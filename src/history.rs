@@ -82,6 +82,10 @@ impl From<StoredChat> for Chat {
             name: stored.name,
             id: stored.id,
             messages: stored.messages,
+            // Restored chats always start idle: a snapshot saved mid-request
+            // has no live request to resume (see Message::normalized_for_storage).
+            lifecycle: crate::model::ChatLifecycle::Idle,
+            queue: std::collections::VecDeque::new(),
         }
     }
 }
@@ -281,5 +285,60 @@ mod tests {
         let path = save_chat_in(Some(&root), &evil).expect("saved safely");
         assert!(path.starts_with(root.join("threads")));
         assert_eq!(path.file_name().unwrap(), "______escape.json");
+    }
+
+    // ---- feat_rename_thread: rename persistence ----------------------------
+
+    /// The whole point of the rename feature's persistence contract: a saved
+    /// renamed chat must come back with the NEW title on the next launch.
+    #[test]
+    fn renamed_chat_title_survives_save_load_roundtrip() {
+        let root = temp_root("rename");
+        let mut chat = sample_chat("old title");
+
+        // Simulate commit_rename: trim, then assign.
+        chat.name = "  fresh title  ".trim().to_owned();
+        save_chat_in(Some(&root), &chat).expect("save renamed chat");
+
+        let loaded = load_chats_from(Some(&root));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].name, "fresh title",
+            "renamed title must survive restart"
+        );
+        // Identity is untouched: same thread id, messages intact.
+        assert_eq!(loaded[0].id, chat.id);
+        assert_eq!(loaded[0].messages.len(), 2);
+
+        // A second rename overwrites in place (same <thread_id>.json file).
+        chat.name = "even newer".to_owned();
+        save_chat_in(Some(&root), &chat).expect("resave renamed chat");
+        let files: Vec<_> = std::fs::read_dir(root.join("threads"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1, "still one file per thread id after rename");
+        assert_eq!(load_chats_from(Some(&root))[0].name, "even newer");
+    }
+
+    /// Files are keyed by stable thread id — a rename can never orphan the
+    /// history snapshot under a new file name.
+    #[test]
+    fn renaming_keeps_history_file_keyed_by_thread_id() {
+        let root = temp_root("rename-key");
+        let mut chat = sample_chat("before");
+        let first_path = save_chat_in(Some(&root), &chat).expect("initial save");
+        let initial_file_name = first_path.file_name().unwrap().to_owned();
+
+        chat.name = "after".to_owned();
+        let second_path = save_chat_in(Some(&root), &chat).expect("save after rename");
+
+        assert_eq!(
+            first_path.file_name().unwrap(),
+            second_path.file_name().unwrap(),
+            "rename must not move or duplicate the snapshot file"
+        );
+        assert_eq!(second_path.file_name().unwrap(), initial_file_name);
+        assert_eq!(load_chats_from(Some(&root))[0].name, "after");
     }
 }

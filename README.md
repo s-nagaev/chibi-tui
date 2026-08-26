@@ -55,19 +55,52 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` or `k` / `j` | Switch chat (when input is empty) |
-| `N` | New chat (when input is empty) |
-| `Enter` | Send message |
-| `PgUp` / `PgDn` | Scrollback in chat view |
-| `Ctrl+C` | Cancel in-flight request; quit when idle |
-| `Esc` / `q` | Quit (when idle) |
-| `Ctrl+V` (`Cmd+V` on macOS) | Paste from clipboard into input |
-| `Ctrl+A` / `Ctrl+E` | Move cursor to line start / end |
-| `Ctrl+U` / `Ctrl+L` | Clear text before cursor / clear line |
-| `R` | Reconnect (shown in error popup when backend disconnects) |
+| `↑` / `↓` | Switch chat (when input is empty) |
+| `Ctrl+N` | New chat |
+| `Ctrl+R` | Rename the current thread inline (`Enter` save · `Esc` cancel) |
+| `Enter` | Send message (or queue it while this chat is busy) |
+| `⇧↵` / `⌥↵` | Insert a newline into the input (multi-line prompts) |
+| `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
+| `PgUp` / `PgDn` | Scroll chat view up/down one page (by visible rows) |
+| macOS: `fn`+`↑` / `fn`+`↓` | Equivalent to PgUp/PgDn on laptops without a dedicated Page key |
+| `Esc` | Clear input / dismiss popup |
+| `Ctrl+V` | Paste clipboard (macOS: Cmd+V) |
+
+> **Terminal support note:** `⇧↵` / `⌥↵` require a terminal that implements
+> the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+> (kitty, WezTerm, foot, recent Ghostty, …). chibi-tui requests it at startup
+> via crossterm's `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`
+> and pops the flags on exit. On terminals without support the request is
+> ignored and **Shift+Enter degrades to plain Enter — i.e. it sends the
+> message** instead of inserting a newline. There is no reliable way to
+> distinguish the keys there; this is a terminal limitation, not a bug.
+| `Ctrl+A` / `Ctrl+E` | Move cursor to start / end of line |
+| `Ctrl+U` | Delete from cursor to start of line |
+| `Ctrl+L` | Clear input |
+
+**Growing input block:** the editor area expands from one up to twenty rows as
+the multiline draft grows (`Shift+Enter`), while the chat pane shrinks to make
+room. Past twenty lines the view auto-follows the caret, keeping the line you
+are typing on screen; `PgUp`/`PgDn` keep scrolling the chat, and clearing the
+input collapses the block back to a single row. The rename editor grows the
+same way for multiline title drafts.
+
+### Renaming threads
+
+`Ctrl+R` turns the bottom input line into a single-line editor prefilled with
+the current thread title (`✎ Rename thread…`). `Enter` saves the trimmed name
+(empty names are rejected and keep the old title), `Esc` cancels and restores
+the untouched message draft. Renaming works while a request is running; the
+sidebar, header and persisted history update immediately (files are keyed by
+thread id, so a rename never orphans a history snapshot).
+
+While renaming, `Shift+Enter` / `Alt+Enter` insert a literal newline into the
+draft (multi-line titles render as one space-separated line in the sidebar).
+Every Enter press inside the rename editor belongs to the editor — it never
+submits the message prompt.
 
 If the backend fails to connect or drops mid-session, a modal error popup
-appears instead of crashing; `R` retries, `Esc`/`q` quits.
+appears instead of crashing; `R` retries, `Esc` dismisses, `q` or `Ctrl+C` quits.
 
 ## Configuration & Data
 

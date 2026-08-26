@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Growing input block: the editor area now expands from 1 up to 20 rows with
+  the multiline draft (`Shift+Enter`), squeezing the chat pane; past 20 lines
+  the view auto-follows the caret. The `⏎ send` chip moves to the first row of
+  a grown block, the sidebar divider stays unbroken at every height, and the
+  rename editor grows equally with multiline title drafts.
+- Multi-line input (`Shift+Enter` / `Alt+Enter` insert a newline; bare `Enter`
+  still sends). chibi-tui requests the kitty keyboard protocol at startup and
+  pops it on exit; on terminals without support Shift+Enter degrades to
+  send-on-Enter (documented in the README). While renaming, modified
+  Enters insert newlines into the title draft instead of saving.
+- Inline thread rename (`Ctrl+R`): bottom input line becomes a single-line
+  editor prefilled with the current title; `Enter` saves (trimmed, empty
+  rejected), `Esc` cancels keeping the message draft; works on busy threads;
+  renamed titles persist across restarts.
+
 ## [0.1.0] - 2026-08-25
 
 Initial release.

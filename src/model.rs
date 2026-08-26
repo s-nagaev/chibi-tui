@@ -47,6 +47,17 @@ impl Message {
         }
     }
 
+    /// Visible marker for a prompt waiting in the chat's FIFO queue
+    /// (per-thread async). Rendered like a pending row; replaced by the real
+    /// pending answer once the prompt leaves the queue.
+    pub fn assistant_queued(position: usize) -> Self {
+        Self {
+            role: Role::Assistant,
+            markdown: format!("\u{23f3} queued (#{position})"),
+            pending: true,
+        }
+    }
+
     /// Storage view of a message: pending placeholders become empty assistant
     /// messages so a restored history never shows a stuck spinner row.
     pub fn normalized_for_storage(&self) -> Self {
@@ -58,12 +69,39 @@ impl Message {
     }
 }
 
-/// Request lifecycle as observed by the UI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChatStatus {
+/// Per-chat request lifecycle (feature: per-thread async).
+///
+/// Each [`crate::app::Chat`] owns exactly one lifecycle: at most one request
+/// is in flight per chat (`Awaiting` = sent, backend has not confirmed
+/// processing yet; `Running` = backend confirmed), while additional prompts
+/// wait in the chat's FIFO queue. Chats never observe each other's
+/// lifecycle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ChatLifecycle {
+    /// Nothing in flight and nothing queued for this chat.
+    #[default]
     Idle,
-    Queued,
-    Running,
+    /// Request handed to the backend; `running` status not seen yet.
+    Awaiting { request_id: String },
+    /// Backend confirmed it is processing the request.
+    Running { request_id: String },
+}
+
+impl ChatLifecycle {
+    /// Protocol request id tracked by this lifecycle, if any.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            ChatLifecycle::Idle => None,
+            ChatLifecycle::Awaiting { request_id } | ChatLifecycle::Running { request_id } => {
+                Some(request_id.as_str())
+            }
+        }
+    }
+
+    /// True while a request is in flight (either phase).
+    pub fn is_busy(&self) -> bool {
+        !matches!(self, ChatLifecycle::Idle)
+    }
 }
 
 #[cfg(test)]
@@ -91,12 +129,28 @@ mod tests {
     }
 
     #[test]
-    fn role_and_status_survive_json_roundtrip() {
-        let status = ChatStatus::Running;
-        assert_eq!(
-            status,
-            serde_json::from_str::<ChatStatus>(&serde_json::to_string(&status).unwrap()).unwrap()
-        );
+    fn lifecycle_default_is_idle() {
+        assert_eq!(ChatLifecycle::default(), ChatLifecycle::Idle);
+        assert!(!ChatLifecycle::Idle.is_busy());
+        assert!(ChatLifecycle::Idle.request_id().is_none());
+    }
+
+    #[test]
+    fn lifecycle_request_id_and_busy_flags() {
+        let awaiting = ChatLifecycle::Awaiting {
+            request_id: "r1".to_owned(),
+        };
+        let running = ChatLifecycle::Running {
+            request_id: "r2".to_owned(),
+        };
+        for (lifecycle, id) in [(&awaiting, "r1"), (&running, "r2")] {
+            assert!(lifecycle.is_busy());
+            assert_eq!(lifecycle.request_id(), Some(id));
+        }
+    }
+
+    #[test]
+    fn role_survives_json_roundtrip() {
         let role = Role::Assistant;
         assert_eq!(
             role,

@@ -252,10 +252,7 @@ pub struct RequestPipeline {
 }
 
 impl RequestPipeline {
-    /// Spawn `python3 <fake_backend> --workspace <root>`, run the mandatory
-    /// handshake, start the actor + reader.
-    ///
-    /// The script defaults to `tests/fake_backend.py` and can be overridden
+    /// The script defaults to `chibi` (from PATH) and can be overridden
     /// with the `CHIBI_FAKE_BACKEND` env var (seam for running tests from
     /// other working directories).
     pub async fn connect(
@@ -273,15 +270,22 @@ impl RequestPipeline {
         extra_args: &[String],
     ) -> Result<Self, BackendError> {
         let workspace_root = workspace_root.as_ref().to_path_buf();
-        let script_path = std::env::var("CHIBI_FAKE_BACKEND")
-            .unwrap_or_else(|_| "tests/fake_backend.py".to_owned());
+        let script_path =
+            std::env::var("CHIBI_FAKE_BACKEND").unwrap_or_else(|_| "chibi".to_owned());
 
-        let mut argv: Vec<std::ffi::OsString> = vec![
-            "python3".into(),
-            script_path.clone().into(),
-            "--workspace".into(),
-            workspace_root.as_os_str().to_owned(),
-        ];
+        let mut argv: Vec<std::ffi::OsString> = if script_path == "chibi" {
+            // Real backend: chibi ide --stdio (no extra CLI flags — workspace_root
+            // travels inside request frames, not on the command line).
+            vec!["chibi".into(), "ide".into(), "--stdio".into()]
+        } else {
+            // Fake backend (tests): python3 tests/fake_backend.py --workspace <root>
+            vec![
+                "python3".into(),
+                script_path.clone().into(),
+                "--workspace".into(),
+                workspace_root.as_os_str().to_owned(),
+            ]
+        };
         argv.extend(extra_args.iter().map(Into::into));
 
         let mut client = spawn_argv(&workspace_root.display().to_string(), argv).await?;
@@ -533,12 +537,18 @@ async fn handle_reconnect(
     }
     state.stdin = None;
 
-    let argv: Vec<std::ffi::OsString> = vec![
-        "python3".into(),
-        config.script_path.clone().into(),
-        "--workspace".into(),
-        config.workspace_root.clone().into(),
-    ];
+    let argv: Vec<std::ffi::OsString> = if config.script_path == "chibi" {
+        // Reconnect to real backend: same argv as initial spawn (no --workspace).
+        vec!["chibi".into(), "ide".into(), "--stdio".into()]
+    } else {
+        // Reconnect to fake backend: python3 <script> --workspace <root>.
+        vec![
+            "python3".into(),
+            config.script_path.clone().into(),
+            "--workspace".into(),
+            config.workspace_root.clone().into(),
+        ]
+    };
 
     let spawn_result = async {
         let mut client = spawn_argv(&config.workspace_root, argv).await?;

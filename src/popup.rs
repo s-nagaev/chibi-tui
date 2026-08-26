@@ -1,7 +1,7 @@
 //! Modal error popup state and rendering-independent logic.
 //!
 //! A single global popup slot: when set, it overlays the whole UI, captures
-//! the `R` / `Esc` / `q` keys (reconnect / quit) and blocks normal input
+//! the `R` / `Esc` / `q` / `Ctrl+C` keys (reconnect / dismiss / quit) and blocks normal input
 //! handling until dismissed. Backend failures (spawn failure, broken pipe,
 //! lost handshake) surface here instead of crashing or being silently
 //! dropped.
@@ -22,7 +22,7 @@ impl ErrorPopup {
 
     /// Static recovery hint rendered under the message.
     pub fn hint() -> &'static str {
-        "R reconnect \u{00b7} Esc/q quit"
+        "R reconnect \u{00b7} Esc dismiss \u{00b7} q/Ctrl+C quit"
     }
 }
 

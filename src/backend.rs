@@ -7,23 +7,38 @@ use tokio::sync::mpsc;
 
 /// Events pushed from the backend towards the UI, mirroring the coarse
 /// lifecycle of protocol v1 (`status queued/running`, then `result`/`error`).
-/// `request_id` is kept in the event shape now so the future real client
-/// needs no UI-side changes; the mock UI ignores it.
+///
+/// Request-scoped variants carry `thread_id` so the app can route them to the
+/// right chat even while several chats run concurrently (per-thread async).
+/// The mock backend fills it with a placeholder — its events only ever target
+/// the active chat.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum BackendEvent {
     /// Request accepted, will start soon.
-    Queued { request_id: u64 },
+    Queued { request_id: u64, thread_id: String },
     /// Backend is processing the request.
-    Running { request_id: u64 },
+    Running { request_id: u64, thread_id: String },
     /// Final markdown answer.
-    Result { request_id: u64, markdown: String },
+    Result {
+        request_id: u64,
+        markdown: String,
+        thread_id: String,
+    },
     /// Request failed.
-    Error { request_id: u64, message: String },
+    Error {
+        request_id: u64,
+        message: String,
+        thread_id: Option<String>,
+    },
     /// The event source itself reported the transport link down (no
     /// particular request to blame). Flips the connection indicator; never
     /// opens the popup by itself.
     Disconnected,
+    /// Per-thread async: the request of `thread_id` reached its terminal
+    /// state, so any prompts waiting in that chat's FIFO queue may now be
+    /// sent. Internal glue signal — carries no user-visible content.
+    QueueDrain { thread_id: String },
 }
 
 /// Source of assistant answers. Implementations MUST NOT spawn processes,
@@ -65,15 +80,26 @@ impl Backend for MockBackend {
         let markdown = crate::mock::MOCK_REPLIES[self.reply_counter].to_string();
 
         tokio::spawn(async move {
-            let _ = tx.send(BackendEvent::Queued { request_id }).await;
+            let _ = tx
+                .send(BackendEvent::Queued {
+                    request_id,
+                    thread_id: String::new(),
+                })
+                .await;
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let _ = tx.send(BackendEvent::Running { request_id }).await;
+            let _ = tx
+                .send(BackendEvent::Running {
+                    request_id,
+                    thread_id: String::new(),
+                })
+                .await;
             // ≈1.5–2.5s total perceived latency before the answer lands.
             tokio::time::sleep(std::time::Duration::from_millis(1200 + jitter_ms())).await;
             let _ = tx
                 .send(BackendEvent::Result {
                     request_id,
                     markdown,
+                    thread_id: String::new(),
                 })
                 .await;
         });

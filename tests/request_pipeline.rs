@@ -14,7 +14,16 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connect with extra fake-backend argv flags (tests run with CWD = crate
 /// root, so the default `tests/fake_backend.py` resolves).
+/// Tests always target the fake backend — set `CHIBI_FAKE_BACKEND` explicitly.
+fn fake_pipeline_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("CHIBI_FAKE_BACKEND", "tests/fake_backend.py");
+    });
+}
+
 async fn connect(extra: &[&str]) -> RequestPipeline {
+    fake_pipeline_env();
     let extra: Vec<String> = extra.iter().map(|s| (*s).to_owned()).collect();
     tokio::time::timeout(TIMEOUT, RequestPipeline::connect_with_args(".", 16, &extra))
         .await
