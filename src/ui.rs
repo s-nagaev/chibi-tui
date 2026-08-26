@@ -4,11 +4,11 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Connection};
+use crate::app::{App, Connection, Focus};
 use crate::markdown;
 use crate::model::{ChatLifecycle, Role};
 use crate::popup::ErrorPopup;
@@ -72,13 +72,31 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     render_spinner_line(f, app, theme, root[1]);
     match &app.mode {
         Mode::Renaming { .. } => render_rename_line(f, app, theme, chat_column),
-        Mode::Normal => render_input(f, app, theme, chat_column),
+        // feat_thread_delete / feat_search_thread / feat_search_all_threads:
+        // while the confirm or a search popup is open the underlying editor
+        // keeps rendering as the normal input row (the popup overlays it and
+        // captures all keys).
+        Mode::Normal | Mode::ConfirmDelete | Mode::Searching { .. } | Mode::SearchingAll { .. } => {
+            render_input(f, app, theme, chat_column)
+        }
     }
     render_status(f, app, theme, root[3]);
 
     // Modal error popup overlays everything (rendered last).
     if app.error_popup.is_some() {
         render_error_popup(f, app, theme);
+    }
+    // feat_thread_delete: confirm popup overlays everything (rendered last).
+    if matches!(app.mode, Mode::ConfirmDelete) {
+        render_delete_popup(f, app, theme);
+    }
+    // feat_search_thread: search popup overlays everything (rendered last).
+    if matches!(app.mode, Mode::Searching { .. }) {
+        render_search_popup(f, app, theme);
+    }
+    // feat_search_all_threads: all-threads search popup (rendered last).
+    if matches!(app.mode, Mode::SearchingAll { .. }) {
+        render_search_all_popup(f, app, theme);
     }
 }
 
@@ -134,7 +152,14 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// `\u{25cb}` idle (dim) · `\u{25c6}` awaiting/queued (yellow) ·
 /// `\u{25cf}` running (green). The ACTIVE chat additionally keeps its name
 /// bold + highlighted row.
+///
+/// feat_focus_panes: the sidebar advertises keyboard ownership when
+/// `app.focus == Focus::Sidebar` — theme-driven emphasis ONLY, no new
+/// palette: border and ` Chats ` title switch from their resting colors to
+/// a brighter accent pair, and the idle unselected dot column brightens
+/// (dim → fg). Busy dots keep their semantic colors either way.
 fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let sidebar_focused = app.focus == Focus::Sidebar;
     let items: Vec<ListItem> = app
         .chats
         .iter()
@@ -152,7 +177,12 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 ChatLifecycle::Awaiting { .. } => theme.yellow,
                 ChatLifecycle::Idle => {
                     if selected {
+                        // Selected idle dot stays green in both focuses.
                         theme.green
+                    } else if sidebar_focused {
+                        // Focus affordance: the dot column brightens while
+                        // the sidebar owns the keyboard.
+                        theme.fg
                     } else {
                         theme.dim
                     }
@@ -178,10 +208,22 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::RIGHT)
-                .border_style(Style::new().fg(theme.selection))
+                .border_style(Style::new().fg(if sidebar_focused {
+                    // Emphasis: focused sidebar's divider lifts to blue.
+                    theme.blue
+                } else {
+                    theme.selection
+                }))
                 .title(Span::styled(
                     " Chats ",
-                    Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
+                    Style::new()
+                        .fg(if sidebar_focused {
+                            // Emphasis: title switches from blue to cyan.
+                            theme.cyan
+                        } else {
+                            theme.blue
+                        })
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .style(Style::new().bg(theme.panel)),
         )
@@ -204,7 +246,17 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     for y in below.top()..below.bottom() {
         f.buffer_mut()[(below.x, y)]
             .set_symbol("\u{2502}")
-            .set_style(Style::new().fg(theme.selection).bg(theme.panel));
+            // feat_focus_panes: the extended divider follows the block's
+            // focus emphasis so the whole divider color agrees.
+            .set_style(
+                Style::new()
+                    .fg(if sidebar_focused {
+                        theme.blue
+                    } else {
+                        theme.selection
+                    })
+                    .bg(theme.panel),
+            );
     }
 }
 
@@ -230,9 +282,14 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         return;
     };
 
-    // Render every message into lines.
+    // Render every message into lines. `msg_ranges` records each message's
+    // `[start, end)` span of LOGICAL lines (role header + content + trailing
+    // blank) so the search jump can map `(message_index, line_index)` onto
+    // the exact line this renderer paints.
     let mut lines: Vec<markdown::MdLine> = Vec::new();
+    let mut msg_ranges: Vec<(usize, usize)> = Vec::new();
     for msg in &chat.messages {
+        let start = lines.len();
         match msg.role {
             Role::User => {
                 lines.push(Line::from(Span::styled(
@@ -253,17 +310,72 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
             lines.extend(markdown::render(&msg.markdown, theme));
         }
         lines.push(Line::from(""));
+        msg_ranges.push((start, lines.len()));
     }
 
-    let total = lines.len();
+    // bugfix_bottom_reply_hidden (restores bugfix_chat_scroll contract):
+    // Paragraph used to wrap internally while `total` counted LOGICAL
+    // markdown lines, so scroll_skip undercounted whenever any message
+    // wrapped to multiple display rows — follow-bottom then hid the tail of
+    // the newest reply behind the input block. Materialize the DISPLAY rows
+    // here instead, count them, and render WITHOUT an internal wrap: the
+    // scrolled view and the row total are the same thing by construction.
+    let width = inner.width.max(1) as usize;
+    let (wrapped, first_row_of) = wrap_message_rows_indexed(&lines, width);
+    let total = wrapped.len();
     let visible = inner.height;
+
+    // feat_search_all_threads: consume a pending GLOBAL search jump (Enter
+    // in the all-threads search popup). `jump_to_selected_all` already
+    // activated the target thread in the state layer (same mechanics as
+    // Ctrl+↑/↓) — this only verifies the target is STILL the active chat
+    // (defensive against a chat vanishing between the state transition and
+    // the next frame; the match list is recomputed on every keystroke, so
+    // this is belt-and-braces) and maps the hit onto its wrapped row with
+    // the SAME totals as rendering, exactly like the in-thread jump below.
+    if let Some((chat_index, message_index, line_index, char_offset)) =
+        app.pending_global_search_jump.take()
+    {
+        if chat_index == app.active {
+            if let Some(row) = search_jump_wrapped_row(
+                &msg_ranges,
+                &first_row_of,
+                &lines,
+                width,
+                message_index,
+                line_index,
+                char_offset,
+            ) {
+                app.scroll = scroll_for_search_jump(row, total, visible);
+            }
+        }
+    }
+
+    // feat_search_thread: consume a pending jump (Enter in the search
+    // popup). The jump math reuses the EXACT wrapped-row totals above —
+    // the same helper, the same width — so a hit inside a visually-wrapped
+    // paragraph lands on the correct display row (via its char offset).
+    // 1-row padding keeps the match a sliver below the top edge instead of
+    // glued to it.
+    if let Some((message_index, line_index, char_offset)) = app.pending_search_jump.take() {
+        if let Some(row) = search_jump_wrapped_row(
+            &msg_ranges,
+            &first_row_of,
+            &lines,
+            width,
+            message_index,
+            line_index,
+            char_offset,
+        ) {
+            app.scroll = scroll_for_search_jump(row, total, visible);
+        }
+    }
+
     let skip = scroll_skip(app.scroll, app.at_bottom(), total, visible);
     let overflowed = total > visible.max(1) as usize;
 
-    let text = Text::from(lines);
-    let paragraph = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((skip as u16, 0));
+    let text = Text::from(wrapped);
+    let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
     f.render_widget(paragraph, inner);
 
     app.chat_visible_rows = inner.height;
@@ -312,6 +424,16 @@ fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) 
     let send_label = "\u{23ce} send ";
     let has_visible_text = app.input.lines().iter().any(|l| !l.is_empty());
 
+    // feat_focus_panes: while the SIDEBAR owns focus the prompt's `❯`
+    // marker dims from cyan to theme.dim — a subtle theme-driven cue that
+    // typing goes nowhere until focus returns. Rename editor keeps its
+    // own marker untouched.
+    let marker_color = if app.focus == Focus::Sidebar {
+        theme.dim
+    } else {
+        theme.cyan
+    };
+
     if !has_visible_text {
         // Blank draft: placeholder + `⏎ send` chip composed in ONE line on
         // the block's FIRST row so they share the same baseline. Width math
@@ -327,7 +449,7 @@ fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) 
             .width
             .saturating_sub(marker_w + placeholder_len + send_len) as usize;
         let line = Line::from(vec![
-            Span::styled(PROMPT_MARKER, Style::new().fg(theme.cyan)),
+            Span::styled(PROMPT_MARKER, Style::new().fg(marker_color)),
             Span::styled("Type a message\u{2026}", Style::new().fg(theme.dim)),
             Span::raw(" ".repeat(gap)),
             Span::styled(send_label, Style::new().fg(theme.selection)),
@@ -348,7 +470,7 @@ fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) 
     };
     if marker_area.width > 0 {
         f.render_widget(
-            Paragraph::new(Span::styled(PROMPT_MARKER, Style::new().fg(theme.cyan)))
+            Paragraph::new(Span::styled(PROMPT_MARKER, Style::new().fg(marker_color)))
                 .style(Style::new().bg(theme.input_panel_bg)),
             marker_area,
         );
@@ -441,14 +563,61 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // feat_shift_enter_newline: `⇧↵ nl` documents multi-line input; `^C
     // cancel/quit` shortened to `^C cancel` so everything still fits 120
     // columns with that longest label.
-    let spans = vec![
-        Span::styled(
-            "   \u{2191}\u{2193} chats \u{00b7} ^N new \u{00b7} PgUp/PgDn scroll \u{00b7} ^R rename \u{00b7} ^C cancel \u{00b7} ^L clear \u{00b7} ^V paste \u{00b7} \u{21e7}\u{21b5} nl",
-            Style::new().fg(theme.selection),
-        ),
-        Span::raw("  "),
-        Span::styled(status_label, Style::new().fg(status_color)),
-    ];
+    // feat_ctrl_arrows_nav: thread switching moved to `^↑↓ chats` and plain
+    // `↑↓` became caret movement (`↑↓ caret`). To keep both new hints AND
+    // the longest status label inside one 120-col row, the self-evident
+    // `PgUp/PgDn scroll` hint retired (PgUp/PgDn still work; README
+    // documents them). ^C cancel / ⇧↵ nl semantics are untouched.
+    // feat_thread_delete: `^D del` joined the hints; the self-evident
+    // `^V paste` compacted to `^V` (the universal paste convention; README
+    // documents both Ctrl+V and macOS Cmd+V) so everything still fits one
+    // 120-col row with the longest status label.
+    // feat_search_thread: `^F find` joined the hints; `^L clear` compacted
+    // to `^L` (the action is still documented in README and self-evident
+    // enough next to `^V`) so the line stays within 120 cols with the
+    // longest status label (`● disconnected (press R)`).
+    // feat_search_all_threads: `^⇧F all` joined the hints; the self-evident
+    // `^L` and `^V` hints retired (both actions are README-documented and
+    // universal enough — clear-screen and paste) so the line stays within
+    // 120 cols with the longest status label. ^C cancel is never dropped.
+    // feat_alt_arrows_nav: `^↑↓ chats` grew to `^/⌥↑↓ chats` (Alt is a
+    // full synonym for thread switching — macOS Mission Control hijacks
+    // Ctrl+arrows). To fit the +2-col token, the self-evident `^F find`
+    // compacted to `^F` (Ctrl+F is THE universal find convention, same
+    // precedent as `^V`; README documents it), keeping the row within 120
+    // cols with the longest status label. ^C cancel is never dropped.
+    // feat_ctrl_t_cycle: `^T next` joined the hints (universal terminal-proof
+    // thread switching that WRAPS around — the browser Ctrl+Tab convention).
+    // To fit the +7-col token, the self-evident `^N new` compacted to `^N`
+    // (Ctrl+N is THE universal new-chat convention, same precedent as `^F`/
+    // `^V`) and `⇧↵ nl` compacted to `⇧↵` (Shift+Enter newline is a universal
+    // chat-app convention; README documents both), keeping the row within 120
+    // cols with the longest status label. ^C cancel is never dropped.
+    // feat_focus_panes: `^T next` became `^T panel` — Ctrl+T now TOGGLES
+    // pane focus (Chat ↔ Sidebar) instead of wrap-cycling threads (the
+    // cycling semantics were rejected in live-check). `^R rename` compacted
+    // to `^R` (the action is README-documented and the popup itself is
+    // self-explanatory) keeps the +1-col cost inside 120 cols with the
+    // longest status label. ^C cancel is never dropped.
+    let spans = if let Some((message, _)) = &app.status_message {
+        // Transient status toast (busy-delete refusal): replaces the hint
+        // block while visible. Short message + connection label always fit
+        // one row.
+        vec![
+            Span::styled(format!("  {message}"), Style::new().fg(theme.yellow)),
+            Span::raw("  "),
+            Span::styled(status_label, Style::new().fg(status_color)),
+        ]
+    } else {
+        vec![
+            Span::styled(
+                "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D del \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T panel",
+                Style::new().fg(theme.selection),
+            ),
+            Span::raw("  "),
+            Span::styled(status_label, Style::new().fg(status_color)),
+        ]
+    };
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::new().bg(theme.panel)),
@@ -510,6 +679,397 @@ fn render_error_popup(f: &mut Frame, app: &mut App, theme: &Theme) {
     }
 }
 
+/// Centered modal delete-confirmation popup over the full frame
+/// (feat_thread_delete). Theme-driven only: red border + red title for the
+/// destructive action, yellow decision hint. Purely visual — all key
+/// handling lives in `main.rs`.
+fn render_delete_popup(f: &mut Frame, app: &mut App, theme: &Theme) {
+    use ratatui::widgets::{Clear, Padding};
+
+    if !matches!(app.mode, Mode::ConfirmDelete) {
+        return;
+    }
+    // Multi-line titles collapse to spaces for the one-line popup message.
+    let title = app.chat_title().replace('\n', " ");
+    let message = format!("Delete \u{201c}{title}\u{201d} permanently?");
+    let hint = "y/Enter confirm \u{00b7} Esc/n cancel \u{00b7} Ctrl+C quit";
+
+    // Centered box at ~50% of the frame width (content-driven minimum, hard
+    // floor of 20 so tiny terminals never panic on an invalid clamp range).
+    let max_w = f.area().width.saturating_sub(4).max(20);
+    let width = (message.width() as u16 + hint.width() as u16 + 6)
+        .max(f.area().width / 2)
+        .clamp(20, max_w);
+    let height = 5.min(f.area().height.saturating_sub(2)).max(3);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.red))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            " Delete thread ",
+            Style::new().fg(theme.red).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height > 0 {
+        let lines = wrap_text(&message, inner.width.max(1) as usize);
+        let hint_line = Line::from(Span::styled(hint, Style::new().fg(theme.yellow)));
+        let mut all: Vec<Line<'static>> = lines;
+        all.push(hint_line); // rendered last; clipped when out of room
+        let text = Text::from(all);
+        let visible = inner.height as usize;
+        let skip = text.height().saturating_sub(visible);
+        let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
+        f.render_widget(paragraph, inner);
+    }
+}
+
+/// Centered modal in-thread search popup (feat_search_thread). Query input
+/// on the first content row, live match list below (`role label + snippet`,
+/// selected row highlighted), total count in the title, decision hint last.
+/// Purely visual — all key handling lives in `main.rs`.
+fn render_search_popup(f: &mut Frame, app: &mut App, theme: &Theme) {
+    use ratatui::widgets::{Clear, Padding};
+
+    let Mode::Searching { state } = &app.mode else {
+        return;
+    };
+    let query = state.query.clone();
+    let matches = state.matches.clone();
+    let selected = state.selected;
+    let count = matches.len();
+
+    let hint =
+        "\u{2191}\u{2193} navigate \u{00b7} Enter jump \u{00b7} Esc close \u{00b7} Ctrl+C quit";
+
+    // Max match rows shown before the list clips (selection stays visible
+    // via a centered window).
+    const MAX_LIST_ROWS: usize = 7;
+
+    // Size to content with sane caps; centered on the full frame. Floor of
+    // 20 and the `max()` guards keep the clamp ranges valid on tiny
+    // terminals (same pattern as the delete popup).
+    let max_w = f.area().width.saturating_sub(4).max(20);
+    let width = (hint.width() as u16 + 12).max(40).clamp(20, max_w);
+    let content_rows = 1 // query row
+        + if count == 0 { 1 } else { count.min(MAX_LIST_ROWS) } // matches / no-match row
+        + 1; // hint row
+    let height = (content_rows as u16 + 2) // + borders
+        .min(f.area().height.saturating_sub(2))
+        .max(3);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.blue))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            format!(" Find in thread \u{00b7} {count} "),
+            Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Query row: `❯` marker + typed query (or a dim placeholder when empty).
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if query.is_empty() {
+        rows.push(Line::from(vec![
+            Span::styled(PROMPT_MARKER, Style::new().fg(theme.cyan)),
+            Span::styled("type to search\u{2026}", Style::new().fg(theme.dim)),
+        ]));
+    } else {
+        rows.push(Line::from(vec![
+            Span::styled(PROMPT_MARKER, Style::new().fg(theme.cyan)),
+            Span::styled(query.clone(), Style::new().fg(theme.fg)),
+        ]));
+    }
+
+    // Match rows: `▸ role · …snippet…` with the selected row highlighted.
+    // The window is centered on the selection so ↑/↓ navigation stays
+    // visible in the fixed-height list.
+    if count == 0 {
+        if !query.is_empty() {
+            rows.push(Line::from(Span::styled(
+                "no matches",
+                Style::new().fg(theme.dim),
+            )));
+        }
+    } else {
+        let half = MAX_LIST_ROWS / 2;
+        let window_start = selected
+            .saturating_sub(half)
+            .min(count.saturating_sub(MAX_LIST_ROWS));
+        for (i, m) in matches
+            .iter()
+            .enumerate()
+            .skip(window_start)
+            .take(MAX_LIST_ROWS)
+        {
+            let is_selected = i == selected;
+            let role_label = match app
+                .chats
+                .get(app.active)
+                .and_then(|c| c.messages.get(m.message_index))
+                .map(|msg| msg.role)
+            {
+                Some(Role::User) => ("You", theme.orange),
+                Some(Role::Assistant) => ("Chibi", theme.blue),
+                None => ("?", theme.dim),
+            };
+            let snippet = search_snippet(m, &query);
+            let row_style = if is_selected {
+                Style::new().bg(theme.selection)
+            } else {
+                Style::new()
+            };
+            rows.push(Line::from(vec![
+                Span::styled(
+                    if is_selected { "\u{25b8} " } else { "  " },
+                    row_style.fg(theme.yellow),
+                ),
+                Span::styled(
+                    format!("{} \u{00b7} ", role_label.0),
+                    row_style.fg(role_label.1).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(snippet, row_style.fg(theme.fg)),
+            ]));
+        }
+    }
+
+    // Hint row (rendered last; clipped when out of room).
+    rows.push(Line::from(Span::styled(
+        hint,
+        Style::new().fg(theme.yellow),
+    )));
+
+    let text = Text::from(rows);
+    let visible = inner.height as usize;
+    let skip = text.height().saturating_sub(visible);
+    let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
+    f.render_widget(paragraph, inner);
+}
+
+/// Centered modal ALL-threads search popup (feat_search_all_threads).
+///
+/// Same popup family as [`render_search_popup`] — theme-driven, same hint
+/// line, same centered windowed list — but visually distinguishable: the
+/// title reads "Search all threads" and carries BOTH the total match count
+/// and the searched-thread count, and every match row is prefixed with its
+/// THREAD TITLE before the role label + snippet. Match rows may belong to
+/// ANY chat, so role lookup uses each match's own `chat_index` — never the
+/// active chat. Purely visual — all key handling lives in `main.rs`.
+fn render_search_all_popup(f: &mut Frame, app: &mut App, theme: &Theme) {
+    use ratatui::widgets::{Clear, Padding};
+
+    let Mode::SearchingAll { state } = &app.mode else {
+        return;
+    };
+    let query = state.query.clone();
+    let matches = state.matches.clone();
+    let selected = state.selected;
+    let count = matches.len();
+    let thread_count = app.chats.len();
+
+    let hint =
+        "\u{2191}\u{2193} navigate \u{00b7} Enter jump \u{00b7} Esc close \u{00b7} Ctrl+C quit";
+
+    // Max match rows shown before the list clips (selection stays visible
+    // via a centered window).
+    const MAX_LIST_ROWS: usize = 7;
+
+    // Size to content with sane caps; centered on the full frame. Floor of
+    // 20 and the `max()` guards keep the clamp ranges valid on tiny
+    // terminals (same pattern as the other popups). Slightly wider minimum
+    // than the in-thread popup to give `thread · role · snippet` room.
+    let max_w = f.area().width.saturating_sub(4).max(20);
+    let width = (hint.width() as u16 + 12).max(56).clamp(20, max_w);
+    let content_rows = 1 // query row
+        + if count == 0 { 1 } else { count.min(MAX_LIST_ROWS) } // matches / no-match row
+        + 1; // hint row
+    let height = (content_rows as u16 + 2) // + borders
+        .min(f.area().height.saturating_sub(2))
+        .max(3);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.blue))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            format!(
+                " Search all threads \u{00b7} {count} ({thread_count} {}) ",
+                if thread_count == 1 {
+                    "thread"
+                } else {
+                    "threads"
+                }
+            ),
+            Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Query row: `❯` marker + typed query (or a dim placeholder when
+    // empty). The placeholder text names the global scope so the two search
+    // popups are distinguishable even before typing.
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if query.is_empty() {
+        rows.push(Line::from(vec![
+            Span::styled(PROMPT_MARKER, Style::new().fg(theme.cyan)),
+            Span::styled(
+                "type to search all threads\u{2026}",
+                Style::new().fg(theme.dim),
+            ),
+        ]));
+    } else {
+        rows.push(Line::from(vec![
+            Span::styled(PROMPT_MARKER, Style::new().fg(theme.cyan)),
+            Span::styled(query.clone(), Style::new().fg(theme.fg)),
+        ]));
+    }
+
+    // Match rows: `▸ thread · role · …snippet…` with the selected row
+    // highlighted. The window is centered on the selection so ↑/↓
+    // navigation stays visible in the fixed-height list. Every match
+    // carries its own chat_index — matches may belong to ANY thread.
+    if count == 0 {
+        if !query.is_empty() {
+            rows.push(Line::from(Span::styled(
+                "no matches",
+                Style::new().fg(theme.dim),
+            )));
+        }
+    } else {
+        let half = MAX_LIST_ROWS / 2;
+        let window_start = selected
+            .saturating_sub(half)
+            .min(count.saturating_sub(MAX_LIST_ROWS));
+        for (i, m) in matches
+            .iter()
+            .enumerate()
+            .skip(window_start)
+            .take(MAX_LIST_ROWS)
+        {
+            let is_selected = i == selected;
+            let role_label = match app
+                .chats
+                .get(m.chat_index)
+                .and_then(|c| c.messages.get(m.message_index))
+                .map(|msg| msg.role)
+            {
+                Some(Role::User) => ("You", theme.orange),
+                Some(Role::Assistant) => ("Chibi", theme.blue),
+                None => ("?", theme.dim),
+            };
+            let snippet = search_snippet_all(m, &query);
+            let row_style = if is_selected {
+                Style::new().bg(theme.selection)
+            } else {
+                Style::new()
+            };
+            // Multi-line titles collapse to spaces in the one-line popup
+            // row (feat_shift_enter_newline allows `\n` in names).
+            let title = m.chat_title.replace('\n', " ");
+            rows.push(Line::from(vec![
+                Span::styled(
+                    if is_selected { "\u{25b8} " } else { "  " },
+                    row_style.fg(theme.yellow),
+                ),
+                Span::styled(
+                    format!("{title} \u{00b7} "),
+                    row_style.fg(theme.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} \u{00b7} ", role_label.0),
+                    row_style.fg(role_label.1).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(snippet, row_style.fg(theme.fg)),
+            ]));
+        }
+    }
+
+    // Hint row (rendered last; clipped when out of room).
+    rows.push(Line::from(Span::styled(
+        hint,
+        Style::new().fg(theme.yellow),
+    )));
+
+    let text = Text::from(rows);
+    let visible = inner.height as usize;
+    let skip = text.height().saturating_sub(visible);
+    let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
+    f.render_widget(paragraph, inner);
+}
+
+/// Shared snippet core: short context window around a search hit at `col`
+/// inside `line_text`, with elided ends: `…beforeHITafter…`. `query` is the
+/// query text; `window` is the number of chars kept on each side. Used by
+/// both the in-thread and the all-threads search popup.
+fn search_snippet_from(line_text: &str, col: usize, query: &str) -> String {
+    const WINDOW: usize = 16;
+    let chars: Vec<char> = line_text.chars().collect();
+    let hit_len = query.chars().count().max(1);
+    let start = col.saturating_sub(WINDOW);
+    let end = (col + hit_len + WINDOW).min(chars.len());
+    let mut s = String::new();
+    if start > 0 {
+        s.push('\u{2026}');
+    }
+    s.extend(&chars[start..end]);
+    if end < chars.len() {
+        s.push('\u{2026}');
+    }
+    s
+}
+
+/// Short context window around an in-thread search hit.
+fn search_snippet(m: &crate::app::SearchMatch, query: &str) -> String {
+    search_snippet_from(&m.line_text, m.col, query)
+}
+
+/// Short context window around an all-threads search hit.
+fn search_snippet_all(m: &crate::app::GlobalSearchMatch, query: &str) -> String {
+    search_snippet_from(&m.line_text, m.col, query)
+}
+
 /// Greedy word-wrap at display-width boundaries; never splits words.
 fn wrap_text(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let max_width = max_width.max(1);
@@ -555,12 +1115,307 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// bugfix_bottom_reply_hidden: expand every logical markdown line into the
+/// display rows it actually occupies at `max_width` columns.
+pub fn wrap_message_rows(lines: &[markdown::MdLine], max_width: usize) -> Vec<markdown::MdLine> {
+    wrap_message_rows_indexed(lines, max_width).0
+}
+
+/// feat_search_thread: like [`wrap_message_rows`], but ALSO returns, for
+/// every logical input line, the index of its FIRST wrapped display row.
+///
+/// The jump math (and its regression tests) must use the SAME totals as
+/// rendering — this is the single source of truth for both. Existing
+/// callers of [`wrap_message_rows`] keep identical behavior (the mapping
+/// vec is simply dropped there).
+pub fn wrap_message_rows_indexed(
+    lines: &[markdown::MdLine],
+    max_width: usize,
+) -> (Vec<markdown::MdLine>, Vec<usize>) {
+    let mut rows = Vec::new();
+    let mut first_row_of = Vec::with_capacity(lines.len());
+    for line in lines {
+        first_row_of.push(rows.len());
+        rows.extend(wrap_line_rows(line, max_width));
+    }
+    (rows, first_row_of)
+}
+
+/// Map a search hit `(message_index, line_index, col)` — as produced by
+/// [`crate::app::collect_search_matches`] — onto its exact WRAPPED row
+/// within the chat pane's display-row list.
+///
+/// The logical line of the hit is the message's `start` (role header) + 1
+/// (the header line itself) + `line_index` (0-based within the message's
+/// rendered lines). The hit's CHAR offset inside that line is then mapped
+/// through the renderer's own wrap ([`wrapped_row_of_char`]), so a hit deep
+/// inside a visually-wrapped paragraph lands on the CONTINUATION row that
+/// actually shows it — never on the paragraph's first row. Returns `None`
+/// when the coordinates are stale (message deleted or line count changed
+/// after the popup closed) — the caller then keeps the current scroll
+/// instead of jumping blind.
+fn search_jump_wrapped_row(
+    msg_ranges: &[(usize, usize)],
+    first_row_of: &[usize],
+    lines: &[markdown::MdLine],
+    width: usize,
+    message_index: usize,
+    line_index: usize,
+    char_offset: usize,
+) -> Option<usize> {
+    let (start, end) = *msg_ranges.get(message_index)?;
+    let logical = start + 1 + line_index; // +1 = the role header line
+    if logical >= end {
+        return None; // stale hit (message changed since the popup closed)
+    }
+    let first = *first_row_of.get(logical)?;
+    Some(first + wrapped_row_of_char(&lines[logical], char_offset, width))
+}
+
+/// Rows of padding between the top edge and a jumped-to search match.
+const SEARCH_JUMP_PADDING: usize = 1;
+
+/// Convert a target wrapped row into the app's `scroll` value (rows up from
+/// the bottom; `0` = follow-bottom) such that the target row sits near the
+/// TOP of the visible pane with [`SEARCH_JUMP_PADDING`] rows of padding.
+/// Saturating math keeps the result within `0..=max_scroll`, so a hit in
+/// the last visible rows naturally lands at follow-bottom.
+fn scroll_for_search_jump(target_row: usize, total: usize, visible: u16) -> u16 {
+    let visible = visible.max(1) as usize;
+    let max_scroll = total.saturating_sub(visible);
+    let skip = target_row
+        .saturating_sub(SEARCH_JUMP_PADDING)
+        .min(max_scroll);
+    (max_scroll - skip) as u16
+}
+
+/// Expand ONE logical markdown line into the DISPLAY ROWS ratatui paints at
+/// `max_width` columns.
+///
+/// Greedy word-wrap over a flattened `(char, style)` stream so styling
+/// survives a mid-span break; unicode-width keeps wide glyphs (CJK, emoji,
+/// box-drawing) from straddling a row boundary and makes byte length
+/// irrelevant to layout. Whitespace runs inside a row are preserved
+/// verbatim; a break trims only the spaces that caused it (the visible part
+/// of ratatui's former `Wrap { trim: false }` behavior). Empty input yields
+/// exactly one blank row, matching an empty `Paragraph`.
+fn wrap_line_rows(line: &markdown::MdLine, max_width: usize) -> Vec<markdown::MdLine> {
+    wrap_line_rows_indexed(line, max_width).0
+}
+
+/// Like [`wrap_line_rows`], but ALSO returns, per output row, the half-open
+/// `(start, end)` CHAR range of the original line it covers
+/// (feat_search_thread: mapping a search hit's char offset onto the exact
+/// wrapped row the renderer paints it on). Dropped break-triggering spaces
+/// are covered by no row, so ranges may have gaps — matching the wrap
+/// exactly. Existing callers of [`wrap_line_rows`] keep identical behavior.
+fn wrap_line_rows_indexed(
+    line: &markdown::MdLine,
+    max_width: usize,
+) -> (Vec<markdown::MdLine>, Vec<(usize, usize)>) {
+    let max_width = max_width.max(1);
+
+    // Flatten per char; effective style = line style patched under span
+    // style (same precedence ratatui applies at render time).
+    let flat: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let style = line.style.patch(span.style);
+            span.content.chars().map(move |ch| (ch, style))
+        })
+        .collect();
+
+    struct Seg {
+        text: String,
+        style: Style,
+    }
+
+    fn push_char(segs: &mut Vec<Seg>, ch: char, style: Style) {
+        match segs.last_mut() {
+            Some(seg) if seg.style == style => seg.text.push(ch),
+            _ => segs.push(Seg {
+                text: ch.to_string(),
+                style,
+            }),
+        }
+    }
+
+    /// Contiguous styled segments of a char range (full-row flushes).
+    fn segs_of(chunk: &[(char, Style)]) -> Vec<Seg> {
+        let mut segs: Vec<Seg> = Vec::new();
+        for &(ch, st) in chunk {
+            push_char(&mut segs, ch, st);
+        }
+        segs
+    }
+
+    fn into_md(segs: Vec<Seg>) -> markdown::MdLine {
+        if segs.is_empty() {
+            return Line::from("");
+        }
+        Line::from(
+            segs.into_iter()
+                .map(|seg| Span::styled(seg.text, seg.style))
+                .collect::<Vec<Span<'static>>>(),
+        )
+    }
+
+    /// Longest char prefix of `chunk` fitting in `room` display columns.
+    /// Returns `(taken_chars, taken_width)`; a single glyph wider than the
+    /// whole row is still taken alone (ratatui clips it horizontally).
+    fn take_fitting(chunk: &[(char, Style)], room: usize) -> (usize, usize) {
+        let (mut take, mut w) = (0usize, 0usize);
+        for &(ch, _) in chunk {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > room && take > 0 {
+                break;
+            }
+            w += cw;
+            take += 1;
+        }
+        (take, w)
+    }
+
+    fn width_of(chunk: &[(char, Style)]) -> usize {
+        chunk
+            .iter()
+            .map(|&(ch, _)| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+            .sum()
+    }
+
+    if flat.is_empty() {
+        return (vec![Line::from("")], vec![(0, 0)]);
+    }
+
+    let is_space = |ch: char| ch == ' ';
+    let mut rows: Vec<Vec<Seg>> = Vec::new();
+    let mut row_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut cur: Vec<Seg> = Vec::new();
+    let mut cur_w = 0usize;
+    // Char range of the row currently being built, in ORIGINAL-line indices.
+    let mut cur_start = 0usize;
+    let mut cur_end = 0usize;
+
+    // Space runs are soft break points; word runs never split unless they
+    // cannot fit on a row of their own.
+    let mut i = 0usize;
+    while i < flat.len() {
+        // ---- space run before the next word ----
+        let sp_start = i;
+        while i < flat.len() && is_space(flat[i].0) {
+            i += 1;
+        }
+        let spaces = &flat[sp_start..i];
+        if i >= flat.len() {
+            // Trailing whitespace only: keep what fits, trim the rest.
+            let room = max_width.saturating_sub(cur_w);
+            let (cnt, _) = take_fitting(spaces, room);
+            for &(ch, st) in &spaces[..cnt] {
+                push_char(&mut cur, ch, st);
+            }
+            cur_end = sp_start + cnt;
+            break;
+        }
+
+        // ---- word run ----
+        let wd_start = i;
+        while i < flat.len() && !is_space(flat[i].0) {
+            i += 1;
+        }
+        let word = &flat[wd_start..i];
+        let (sp_w, word_w) = (width_of(spaces), width_of(word));
+
+        if cur_w + sp_w + word_w <= max_width {
+            for &(ch, st) in spaces {
+                push_char(&mut cur, ch, st);
+            }
+            for &(ch, st) in word {
+                push_char(&mut cur, ch, st);
+            }
+            cur_w += sp_w + word_w;
+            cur_end = i;
+            continue;
+        }
+
+        // Break before the word: flush the current row; the pending spaces
+        // that triggered the break are dropped (covered by no row).
+        if !cur.is_empty() {
+            rows.push(std::mem::take(&mut cur));
+            row_ranges.push((cur_start, sp_start));
+            cur_w = 0;
+        }
+
+        if word_w > max_width {
+            // Hard-split an oversized token across full rows.
+            let mut pos = wd_start;
+            loop {
+                let rest = &flat[pos..i];
+                let rest_w = width_of(rest);
+                if rest_w <= max_width {
+                    cur_start = pos;
+                    for &(ch, st) in rest {
+                        push_char(&mut cur, ch, st);
+                    }
+                    cur_w += rest_w;
+                    cur_end = i;
+                    break;
+                }
+                let (take, _) = take_fitting(rest, max_width);
+                debug_assert!(take > 0, "take_fitting never returns 0");
+                rows.push(segs_of(&rest[..take]));
+                row_ranges.push((pos, pos + take));
+                pos += take;
+            }
+        } else {
+            cur_start = wd_start;
+            for &(ch, st) in word {
+                push_char(&mut cur, ch, st);
+            }
+            cur_w += word_w;
+            cur_end = i;
+        }
+    }
+
+    if !cur.is_empty() || rows.is_empty() {
+        if cur.is_empty() {
+            // Empty whole-line case (defensive; flat non-empty always yields
+            // content above, but keep the empty-row contract).
+            row_ranges.push((0, 0));
+        } else {
+            row_ranges.push((cur_start, cur_end.max(cur_start)));
+        }
+        rows.push(cur);
+    }
+
+    (rows.into_iter().map(into_md).collect(), row_ranges)
+}
+
+/// Map a char offset inside a logical line to the 0-based index of the
+/// wrapped display row containing it (feat_search_thread jump math).
+///
+/// Uses the renderer's OWN span-aware wrap (via
+/// [`wrap_line_rows_indexed`]), so the answer is the exact row the renderer
+/// paints that char on — never a second approximation. Offsets inside
+/// dropped break-triggering spaces resolve to the row the following word
+/// landed on (the visible content starts there); past-the-end offsets clamp
+/// to the last row.
+fn wrapped_row_of_char(line: &markdown::MdLine, char_offset: usize, max_width: usize) -> usize {
+    let (_, ranges) = wrap_line_rows_indexed(line, max_width);
+    for (i, &(_, end)) in ranges.iter().enumerate() {
+        if char_offset < end {
+            return i;
+        }
+    }
+    ranges.len().saturating_sub(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{App, Chat};
     use crate::mock;
-    use crate::model::ChatLifecycle;
+    use crate::model::{ChatLifecycle, Message};
     use crate::theme::Theme;
     use ratatui::backend::TestBackend;
 
@@ -596,8 +1451,211 @@ mod tests {
     /// Render the full UI offscreen and return the plain-text cell grid.
     fn render_grid(app: &mut App) -> Vec<String> {
         render_grid_with_buffer(app).0
+    } // ---- bugfix_bottom_reply_hidden --------------------------------------
+
+    fn plain_line(s: &str) -> markdown::MdLine {
+        Line::from(s.to_owned())
     }
+
+    /// bugfix_bottom_reply_hidden: greedy wrap keeps words intact and never
+    /// lets a row exceed the width budget.
+    #[test]
+    fn wrap_line_rows_wraps_words_without_exceeding_width() {
+        let rows = wrap_line_rows(&plain_line("alpha beta gamma delta"), 10);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(texts, vec!["alpha beta", "gamma", "delta"]);
+    }
+
+    /// Indentation and intra-row whitespace runs survive untouched — they are
+    /// part of the content (code blocks relied on this).
+    #[test]
+    fn wrap_line_rows_preserves_indentation_and_inner_spaces() {
+        let src = "    return   x";
+        let rows = wrap_line_rows(&plain_line(src), 30);
+        assert_eq!(rows.len(), 1);
+        let got: String = rows[0]
+            .spans
+            .iter()
+            .map(|s| s.content.clone())
+            .collect::<String>();
+        assert_eq!(got, src);
+    }
+
+    /// Wide-glyph regression: CJK glyphs are 2 columns wide regardless of
+    /// their 3-byte UTF-8 length; they split cleanly BETWEEN glyphs.
+    #[test]
+    fn wrap_line_rows_splits_cjk_on_column_boundaries_not_bytes() {
+        // "你好世界" = 12 bytes, 8 display columns.
+        let rows = wrap_line_rows(&plain_line("\u{4f60}\u{597d}\u{4e16}\u{754c}"), 4);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].spans[0].content, "\u{4f60}\u{597d}");
+        assert_eq!(rows[1].spans[0].content, "\u{4e16}\u{754c}");
+    }
+
+    /// Emoji (2 columns) never straddles the right edge of a row.
+    #[test]
+    fn wrap_line_rows_never_straddles_emoji_across_boundary() {
+        // Three hourglass U+23F3 glyphs = 6 columns; budget 5.
+        let rows = wrap_line_rows(&plain_line("\u{23f3}\u{23f3}\u{23f3}"), 5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].spans[0].content, "\u{23f3}\u{23f3}");
+        assert_eq!(rows[1].spans[0].content, "\u{23f3}");
+    }
+
+    /// An unbreakable token longer than the budget hard-splits across rows.
+    #[test]
+    fn wrap_line_rows_hard_splits_overlong_token() {
+        let rows = wrap_line_rows(&plain_line(&"A".repeat(25)), 10);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].spans[0].content, "AAAAAAAAAA");
+        assert_eq!(rows[1].spans[0].content, "AAAAAAAAAA");
+        assert_eq!(rows[2].spans[0].content, "AAAAA");
+    }
+
+    /// Per-span styling survives a break: each output row keeps the style of
+    /// the characters it carries.
+    #[test]
+    fn wrap_line_rows_keeps_span_style_after_break() {
+        let line = Line::from(vec![
+            Span::styled("RED", Style::new().fg(ratatui::style::Color::Red)),
+            Span::raw(" "),
+            Span::styled("BLUE", Style::new().fg(ratatui::style::Color::Blue)),
+        ]);
+        let rows = wrap_line_rows(&line, 5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].spans[0].content, "RED");
+        assert_eq!(rows[0].spans[0].style.fg, Some(ratatui::style::Color::Red));
+        assert_eq!(rows[1].spans[0].content, "BLUE");
+        assert_eq!(rows[1].spans[0].style.fg, Some(ratatui::style::Color::Blue));
+    }
+
+    /// Empty / whitespace-only logical lines still occupy exactly one row.
+    #[test]
+    fn wrap_line_rows_empty_line_yields_one_blank_row() {
+        assert_eq!(wrap_line_rows(&plain_line(""), 80).len(), 1);
+        assert_eq!(wrap_line_rows(&Line::from(Vec::<Span>::new()), 80).len(), 1);
+        let rows = wrap_line_rows(&plain_line("   "), 2);
+        assert_eq!(rows.len(), 1);
+    }
+
     // ---- feat_input_grow --------------------------------------------------
+    const TAIL_SENTINEL: &str = "ENDOFREPLY7X";
+    const HEAD_SENTINEL: &str = "GREETING_A1";
+
+    /// Single-line markdown paragraph — one LOGICAL line, many DISPLAY rows
+    /// once wrapped at ~94 chat columns.
+    fn long_paragraph(seed: &str, sentences: usize) -> String {
+        let sentence = format!("{seed}-ish plain wrapping filler for scroll math. ");
+        sentence.repeat(sentences) + seed
+    }
+
+    fn grid_contains(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|r| r.contains(needle))
+    }
+
+    /// THE regression: with several exchanges plus a long wrapped final
+    /// reply, follow-bottom must show the END of the last reply above the
+    /// input band. The old logical-line total clipped it away.
+    #[test]
+    fn follow_bottom_shows_end_of_last_wrapped_reply() {
+        let mut app = App::new(vec![Chat::new("scroll")]);
+        {
+            let chat = &mut app.chats[0];
+            chat.messages.push(Message::user("first question"));
+            // First reply anchors the TRUE top of the content.
+            chat.messages.push(Message::assistant(format!(
+                "{HEAD_SENTINEL} short ack zero"
+            )));
+            for n in 1..6 {
+                chat.messages
+                    .push(Message::user(format!("filler question {n}")));
+                chat.messages
+                    .push(Message::assistant(format!("short ack {n}")));
+            }
+            chat.messages.push(Message::user("final question"));
+            chat.messages.push(Message::assistant(
+                long_paragraph("wrapped", 60) + TAIL_SENTINEL,
+            ));
+        }
+
+        // Follow-bottom (scroll untouched): tail sentinel must be on screen.
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 20);
+        assert!(
+            grid_contains(&rows, TAIL_SENTINEL),
+            "follow-bottom hid the end of the newest wrapped reply"
+        );
+
+        // One page up, then far enough that the clamp saturates at
+        // max_scroll: the view must reach the absolute top of the WRAPPED
+        // content, and nothing from below may leak into that view.
+        let page = app.chat_visible_rows.max(1);
+        app.scroll_up(page);
+        let _ = render_grid_at_with_buffer(&mut app, 120, 20); // refresh page size
+        app.scroll_up(u16::MAX / 2);
+        let (rows_top, _) = render_grid_at_with_buffer(&mut app, 120, 20);
+        assert!(
+            grid_contains(&rows_top, HEAD_SENTINEL),
+            "max-scroll-up missed the true top of wrapped content"
+        );
+        assert!(
+            !grid_contains(&rows_top, TAIL_SENTINEL),
+            "top view shows rows that belong far below"
+        );
+    }
+
+    /// Wide-glyph variant: totals must derive from unicode-width columns, not
+    /// byte lengths, or a CJK/emoji-heavy reply clips its tail.
+    #[test]
+    fn follow_bottom_shows_end_of_wide_glyph_reply() {
+        let mut app = App::new(vec![Chat::new("wide")]);
+        app.chats[0].messages.push(Message::assistant(format!(
+            "{}{}",
+            "\u{4e16}\u{754c}\u{30ec}\u{30d9}\u{30eb} filler ".repeat(120),
+            "\u{7d42}\u{7aef}9X" // 終端 + ASCII digits sentinel
+        )));
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 20);
+        // Ratatui paints a 2-column glyph into its leading cell and pads the
+        // trailing skip-cell with a blank — collapse blanks before matching.
+        let squeezed: Vec<String> = rows.iter().map(|r| r.replace(' ', "")).collect();
+        assert!(
+            grid_contains(&squeezed, "\u{7d42}\u{7aef}9X"),
+            "wide-glyph reply tail hidden in follow-bottom mode"
+        );
+    }
+
+    /// Overflow hint fires iff WRAPPED rows exceed the visible pane — even
+    /// when the logical line count fits comfortably.
+    #[test]
+    fn overflow_hint_appears_iff_wrapped_rows_exceed_visible() {
+        // 120×14 ⇒ main area 11 rows, spinner row y=11, chat inner height 10.
+        let mut app = App::new(vec![Chat::new("hint")]);
+        app.chats[0].messages.push(Message::user("q"));
+        // One huge unbreakable token: 3 LOGICAL lines (~45 display rows).
+        app.chats[0]
+            .messages
+            .push(Message::assistant("X".repeat(4000)));
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 14);
+        assert!(
+            rows[11].contains("more"),
+            "wrapped overflow (>10 rows) must raise the hint"
+        );
+
+        let mut calm = App::new(vec![Chat::new("calm")]);
+        calm.chats[0].messages.push(Message::assistant("tiny"));
+        let (rows_calm, _) = render_grid_at_with_buffer(&mut calm, 120, 14);
+        assert!(
+            !rows_calm[11].contains("more"),
+            "hint raised although content fits"
+        );
+    }
 
     /// Vertical band layout, bottom-up at frame height `H` with editor block
     /// height `h`: status hints `H-1`, band `[H-1-h ..= H-2]`, spinner row
@@ -637,8 +1695,9 @@ mod tests {
         );
         // Chat pane header still rendered above the grown block.
         assert!(rows[0].contains("#1/1"));
-        // Status hints pinned below the band.
-        assert!(rows.last().unwrap().contains("^N new"));
+        // Status hints pinned below the band (compacted ^N token, see
+        // feat_ctrl_t_cycle).
+        assert!(rows.last().unwrap().contains("^N"));
 
         // Collapse back to exactly one placeholder row.
         app.clear_input();
@@ -783,7 +1842,7 @@ mod tests {
         }
         let (rows, buf) = render_grid_at_with_buffer(&mut app, 80, 12);
         assert!(
-            rows.last().unwrap().contains("^N new"),
+            rows.last().unwrap().contains("^N"),
             "status hints must survive the clamp"
         );
         // Block clamped to 12-4 = 8 rows: band top lands at H-1-8 = 3.
@@ -1246,15 +2305,57 @@ mod tests {
 
     /// Status hints line lists the thread tools AND the multi-line hint;
     /// `^C cancel` stays readable next to the longest connection label.
+    /// feat_ctrl_arrows_nav: `^↑↓ chats` documents Ctrl-arrow thread
+    /// switching and `↑↓ caret` documents plain-arrow caret movement.
+    /// feat_thread_delete: `^D del` documents thread deletion.
+    /// feat_focus_panes: `^T panel` documents the pane-focus toggle; the
+    /// rename token compacted to bare `^R` (compact `^N`/`⇧↵`/`^R` tokens
+    /// per the fit budget; README documents the full names).
     #[test]
     fn status_line_lists_rename_and_newline_hints() {
         let mut app = App::new(mock::initial_chats());
         app.connection = Connection::Disconnected;
         let last = render_grid(&mut app).last().unwrap().clone();
 
-        for needle in ["^R rename", "\u{21e7}\u{21b5} nl", "^C cancel"] {
+        for needle in [
+            "^R",
+            "\u{21e7}\u{21b5}",
+            "^C cancel",
+            "^/\u{2325}\u{2191}\u{2193} chats",
+            "\u{2191}\u{2193} caret",
+            "^D del",
+            "^F",
+            "^T panel",
+        ] {
             assert!(last.contains(needle), "{needle} missing from {last:?}");
         }
+        assert!(
+            !last.contains("^T next"),
+            "stale cycling hint must be gone: {last:?}"
+        );
+    }
+
+    /// feat_ctrl_arrows_nav: the hints line plus the LONGEST connection
+    /// label (`● disconnected (press R)`) must fit one row at 120 columns.
+    /// Paragraph clips overflowing content, so the presence of the label's
+    /// tail on the rendered row PROVES nothing was cut — an honest fit check.
+    #[test]
+    fn status_hints_fit_120_cols_with_longest_status_label() {
+        let mut app = App::new(mock::initial_chats());
+        app.connection = Connection::Disconnected;
+        let last = render_grid(&mut app).last().unwrap().clone();
+
+        assert!(
+            last.contains("disconnected (press R)"),
+            "status label clipped — hints overflowed 120 cols: {last:?}"
+        );
+        // Total painted width cannot exceed the frame width.
+        assert!(
+            last.trim_end().width() <= 120,
+            "hints row too wide: {} cols — {:?}",
+            last.trim_end().width(),
+            last
+        );
     }
 
     /// feat_input_visual: the input row carries the panel tint background —
@@ -1405,6 +2506,796 @@ mod tests {
         assert!(
             polluted.is_empty(),
             "baseline polluted between placeholder and chip: {polluted:?}"
+        );
+    }
+
+    // ---- feat_thread_delete: render-level checks -------------------------
+
+    /// The Ctrl+D confirm popup renders the destructive title, the active
+    /// thread's title and the decision hint inside a bordered box.
+    #[test]
+    fn delete_popup_renders_title_thread_and_hint() {
+        let mut app = App::new(vec![Chat::new("Deep Dive")]);
+        app.begin_delete_confirm();
+        let rows = render_grid(&mut app);
+        let flat: String = rows.join("\n");
+
+        assert!(
+            flat.contains("Delete thread"),
+            "popup title missing:\n{flat}"
+        );
+        assert!(flat.contains("Deep Dive"), "thread title missing:\n{flat}");
+        assert!(flat.contains("y/Enter confirm"), "confirm hint missing");
+        assert!(flat.contains("Esc/n cancel"), "cancel hint missing");
+        // Boxed: a closed top border row exists.
+        assert!(rows.iter().any(|r| r.contains('┌') && r.contains('┐')));
+    }
+
+    /// The popup is centered: identical left/right margins on its top row.
+    #[test]
+    fn delete_popup_is_centered() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.begin_delete_confirm();
+        let (_, buf) = render_grid_with_buffer(&mut app);
+
+        let top = (0..buf.area.height)
+            .find(|&y| (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "┌"))
+            .expect("popup top border");
+        let left = (0..buf.area.width)
+            .position(|x| buf[(x, top)].symbol() == "┌")
+            .unwrap() as u16;
+        let right = (0..buf.area.width)
+            .rposition(|x| buf[(x, top)].symbol() == "┐")
+            .unwrap() as u16;
+        assert_eq!(left, buf.area.width - 1 - right, "popup not centered");
+        // ~50% width at the demo resolution: ≥ half the frame.
+        let width = right - left + 1;
+        assert!(
+            width >= buf.area.width / 2,
+            "popup narrower than half the frame"
+        );
+    }
+
+    /// No popup in Normal mode — no overlay artifacts.
+    #[test]
+    fn no_delete_popup_when_closed() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        let flat = render_grid(&mut app).join("\n");
+        assert!(!flat.contains("Delete thread"));
+    }
+
+    /// Deleting the last chat renders the clean empty state without
+    /// panicking: header, sidebar and placeholder input all survive.
+    #[test]
+    fn empty_state_after_deleting_last_chat_renders_cleanly() {
+        let mut app = App::new(vec![Chat::new("solo")]);
+        app.begin_delete_confirm();
+        app.confirm_delete();
+        assert!(app.chats.is_empty());
+
+        let rows = render_grid(&mut app);
+        let input_row = &rows[rows.len() - 2];
+        assert!(
+            input_row.contains("Type a message"),
+            "placeholder input must show in the empty state: {input_row:?}"
+        );
+        assert!(rows.last().unwrap().contains("^N"), "hints intact");
+    }
+
+    // ---- feat_search_thread: render-level checks -------------------------
+
+    /// The search popup renders the query row, the live match list with role
+    /// labels + snippets, and the total count in the title.
+    #[test]
+    fn search_popup_renders_query_matches_and_count() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0]
+            .messages
+            .push(Message::user("the needle question"));
+        app.chats[0]
+            .messages
+            .push(Message::assistant("answer with needle inside"));
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.search_push(ch);
+        }
+
+        let rows = render_grid(&mut app);
+        let flat: String = rows.join("\n");
+
+        assert!(
+            flat.contains("Find in thread") && flat.contains("\u{00b7} 2"),
+            "title must carry the total count: {flat:?}"
+        );
+        assert!(flat.contains("\u{276f} needle"), "query row missing");
+        assert!(flat.contains("You"), "user role label missing");
+        assert!(flat.contains("Chibi"), "assistant role label missing");
+        assert!(
+            flat.contains("needle question") && flat.contains("needle inside"),
+            "snippet context windows missing"
+        );
+        assert!(flat.contains("Enter jump"), "hint missing");
+        // Selected row marker rendered.
+        assert!(flat.contains("\u{25b8}"), "selection marker missing");
+    }
+
+    /// Empty query state renders gracefully: placeholder query row, no
+    /// match rows, no crash, hint still present.
+    #[test]
+    fn search_popup_empty_query_is_graceful() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].messages.push(Message::user("needle"));
+        app.begin_search();
+        let rows = render_grid(&mut app);
+        let flat: String = rows.join("\n");
+
+        assert!(
+            flat.contains("type to search\u{2026}"),
+            "placeholder missing"
+        );
+        assert!(flat.contains("\u{00b7} 0"), "zero count in title");
+        assert!(!flat.contains("\u{25b8}"), "no selection with no matches");
+        assert!(flat.contains("Esc close"), "hint intact");
+    }
+
+    /// Tiny terminals must not panic while the search popup is open — the
+    /// popup box clamps to whatever fits (same guarantee as the delete
+    /// popup), and repeated draws stay stable.
+    #[test]
+    fn search_popup_never_panics_on_tiny_terminal() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].messages.push(Message::user("needle"));
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.search_push(ch);
+        }
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 40, 8);
+        let flat: String = rows.join("\n");
+        assert!(flat.contains("Find in thread"), "popup title present");
+        // Second draw after viewport state exists — still no panic.
+        let _ = render_grid_at_with_buffer(&mut app, 40, 8);
+    }
+
+    /// No popup in Normal mode — no overlay artifacts.
+    #[test]
+    fn no_search_popup_when_closed() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].messages.push(Message::user("needle"));
+        let flat = render_grid(&mut app).join("\n");
+        assert!(!flat.contains("Find in thread"));
+    }
+
+    /// Snippet elides long context with `…` on both sides and keeps the hit
+    /// visible.
+    #[test]
+    fn search_snippet_elides_ends() {
+        // Long enough that the 16-char window can't cover both ends.
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+        let m = crate::app::SearchMatch {
+            message_index: 0,
+            line_index: 0,
+            line_text: text.to_owned(),
+            col: 30, // inside "delta"
+        };
+        let s = search_snippet(&m, "delta");
+        assert!(s.contains("delta"), "hit must stay visible: {s:?}");
+        assert!(s.starts_with('\u{2026}'), "left elision: {s:?}");
+        assert!(s.ends_with('\u{2026}'), "right elision: {s:?}");
+        assert!(s.len() <= text.len(), "snippet must be shorter than source");
+    }
+
+    // ---- feat_search_thread: THE wrapped-jump regression ----------------
+
+    /// THE core acceptance criterion: a search hit inside a visually-WRAPPED
+    /// paragraph (one logical line spanning many display rows) must jump to
+    /// the correct WRAPPED row — the match sits near the top of the viewport
+    /// afterwards, not buried at the bottom (which a logical-line-only
+    /// approximation would produce) and not at the message's first row.
+    #[test]
+    fn search_jump_lands_wrapped_match_near_top() {
+        // Narrow chat pane forces heavy wrapping of the long paragraph.
+        const FRAME_W: u16 = 60;
+        const FRAME_H: u16 = 24;
+        // Chat pane inner width = frame - sidebar(26); chat inner height =
+        // frame - top border(1) - spinner(1) - input(1) - status(1).
+        let pane_width = FRAME_W - 26;
+
+        let mut app = App::new(vec![Chat::new("wrap")]);
+        {
+            let chat = &mut app.chats[0];
+            chat.messages.push(Message::user("first question"));
+            // A LONG single-paragraph reply: one logical line that wraps to
+            // many display rows at this width. The needle sits in the MIDDLE
+            // of the paragraph so the jump must land on a continuation row,
+            // not the first row of the message.
+            let mut para = String::from("alpha filler ");
+            for _ in 0..40 {
+                para.push_str("filler word ");
+            }
+            para.push_str("needle42 mid-paragraph ");
+            for _ in 0..40 {
+                para.push_str("trailing filler ");
+            }
+            chat.messages.push(Message::assistant(para));
+            // Plenty of content BELOW so follow-bottom would hide the match
+            // entirely — the jump must detach from the bottom.
+            for i in 0..30 {
+                chat.messages.push(Message::user(format!("filler q {i}")));
+                chat.messages.push(Message::assistant("short ack"));
+            }
+        }
+
+        // Find the wrapped row of the needle via the renderer's own totals.
+        // Rebuild logical lines exactly as render_chat does, then use the
+        // SAME indexed wrap helper the renderer consumes.
+        let mut lines: Vec<markdown::MdLine> = Vec::new();
+        let mut msg_ranges: Vec<(usize, usize)> = Vec::new();
+        for msg in &app.chats[0].messages {
+            let start = lines.len();
+            match msg.role {
+                Role::User => {
+                    lines.push(Line::from(Span::styled("\u{25cf} You", Style::new())));
+                }
+                Role::Assistant => {
+                    lines.push(Line::from(Span::styled("\u{25cf} Chibi", Style::new())));
+                }
+            }
+            if msg.pending {
+                lines.push(Line::from(""));
+            } else {
+                lines.extend(markdown::render(&msg.markdown, &Theme::tokyo_night()));
+            }
+            lines.push(Line::from(""));
+            msg_ranges.push((start, lines.len()));
+        }
+        let (_, first_row_of) = wrap_message_rows_indexed(&lines, pane_width as usize);
+        // Message 1 (the long paragraph) occupies logical lines
+        // [msg_ranges[1].0, msg_ranges[1].1); its rendered line 0 is
+        // start + 1 (after the role header).
+        let logical = msg_ranges[1].0 + 1;
+        let needle_wrapped_row = first_row_of[logical];
+        assert!(
+            needle_wrapped_row > 1,
+            "needle must live on a WRAPPED continuation row, got {needle_wrapped_row}"
+        );
+
+        // Full render path: set the pending jump and draw.
+        app.begin_search();
+        for ch in "needle42".chars() {
+            app.search_push(ch);
+        }
+        let (mi, li, col) = {
+            let m = &app.search_matches()[0];
+            (m.message_index, m.line_index, m.col)
+        };
+        assert!(app.jump_to_selected(), "match must be found");
+        assert_eq!(
+            app.pending_search_jump,
+            Some((mi, li, col)),
+            "hit in message {mi}, rendered line {li}, char col {col}"
+        );
+
+        let (rows, _) = render_grid_at_with_buffer(&mut app, FRAME_W, FRAME_H);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("needle42"))
+            .expect("needle must be visible after the jump");
+        // Chat pane inner starts at y=1 (top border). "Near top" = within the
+        // first few rows of the pane; 1-row padding puts the match at inner
+        // row 1 → grid y=2. Allow a small tolerance for border/glyph offsets.
+        assert!(
+            (1..=5).contains(&y),
+            "match must be near the top of the pane, got y={y}: {rows:?}"
+        );
+        assert!(
+            !app.at_bottom(),
+            "jump must detach from follow-bottom (match is far above the end)"
+        );
+        assert!(
+            y < rows.len() - 4,
+            "match must NOT be at the bottom of the pane"
+        );
+    }
+
+    /// The wrap helper exposes per-logical-line first-row offsets and keeps
+    /// the plain (non-indexed) wrapper's behavior identical.
+    #[test]
+    fn wrap_message_rows_indexed_matches_plain_wrapper() {
+        let lines = vec![
+            plain_line("short"),
+            plain_line("this line definitely wraps at a narrow width"),
+            plain_line(""),
+            plain_line("x"),
+        ];
+        let (rows, first_row_of) = wrap_message_rows_indexed(&lines, 12);
+        // "short" → 1 row; the long line wraps to 4 rows; "" → 1; "x" → 1.
+        assert_eq!(rows.len(), 7);
+        assert_eq!(first_row_of.len(), lines.len());
+        assert_eq!(first_row_of[0], 0, "short starts at row 0");
+        assert_eq!(first_row_of[1], 1, "long line starts at row 1");
+        assert_eq!(first_row_of[2], 5, "blank line starts after the long line");
+        assert_eq!(first_row_of[3], 6, "x starts at the last row");
+        assert_eq!(
+            wrap_message_rows(&lines, 12),
+            rows,
+            "indexed variant must not change the plain wrapper's output"
+        );
+    }
+
+    /// Hint compaction stays within budget with the longest status label.
+    #[test]
+    fn status_hints_still_fit_with_search_hint() {
+        let mut app = App::new(mock::initial_chats());
+        app.connection = Connection::Disconnected;
+        let last = render_grid(&mut app).last().unwrap().clone();
+        assert!(last.contains("^F"), "^F missing from hints: {last:?}");
+        assert!(last.trim_end().width() <= 120, "hints row too wide");
+    }
+
+    /// A busy-refusal status toast renders in the status line (replacing the
+    /// hint block while visible) and always fits with the longest connection
+    /// label on one 120-col row.
+    #[test]
+    fn status_toast_renders_in_status_line() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.connection = Connection::Disconnected;
+        app.show_status("can't delete — busy");
+        let last = render_grid(&mut app).last().unwrap().clone();
+
+        assert!(
+            last.contains("can't delete — busy"),
+            "toast missing: {last:?}"
+        );
+        assert!(
+            last.contains("disconnected (press R)"),
+            "connection label clipped by toast: {last:?}"
+        );
+        assert!(last.trim_end().width() <= 120, "toast row too wide");
+        // Hints are hidden while the toast is up.
+        assert!(!last.contains("^N"), "hints must yield to the toast");
+    }
+
+    // ---- feat_search_all_threads: render-level checks --------------------
+
+    /// The global search popup renders the query row, the live match list
+    /// with THREAD TITLE + role labels + snippets, and the title carries the
+    /// total match count AND the searched-thread count.
+    #[test]
+    fn search_all_popup_renders_thread_titles_matches_and_counts() {
+        let mut app = App::new(vec![Chat::new("Alpha"), Chat::new("Beta")]);
+        app.chats[0]
+            .messages
+            .push(Message::user("the needle question"));
+        app.chats[1]
+            .messages
+            .push(Message::assistant("answer with needle inside"));
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+
+        let rows = render_grid(&mut app);
+        let flat: String = rows.join("\n");
+
+        assert!(
+            flat.contains("Search all threads")
+                && flat.contains("\u{00b7} 2")
+                && flat.contains("(2 threads)"),
+            "title must carry total count + thread count: {flat:?}"
+        );
+        assert!(flat.contains("\u{276f} needle"), "query row missing");
+        assert!(flat.contains("Alpha"), "thread title label missing");
+        assert!(flat.contains("Beta"), "thread title label missing");
+        assert!(flat.contains("You"), "user role label missing");
+        assert!(flat.contains("Chibi"), "assistant role label missing");
+        assert!(
+            flat.contains("needle question") && flat.contains("needle inside"),
+            "snippet context windows missing"
+        );
+        assert!(flat.contains("Enter jump"), "hint missing");
+        // Selected row marker rendered.
+        assert!(flat.contains("\u{25b8}"), "selection marker missing");
+        // Visually distinguishable from the in-thread popup.
+        assert!(!flat.contains("Find in thread"), "wrong popup title");
+    }
+
+    /// Empty query state renders gracefully: placeholder query row, no
+    /// match rows, zero count + thread count in the title, hint intact.
+    #[test]
+    fn search_all_popup_empty_query_is_graceful() {
+        let mut app = App::new(vec![Chat::new("solo")]);
+        app.chats[0].messages.push(Message::user("needle"));
+        app.begin_search_all();
+        let rows = render_grid(&mut app);
+        let flat: String = rows.join("\n");
+
+        assert!(
+            flat.contains("type to search all threads\u{2026}"),
+            "placeholder missing: {flat:?}"
+        );
+        assert!(
+            flat.contains("\u{00b7} 0") && flat.contains("(1 thread)"),
+            "zero count + thread count in title"
+        );
+        assert!(!flat.contains("\u{25b8}"), "no selection with no matches");
+        assert!(flat.contains("Esc close"), "hint intact");
+    }
+
+    /// Tiny terminals must not panic while the global search popup is open —
+    /// the box clamps to whatever fits, and repeated draws stay stable.
+    #[test]
+    fn search_all_popup_never_panics_on_tiny_terminal() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].messages.push(Message::user("needle"));
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 40, 8);
+        let flat: String = rows.join("\n");
+        assert!(flat.contains("Search all threads"), "popup title present");
+        // Second draw after viewport state exists — still no panic.
+        let _ = render_grid_at_with_buffer(&mut app, 40, 8);
+    }
+
+    /// No popup in Normal mode — no overlay artifacts.
+    #[test]
+    fn no_search_all_popup_when_closed() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].messages.push(Message::user("needle"));
+        let flat = render_grid(&mut app).join("\n");
+        assert!(!flat.contains("Search all threads"));
+    }
+
+    /// The all-threads snippet path elides like the in-thread one (same
+    /// shared core — the wrapper must forward the right fields).
+    #[test]
+    fn search_all_snippet_elides_ends() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+        let m = crate::app::GlobalSearchMatch {
+            chat_index: 3,
+            chat_title: "deep thread".to_owned(),
+            message_index: 0,
+            line_index: 0,
+            line_text: text.to_owned(),
+            col: 30, // inside "delta"
+        };
+        let s = search_snippet_all(&m, "delta");
+        assert!(s.contains("delta"), "hit must stay visible: {s:?}");
+        assert!(s.starts_with('\u{2026}'), "left elision: {s:?}");
+        assert!(s.ends_with('\u{2026}'), "right elision: {s:?}");
+        assert!(s.len() <= text.len(), "snippet must be shorter than source");
+    }
+
+    // ---- feat_search_all_threads: THE cross-thread wrapped-jump regression
+
+    /// THE core acceptance criterion for the global search: a match inside a
+    /// NON-active thread's visually-WRAPPED paragraph must (a) activate that
+    /// thread (same mechanics as Ctrl+↑/↓ switching) and (b) land on the
+    /// exact WRAPPED row near the top of the pane — never the message's
+    /// first row, never the bottom.
+    #[test]
+    fn search_all_jump_activates_non_active_thread_and_lands_wrapped_row() {
+        // Narrow chat pane forces heavy wrapping of the long paragraph.
+        const FRAME_W: u16 = 60;
+        const FRAME_H: u16 = 24;
+        // Chat pane inner width = frame - sidebar(26).
+        let pane_width = FRAME_W - 26;
+
+        let mut app = App::new(vec![Chat::new("target"), Chat::new("decoy")]);
+        // The ACTIVE chat at search time: chat 0. Lots of filler so
+        // follow-bottom of THIS chat would never show chat 1's needle.
+        {
+            let chat = &mut app.chats[0];
+            chat.messages
+                .push(Message::user("filler in the active thread"));
+            for i in 0..20 {
+                chat.messages.push(Message::user(format!("filler q {i}")));
+                chat.messages.push(Message::assistant("short ack"));
+            }
+        }
+        // The NON-active chat holding the wrapped needle.
+        {
+            let chat = &mut app.chats[1];
+            chat.messages.push(Message::user("first question"));
+            // A LONG single-paragraph reply: one logical line that wraps to
+            // many display rows at this width. The needle sits in the MIDDLE
+            // of the paragraph so the jump must land on a continuation row.
+            let mut para = String::from("alpha filler ");
+            for _ in 0..40 {
+                para.push_str("filler word ");
+            }
+            para.push_str("needle42 mid-paragraph ");
+            for _ in 0..40 {
+                para.push_str("trailing filler ");
+            }
+            chat.messages.push(Message::assistant(para));
+            // Plenty of content BELOW so follow-bottom would hide the match
+            // entirely — the jump must detach from the bottom.
+            for i in 0..30 {
+                chat.messages.push(Message::user(format!("filler q {i}")));
+                chat.messages.push(Message::assistant("short ack"));
+            }
+        }
+        app.active = 0; // searching from chat 0; the hit lives in chat 1
+
+        // Rebuild logical lines of the TARGET chat exactly as render_chat
+        // does, then use the SAME indexed wrap helper the renderer consumes
+        // to prove the needle lives on a WRAPPED continuation row.
+        let mut lines: Vec<markdown::MdLine> = Vec::new();
+        let mut msg_ranges: Vec<(usize, usize)> = Vec::new();
+        for msg in &app.chats[1].messages {
+            let start = lines.len();
+            match msg.role {
+                Role::User => {
+                    lines.push(Line::from(Span::styled("\u{25cf} You", Style::new())));
+                }
+                Role::Assistant => {
+                    lines.push(Line::from(Span::styled("\u{25cf} Chibi", Style::new())));
+                }
+            }
+            if msg.pending {
+                lines.push(Line::from(""));
+            } else {
+                lines.extend(markdown::render(&msg.markdown, &Theme::tokyo_night()));
+            }
+            lines.push(Line::from(""));
+            msg_ranges.push((start, lines.len()));
+        }
+        let (_, first_row_of) = wrap_message_rows_indexed(&lines, pane_width as usize);
+        let logical = msg_ranges[1].0 + 1; // long paragraph, after role header
+        let needle_wrapped_row = first_row_of[logical];
+        assert!(
+            needle_wrapped_row > 1,
+            "needle must live on a WRAPPED continuation row, got {needle_wrapped_row}"
+        );
+
+        // Full path: open the GLOBAL search from chat 0, type, jump.
+        app.begin_search_all();
+        for ch in "needle42".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_matches().len(), 1);
+        let (ci, mi, li, col) = {
+            let m = &app.search_all_matches()[0];
+            (m.chat_index, m.message_index, m.line_index, m.col)
+        };
+        assert_eq!(ci, 1, "hit lives in the NON-active thread");
+        assert!(app.jump_to_selected_all(), "match must be found");
+        assert_eq!(app.active, 1, "target thread activated by the jump");
+        assert_eq!(app.pending_global_search_jump, Some((ci, mi, li, col)));
+
+        let (rows, _) = render_grid_at_with_buffer(&mut app, FRAME_W, FRAME_H);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("needle42"))
+            .expect("needle must be visible after the jump");
+        // Chat pane inner starts at y=1 (top border). "Near top" = within the
+        // first few rows of the pane; 1-row padding puts the match at inner
+        // row 1 → grid y=2. Allow a small tolerance for border/glyph offsets.
+        assert!(
+            (1..=5).contains(&y),
+            "match must be near the top of the pane, got y={y}: {rows:?}"
+        );
+        assert!(
+            !app.at_bottom(),
+            "jump must detach from follow-bottom (match is far above the end)"
+        );
+        assert!(
+            y < rows.len() - 4,
+            "match must NOT be at the bottom of the pane"
+        );
+    }
+
+    /// feat_search_all_threads: the hints line gains `^⇧F all` and still fits
+    /// 120 cols with the longest status label — the self-evident `^L` and
+    /// `^V` hints retired to make room (both actions stay README-documented).
+    #[test]
+    fn status_hints_still_fit_with_global_search_hint() {
+        let mut app = App::new(mock::initial_chats());
+        app.connection = Connection::Disconnected;
+        let last = render_grid(&mut app).last().unwrap().clone();
+
+        assert!(
+            last.contains("^\u{21e7}F all"),
+            "^⇧F all missing from hints: {last:?}"
+        );
+        assert!(last.contains("^F"), "^F missing: {last:?}");
+        assert!(
+            last.contains("^C cancel"),
+            "^C cancel must never be dropped"
+        );
+        assert!(
+            last.contains("disconnected (press R)"),
+            "status label clipped — hints overflowed 120 cols: {last:?}"
+        );
+        assert!(
+            last.trim_end().width() <= 120,
+            "hints row too wide: {} cols — {:?}",
+            last.trim_end().width(),
+            last
+        );
+    }
+
+    /// feat_focus_panes: the hints line carries `^T panel` (focus toggle —
+    /// wrap-cycling was removed) and still fits 120 cols with the longest
+    /// status label — `^R rename` compacted to `^R` to absorb the +1 col.
+    /// ^C cancel is never dropped.
+    #[test]
+    fn status_hints_still_fit_with_ctrl_t_panel_hint() {
+        let mut app = App::new(mock::initial_chats());
+        app.connection = Connection::Disconnected;
+        let last = render_grid(&mut app).last().unwrap().clone();
+
+        assert!(
+            last.contains("^T panel"),
+            "^T panel missing from hints: {last:?}"
+        );
+        assert!(
+            !last.contains("next"),
+            "stale ^T next hint must be gone: {last:?}"
+        );
+        assert!(
+            last.contains("^C cancel"),
+            "^C cancel must never be dropped"
+        );
+        assert!(
+            last.contains("disconnected (press R)"),
+            "status label clipped — hints overflowed 120 cols: {last:?}"
+        );
+        assert!(
+            last.trim_end().width() <= 120,
+            "hints row too wide: {} cols — {:?}",
+            last.trim_end().width(),
+            last
+        );
+    }
+
+    // ---- feat_focus_panes: visuals ------------------------------------------
+
+    /// Focus emphasis differs between focuses: with Chat focused, the
+    /// sidebar divider is the resting dark selection tone; with Sidebar
+    /// focused it lifts to theme.blue. Snapshot-style per-cell fg compare
+    /// on the same app state, only the focus flipped.
+    #[test]
+    fn sidebar_border_emphasis_differs_between_focuses() {
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(vec![Chat::new("one"), Chat::new("two")]);
+
+        // Divider column: x=25 (sidebar width 26, right border col), any
+        // main-area row inside both renders.
+        let (_, chat_focused_buf) = render_grid_with_buffer(&mut app);
+        assert_eq!(chat_focused_buf[(25, 5)].fg, theme.selection);
+
+        app.focus = Focus::Sidebar;
+        let (_, sidebar_focused_buf) = render_grid_with_buffer(&mut app);
+        assert_eq!(sidebar_focused_buf[(25, 5)].fg, theme.blue);
+
+        // Bottom-extended divider (below the block, e.g. the input band)
+        // follows the same emphasis: row 33 of 34 @120×34 is status-ish;
+        // check row just below the sidebar block too. Use row 30.
+        assert_eq!(sidebar_focused_buf[(25, 30)].fg, theme.blue);
+        assert_ne!(
+            chat_focused_buf[(25, 5)].fg,
+            sidebar_focused_buf[(25, 5)].fg,
+            "border color must visibly differ between focuses"
+        );
+    }
+
+    /// The ` Chats ` title brightens blue → cyan while the sidebar holds
+    /// focus (same snapshot technique as the border test).
+    #[test]
+    fn sidebar_title_emphasis_differs_between_focuses() {
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(vec![Chat::new("one"), Chat::new("two")]);
+
+        // Title cell: find "C" of "Chats" on row 0 (x≈1..7).
+        let title_x = |buf: &ratatui::buffer::Buffer| {
+            (0..20)
+                .find(|&x| buf[(x, 0)].symbol() == "C")
+                .expect("title not found")
+        };
+
+        let (_, chat_buf) = render_grid_with_buffer(&mut app);
+        let x_chat = title_x(&chat_buf);
+        assert_eq!(chat_buf[(x_chat, 0)].fg, theme.blue);
+
+        app.focus = Focus::Sidebar;
+        let (_, side_buf) = render_grid_with_buffer(&mut app);
+        let x_side = title_x(&side_buf);
+        assert_eq!(side_buf[(x_side, 0)].fg, theme.cyan);
+    }
+
+    /// Idle unselected dots brighten dim → fg while the sidebar owns the
+    /// keyboard; selected idle stays green either way.
+    #[test]
+    fn sidebar_idle_dots_brighten_when_focused() {
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(vec![Chat::new("first"), Chat::new("second")]);
+
+        let (_, chat_buf) = render_grid_with_buffer(&mut app);
+        // Row 2 = second chat's unselected idle dot.
+        assert_eq!(chat_buf[(0, 2)].fg, theme.dim);
+
+        app.focus = Focus::Sidebar;
+        let (_, side_buf) = render_grid_with_buffer(&mut app);
+        assert_eq!(side_buf[(0, 2)].fg, theme.fg, "unselected dot brightens");
+        // Selected (row 1) keeps green in both focuses.
+        assert_eq!(chat_buf[(0, 1)].fg, theme.green);
+        assert_eq!(side_buf[(0, 1)].fg, theme.green);
+    }
+
+    /// The prompt's `❯` marker dims cyan → theme.dim while the sidebar
+    /// holds focus (subtle "typing goes nowhere" cue); back to cyan on
+    /// return.
+    #[test]
+    fn prompt_marker_dims_while_sidebar_focused() {
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(vec![Chat::new("one")]);
+        type_text_into_input(&mut app, "draft");
+
+        let marker_fg = |app: &mut App| render_grid_at_with_buffer(app, 120, 34).1[(26, 32)].fg;
+
+        assert_eq!(marker_fg(&mut app), theme.cyan, "Chat focus → cyan");
+        app.focus = Focus::Sidebar;
+        assert_eq!(marker_fg(&mut app), theme.dim, "Sidebar focus → dimmed");
+    }
+
+    // ---- feat_focus_panes: selection auto-scroll ------------------------------
+
+    /// Type into the prompt textarea through tui-textarea directly (test
+    /// helper shared by marker tests).
+    fn type_text_into_input(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.input.input(tui_textarea::Input {
+                key: tui_textarea::Key::Char(ch),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+        }
+    }
+
+    /// Selection-aware viewport: with MORE chats than sidebar rows, moving
+    /// the selection down must scroll the list so the ACTIVE row becomes
+    /// visible (ratatui's List keeps a fresh-state offset minimal but
+    /// selection-inclusive every frame), and moving back up restores the
+    /// top rows.
+    #[test]
+    fn sidebar_scrolls_selection_into_view_beyond_viewport() {
+        let chats: Vec<Chat> = (0..30).map(|i| Chat::new(format!("chat-{i}"))).collect();
+        let mut app = App::new(chats);
+
+        // Tiny frame: 12 rows total → main area ≈ 9 rows ⇒ ~9 visible chats.
+        let rows_of = |app: &mut App| {
+            render_grid_at_with_buffer(app, 120, 12)
+                .0
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let visible_named = |rows: &[String], name: &str| rows.iter().any(|r| r.contains(name));
+
+        let rows = rows_of(&mut app);
+        assert!(visible_named(&rows, "chat-0"), "top chat visible initially");
+        assert!(!visible_named(&rows, "chat-25"), "precondition sanity");
+
+        // Jump to a selection deep BELOW the viewport…
+        for _ in 0..25 {
+            app.select_next();
+        }
+        let rows = rows_of(&mut app);
+        assert!(
+            visible_named(&rows, "chat-25"),
+            "active chat scrolled INTO view when below viewport"
+        );
+
+        // …and far ABOVE it again.
+        app.active = 0;
+        app.scroll = 0;
+        let rows = rows_of(&mut app);
+        assert!(
+            visible_named(&rows, "chat-0"),
+            "selection returned to the visible top"
         );
     }
 }

@@ -34,7 +34,7 @@ use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use chibi_tui::app::{Connection, Mode, ReconnectRequest};
+use chibi_tui::app::{Connection, Focus, Mode, ReconnectRequest};
 use chibi_tui::backend::{Backend, BackendEvent};
 use chibi_tui::{history, mock, splash, theme, ui};
 
@@ -247,9 +247,33 @@ async fn run_loop(
                             // feat_rename_thread: snapshot BEFORE the key
                             // lands so the loop can tell a rename commit
                             // (Renaming --Enter--> Normal) apart from a plain
-                            // message submission.
+                            // message submission. NOTE: rename detection uses
+                            // `matches!(.. Renaming)` — NOT `!is_normal()` —
+                            // because the delete-confirm popup (feat_thread_
+                            // delete) also leaves Normal mode, and its Enter
+                            // is a deletion, never a rename.
                             let name_before = app.chat_title();
-                            let was_renaming = !app.mode.is_normal();
+                            let was_renaming = matches!(app.mode, Mode::Renaming { .. });
+                            let was_confirming_delete =
+                                matches!(app.mode, Mode::ConfirmDelete);
+                            // feat_search_thread: snapshot BEFORE the key
+                            // lands too — the search popup's Enter jumps and
+                            // closes, so by the time the loop runs the mode
+                            // is already Normal again; only the snapshot can
+                            // tell that Enter apart from a plain submit.
+                            let was_searching = matches!(app.mode, Mode::Searching { .. });
+                            // feat_search_all_threads: same snapshot for the
+                            // GLOBAL search popup — its Enter activates the
+                            // match's thread AND closes the popup, so the
+                            // loop must know that Enter belonged to it.
+                            let was_searching_all =
+                                matches!(app.mode, Mode::SearchingAll { .. });
+                            // feat_focus_panes: snapshot of the SIDEBAR-focus
+                            // flag. Bare Enter while the sidebar holds focus
+                            // means "apply & return to the editor" (handle_key
+                            // flips focus back) — it must never also submit
+                            // the message draft the editor still holds.
+                            let was_sidebar_focused = app.focus == Focus::Sidebar;
 
                             handle_key(&mut app, key);
 
@@ -266,6 +290,41 @@ async fn run_loop(
                             // (a rejected save must not leak into the prompt).
                             let enter_consumed_by_rename =
                                 was_renaming && key.code == KeyCode::Enter;
+                            // feat_thread_delete: the Enter that confirmed the
+                            // delete popup belongs to the popup too — it must
+                            // never submit the message draft to the neighbour.
+                            let enter_consumed_by_delete =
+                                was_confirming_delete && key.code == KeyCode::Enter;
+                            // feat_search_thread: the Enter that jumped to the
+                            // selected match belongs to the popup too — it
+                            // must never submit the message draft.
+                            let enter_consumed_by_search =
+                                was_searching && key.code == KeyCode::Enter;
+                            // feat_search_all_threads: same gate for the
+                            // global search popup's Enter — it activates the
+                            // target thread and must never submit the draft
+                            // to that (or any) chat.
+                            let enter_consumed_by_search_all =
+                                was_searching_all && key.code == KeyCode::Enter;
+                            // feat_focus_panes: the sidebar's bare Enter is
+                            // consumed too — it returns focus to the editor
+                            // pane and never submits.
+                            let enter_consumed_by_sidebar =
+                                was_sidebar_focused && key.code == KeyCode::Enter;
+
+                            // A confirmed thread deletion removes the persisted
+                            // history file (idempotent: a missing file is
+                            // success). Consumed here, right after the key, so
+                            // the removal happens regardless of what follows.
+                            if let Some(removed_id) = app.pending_delete.take() {
+                                if let Err(e) =
+                                    history::delete_chat_file_in(history_dir, &removed_id)
+                                {
+                                    eprintln!(
+                                        "chibi-tui: could not delete chat history: {e}"
+                                    );
+                                }
+                            }
 
                             // Popup-requested reconnect (R).
                             if let Some(ReconnectRequest {}) = app.reconnect_requested.take() {
@@ -312,13 +371,23 @@ async fn run_loop(
                             // editor, and the renamed chat is persisted here so
                             // the new title survives restarts.
                             if renamed {
-                                persist_chat(&app.chats[app.active], history_dir);
+                                // The chat exists by construction here (a
+                                // rename commit cannot delete it), but guard
+                                // anyway — `active` may point nowhere after a
+                                // delete-into-empty-state.
+                                if let Some(chat) = app.chats.get(app.active) {
+                                    persist_chat(chat, history_dir);
+                                }
                             } else if enter_consumed_by_rename {
                                 // Rejected rename save (empty draft): nothing
                                 // to do — old name kept, nothing persisted.
                             } else if app.error_popup.is_none()
                                 && source.accepts_submissions()
                                 && should_submit(&key)
+                                && !enter_consumed_by_delete
+                                && !enter_consumed_by_search
+                                && !enter_consumed_by_search_all
+                                && !enter_consumed_by_sidebar
                             {
                                 let submitted = app.take_input();
                                 if let Some(submitted) = submitted {
@@ -331,6 +400,19 @@ async fn run_loop(
                                     // unexpected shutdown too.
                                     persist_chat(&app.chats[app.active], history_dir);
                                 }
+                            }
+
+                            // bugfix_ctrl_l_screen_clear: ^L wipes the VISIBLE
+                            // screen. Crossterm's Clear(All) is emitted HERE —
+                            // outside ratatui's diff-based draw; Terminal::
+                            // clear() also resets ratatui's cached back buffer,
+                            // so the immediately-following draw repaints every
+                            // cell and nothing stale lingers. App::request_
+                            // clear_screen already snapped the chat view to
+                            // follow-bottom before this fires.
+                            if app.take_clear_screen_request() {
+                                terminal.clear()?;
+                                terminal.draw(|f| ui::draw(f, &mut app, theme))?;
                             }
                         }
                     }
@@ -379,6 +461,9 @@ async fn run_loop(
                 if app.any_busy() {
                     app.tick_spinner();
                 }
+                // feat_thread_delete: the transient status toast (busy
+                // refusal) auto-expires on the same 100 ms cadence.
+                app.tick_status_message();
             }
         }
 
@@ -483,6 +568,10 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         return;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // feat_alt_arrows_nav: Alt+↑/↓ are a full synonym of Ctrl+↑/↓ thread
+    // switching (see the match below); macOS Mission Control hijacks
+    // Ctrl+arrows system-wide before they ever reach the terminal.
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // ---- modal error popup captures everything ----
     // (Ctrl+R rename is intentionally unreachable while the popup is open:
@@ -498,6 +587,93 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('c') if ctrl => app.should_quit = true,
             // Any other key just dismisses the popup (stay in the app).
             _ => app.dismiss_error(),
+        }
+        return;
+    }
+
+    // ---- feat_thread_delete: modal confirm popup captures everything ----
+    //
+    // While the Ctrl+D confirmation is open, ONLY the destructive decision
+    // keys work: Enter/`y` confirm, Esc/`n` cancel, Ctrl+C quits (same
+    // class as the error popup's Ctrl+C). Everything else — typing, arrows,
+    // Ctrl+N/R/L/F — is swallowed so no keystroke leaks into the textarea
+    // and no global binding fires. `q` is deliberately left UNBOUND here
+    // (unlike the error popup): a stray `q` must never quit while a
+    // destructive confirmation is on screen.
+    if matches!(app.mode, Mode::ConfirmDelete) {
+        match key.code {
+            KeyCode::Enter => {
+                app.confirm_delete();
+            }
+            // Plain y/Y confirm (Ctrl+Y is swallowed like any other combo).
+            KeyCode::Char('y') | KeyCode::Char('Y') if !ctrl => {
+                app.confirm_delete();
+            }
+            KeyCode::Esc => {
+                app.cancel_delete();
+            }
+            // Plain n/N cancel (Ctrl+N stays suspended — new-chat must not
+            // fire and must not cancel the popup either).
+            KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
+                app.cancel_delete();
+            }
+            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            _ => {}
+        }
+        return;
+    }
+
+    // ---- feat_search_thread: modal search popup captures everything ----
+    //
+    // While the Ctrl+F search popup is open, ONLY search keys work: plain
+    // chars edit the query (live recompute), Backspace edits backwards,
+    // ↑/↓ navigate matches, Enter jumps to the selected match and closes,
+    // Esc closes without jumping, Ctrl+C quits (same class as the other
+    // popups). Everything else — PgUp/PgDn, arrows, Ctrl+N/R/L/D, q — is
+    // swallowed so no keystroke leaks into the textarea and no global
+    // binding fires. Chat scroll is driven ONLY by the jump, never by
+    // PgUp/PgDn while the popup is open.
+    if matches!(app.mode, Mode::Searching { .. }) {
+        match key.code {
+            KeyCode::Up => app.search_select_prev(),
+            KeyCode::Down => app.search_select_next(),
+            KeyCode::Enter => {
+                app.jump_to_selected();
+            }
+            KeyCode::Esc => {
+                app.cancel_search();
+            }
+            KeyCode::Backspace => app.search_backspace(),
+            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char(ch) if !ctrl => app.search_push(ch),
+            _ => {}
+        }
+        return;
+    }
+
+    // ---- feat_search_all_threads: modal GLOBAL search popup captures ----
+    // everything ----
+    //
+    // Same modal-ish isolation as the in-thread search popup: while the
+    // Ctrl+Shift+F popup is open, ONLY search keys work. The one behavioral
+    // difference is Enter — it ACTIVATES the match's thread (switching the
+    // active chat, same mechanics as Ctrl+↑/↓) before recording the jump.
+    // Everything else — PgUp/PgDn, arrows, Ctrl+N/R/L/D/F — is swallowed so
+    // no keystroke leaks into the textarea and no global binding fires.
+    if matches!(app.mode, Mode::SearchingAll { .. }) {
+        match key.code {
+            KeyCode::Up => app.search_all_select_prev(),
+            KeyCode::Down => app.search_all_select_next(),
+            KeyCode::Enter => {
+                app.jump_to_selected_all();
+            }
+            KeyCode::Esc => {
+                app.cancel_search_all();
+            }
+            KeyCode::Backspace => app.search_all_backspace(),
+            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char(ch) if !ctrl => app.search_all_push(ch),
+            _ => {}
         }
         return;
     }
@@ -553,8 +729,12 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             }
             KeyCode::Backspace => app.rename_backspace(),
             KeyCode::Up | KeyCode::Down => {
-                // Chat navigation stays blocked mid-rename: switching the
-                // active chat under an open editor would be confusing.
+                // Thread navigation stays blocked mid-rename — in ALL
+                // modifier flavors (feat_ctrl_arrows_nav + feat_alt_arrows_
+                // nav: Ctrl+↑/↓ AND Alt+↑/↓ switch threads in Normal mode,
+                // but never under an open editor; plain ↑/↓ are consumed by
+                // the block as caret no-ops). Switching the active chat
+                // under an open rename would be confusing.
             }
             _ => {
                 if let KeyCode::Char(ch) = key.code {
@@ -572,6 +752,64 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         return;
     }
 
+    // ---- feat_focus_panes: the SIDEBAR owns the keyboard --------------------
+    //
+    // While the sidebar holds focus ONLY navigation + service keys work;
+    // everything else is swallowed so no keystroke can ever leak into the
+    // prompt textarea (Shift+Enter / Alt+Enter newlines, readline edits,
+    // paste — all included). This branch sits AFTER the modal popup and
+    // rename branches (those always capture first) and BEFORE the editor
+    // fall-through:
+    //
+    // * ↑/↓ move the selection with LIVE active-chat switching — the same
+    //   clamp + follow-bottom mechanics as Ctrl+↑/↓ in Normal mode; every
+    //   arrow flavor routes here identically.
+    // * bare Enter applies and returns focus to Chat (active chat stays
+    //   highlighted; the event loop suppresses submission for it via
+    //   `enter_consumed_by_sidebar`); Esc returns WITHOUT touching the
+    //   draft — deliberately different from Normal-mode Esc (clears input).
+    // * PgUp/PgDn STILL scroll the CHAT pane: reading works regardless of
+    //   focus (documented choice).
+    // * Global service chords stay live with their exact Normal-mode
+    //   semantics (parity by contract with the chord match below): ^T
+    //   toggles back to Chat, ^F / ^⇧F open the search popups (each close
+    //   resets focus to Chat via App), ^N creates a chat (App lands focus
+    //   on Chat), ^D opens the guarded confirm popup, ^L clears input +
+    //   screen. ^C quit/cancel is serviced even earlier (global section).
+    //   ^R rename also never reaches this branch: its entry guard sits
+    //   above, so renaming from a Sidebar-focused UI works and closing the
+    //   session returns focus to Chat (App::commit/cancel_rename).
+    if app.focus == Focus::Sidebar {
+        match key.code {
+            KeyCode::Char('f') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.begin_search_all();
+            }
+            KeyCode::Char('t') if ctrl => app.toggle_focus(),
+            KeyCode::Char('n') if ctrl => app.new_chat(),
+            KeyCode::Char('d') if ctrl => app.begin_delete_confirm(),
+            KeyCode::Char('l') if ctrl => {
+                // Same pair as the global ^L arm below (clear + wipe intent).
+                app.clear_input();
+                app.request_clear_screen();
+            }
+            KeyCode::Char('f') if ctrl => app.begin_search(),
+            // Chat-pane scrolling regardless of focus.
+            KeyCode::PageUp => app.scroll_up(app.chat_visible_rows),
+            KeyCode::PageDown => app.scroll_down(app.chat_visible_rows),
+            // Selection navigation with live active-chat switching (all
+            // modifier flavors behave identically here).
+            KeyCode::Up => app.select_prev(),
+            KeyCode::Down => app.select_next(),
+            // Apply & return to the editor — no submit side effect.
+            KeyCode::Enter if key.modifiers.is_empty() => app.focus = Focus::Chat,
+            // Return without touching the draft (never clears input).
+            KeyCode::Esc => app.focus = Focus::Chat,
+            // Everything else is swallowed while the sidebar is focused.
+            _ => {}
+        }
+        return;
+    }
+
     // ---- extended input keybindings (readline-style) ----
     // Paste accepts Ctrl+V and macOS Cmd+V (crossterm reports the Command
     // key as META).
@@ -585,7 +823,14 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     }
     match (key.code, ctrl) {
         (KeyCode::Char('l'), true) => {
+            // Readline `^L` kept clearing the input, but in a chat TUI the
+            // hint bar's `^L clear` reads as "wipe the visible screen"
+            // (bugfix_ctrl_l_screen_clear). Both now: input is still cleared,
+            // and a one-shot wipe intent is recorded for the event loop —
+            // the real crossterm Clear(All) + full repaint is emitted there,
+            // outside ratatui's diff-based draw.
             app.clear_input();
+            app.request_clear_screen();
             return;
         }
         (KeyCode::Char('u'), true) => {
@@ -599,20 +844,85 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             app.new_chat();
             return;
         }
+        // Ctrl+D: delete the active thread (idle only) via the confirm
+        // popup. Busy/queued chats are refused with a status toast inside
+        // App::begin_delete_confirm — the popup never opens there.
+        (KeyCode::Char('d'), true) => {
+            app.begin_delete_confirm();
+            return;
+        }
+        // Ctrl+Shift+F: GLOBAL search across ALL threads
+        // (feat_search_all_threads). With the kitty keyboard protocol
+        // (pushed at startup) Ctrl+Shift+F arrives as Char('f') +
+        // CONTROL|SHIFT; on terminals WITHOUT it the Shift modifier is
+        // lost and the chord degrades to plain Ctrl+F (in-thread search) —
+        // documented in the README. Guarded inside App::begin_search_all
+        // (Normal mode only), so it can never fire over the confirm/rename/
+        // search popups — those branches return before this match runs.
+        (KeyCode::Char('f'), true) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.begin_search_all();
+            return;
+        }
+        // Ctrl+F: open the in-thread search popup (feat_search_thread).
+        // Guarded inside App::begin_search (Normal mode + active chat
+        // only), so this can never fire over the confirm/rename popups —
+        // those branches return before this match runs.
+        (KeyCode::Char('f'), true) => {
+            app.begin_search();
+            return;
+        }
+        // Ctrl+T: TOGGLE PANE FOCUS (feat_focus_panes) — flips the keyboard
+        // between Chat (editor) and Sidebar. Replaces the old wrap-cycling
+        // thread switcher, which live-check feedback rejected ("just moves
+        // the selection down"). Deliberately a plain Ctrl+letter chord so it
+        // works in ANY terminal. Modal modes swallow this like every other
+        // chord — the error/confirm/search branches and the rename branch
+        // return before this match runs.
+        (KeyCode::Char('t'), true) => {
+            app.toggle_focus();
+            return;
+        }
         // Ctrl+A / Ctrl+E reach tui-textarea's built-in readline mappings
         // (head/end of line); they fall through untouched below.
         _ => {}
     }
 
-    // Vim-style navigation only when the input buffer is empty.
+    // ---- vertical arrows & thread switching (feat_ctrl_arrows_nav + --------
+    // feat_alt_arrows_nav) ----------------------------------------------------
+    //
+    // * Ctrl+↑ / Ctrl+↓ AND Alt+↑ / Alt+↓ switch the ACTIVE THREAD, carrying
+    //   over EXACTLY the semantics plain ↑/↓ had before this rework:
+    //   App::select_prev/next bounds-clamp the index and reset the chat
+    //   scroll to 0; sidebar focus/dot refresh derives from `active` at draw
+    //   time, so it follows for free. Alt is a FULL SYNONYM (not a fallback):
+    //   both flavors route to the identical select_prev/select_next call —
+    //   zero behavior divergence. Alt exists because macOS Mission Control
+    //   hijacks Ctrl+arrows system-wide before they reach the terminal.
+    // * Plain ↑ / ↓ move the TEXT CURSOR vertically inside the editor via
+    //   tui-textarea's native Up/Down mapping (CursorMove::Up/Down). They
+    //   never submit and never switch threads; the caret auto-follows the
+    //   feat_input_grow viewport because ui::draw renders the widget over
+    //   the full grown block every frame.
     let input_is_empty = app.input.lines().iter().all(|l| l.is_empty());
 
-    match key.code {
-        KeyCode::Up => app.select_prev(),
-        KeyCode::Down => app.select_next(),
-        KeyCode::PageUp => app.scroll_up(app.chat_visible_rows),
-        KeyCode::PageDown => app.scroll_down(app.chat_visible_rows),
-        KeyCode::Esc if !input_is_empty => {
+    match (key.code, ctrl) {
+        (KeyCode::Up, true) => app.select_prev(),
+        (KeyCode::Down, true) => app.select_next(),
+        // Alt+↑/↓ (ctrl unset): same select_prev/next mechanics as the ctrl
+        // flavor above. When BOTH modifiers ride along, the ctrl arm wins —
+        // identical to pre-alt behavior.
+        (KeyCode::Up, false) if alt => app.select_prev(),
+        (KeyCode::Down, false) if alt => app.select_next(),
+        // Plain (and Shift-decorated) vertical arrows go straight into the
+        // textarea's readline-compatible handler — caret movement only.
+        // Alt+↑/↓ never reach this arm (the synonym arms above take them).
+        (KeyCode::Up | KeyCode::Down, _) => {
+            let converted: tui_textarea::Input = key.into();
+            app.input.input(converted);
+        }
+        (KeyCode::PageUp, _) => app.scroll_up(app.chat_visible_rows),
+        (KeyCode::PageDown, _) => app.scroll_down(app.chat_visible_rows),
+        (KeyCode::Esc, _) if !input_is_empty => {
             // Non-empty input: clear it.
             app.clear_input();
         }
@@ -623,17 +933,17 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // textarea as newline inserts. On terminals WITHOUT the kitty
         // keyboard protocol, Shift+Enter arrives as bare Enter bytes and
         // degrades to submit — documented in the README.
-        KeyCode::Enter
+        (KeyCode::Enter, _)
             if key
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
         {
             app.input.insert_newline();
         }
-        KeyCode::Enter => {}
+        (KeyCode::Enter, _) => {}
         // Everything else (including Ctrl+A/E, Alt+B/F, Alt+D word ops)
         // goes into the textarea's readline-compatible handler.
-        _ => {
+        (_, _) => {
             let converted: tui_textarea::Input = key.into();
             app.input.input(converted);
         }
@@ -644,6 +954,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
 mod tests {
     use super::*;
     use chibi_tui::app::Chat;
+    use chibi_tui::model::Message;
 
     fn key_event(code: KeyCode, modifiers: KeyModifiers) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(code, modifiers)
@@ -768,6 +1079,42 @@ mod tests {
         assert_eq!(app.chats.len(), 1);
         press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert_eq!(app.chats.len(), 2, "Ctrl+N creates a new chat");
+    }
+
+    // ---- bugfix_ctrl_l_screen_clear ------------------------------------------
+
+    #[test]
+    fn ctrl_l_wipes_screen_intent_and_resets_scroll_to_bottom() {
+        let mut app = app_with_chats(1);
+        for ch in "hello".chars() {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.scroll_up(30);
+        assert!(!app.at_bottom(), "precondition: chat view is scrolled up");
+
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+
+        assert!(
+            app.input.lines().iter().all(|l| l.is_empty()),
+            "^L keeps clearing the input (readline compatibility)"
+        );
+        assert_eq!(
+            app.scroll, 0,
+            "screen wipe snaps the chat view back to follow-bottom"
+        );
+        assert!(app.at_bottom());
+        assert!(
+            app.take_clear_screen_request(),
+            "one-shot wipe intent handed to the event loop"
+        );
+
+        // Esc is unchanged: input-clear only, never a screen wipe.
+        for ch in "again".chars() {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.input.lines().iter().all(|l| l.is_empty()));
+        assert!(!app.clear_screen_requested, "Esc must not request a wipe");
     }
 
     // ---- should_submit -------------------------------------------------------
@@ -964,6 +1311,25 @@ mod tests {
         assert_eq!(app.active, 0, "chat navigation blocked by popup");
         assert!(app.error_popup.is_none(), "Down dismissed the popup");
         assert!(!app.should_quit);
+
+        // feat_ctrl_arrows_nav: Ctrl+↑/↓ (thread switching in Normal mode)
+        // are just another dismiss key under the popup — no thread change.
+        app.show_error("boom again");
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 0, "Ctrl+Down must not switch chats via popup");
+        assert!(app.error_popup.is_none(), "Ctrl+Down dismissed the popup");
+        app.show_error("boom thrice");
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 0, "Ctrl+Up must not switch chats via popup");
+
+        // feat_alt_arrows_nav: the Alt synonym is swallowed identically.
+        app.show_error("boom quater");
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(app.active, 0, "Alt+Down must not switch chats via popup");
+        assert!(app.error_popup.is_none(), "Alt+Down dismissed the popup");
+        app.show_error("boom quinquies");
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.active, 0, "Alt+Up must not switch chats via popup");
     }
 
     // ---- extended input keybindings ------------------------------------------
@@ -1151,16 +1517,32 @@ mod tests {
         );
     }
 
-    /// Chat navigation (↑/↓) is blocked mid-rename so the active chat cannot
-    /// silently change under the open editor.
+    /// Chat navigation is blocked mid-rename in ALL modifier flavors so the
+    /// active chat cannot silently change under the open editor
+    /// (feat_ctrl_arrows_nav: plain ↑/↓ AND Ctrl+↑/↓).
     #[test]
     fn arrows_do_not_switch_chats_while_renaming() {
         let mut app = app_with_chats(3);
         press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+
+        // Plain arrows.
         press(&mut app, KeyCode::Down, KeyModifiers::NONE);
         press(&mut app, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(app.active, 0, "navigation suppressed during rename");
         assert!(!matches!(app.mode, chibi_tui::app::Mode::Normal));
+
+        // feat_ctrl_arrows_nav: the new thread-switch bindings must not leak
+        // into rename mode either.
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 0, "Ctrl+arrows suppressed during rename");
+        assert!(matches!(app.mode, Mode::Renaming { .. }), "session intact");
+
+        // feat_alt_arrows_nav: the Alt synonym is blocked mid-rename too.
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.active, 0, "Alt+arrows suppressed during rename");
+        assert!(matches!(app.mode, Mode::Renaming { .. }), "session intact");
     }
 
     /// Ctrl+C keeps its global meaning in rename mode: with an open session
@@ -1213,5 +1595,1157 @@ mod tests {
             app.input.lines().iter().all(|l| l.is_empty()),
             "Ctrl+R itself must leave the prompt empty"
         );
+    }
+
+    // ---- feat_ctrl_arrows_nav: thread switching + caret movement ------------
+
+    /// Ctrl+↑ / Ctrl+↓ switch the active thread with EXACTLY the old plain-
+    /// arrow semantics: bounds-clamped selection move + chat-scroll reset.
+    /// (The sidebar dot/focus refresh derives from `active` at draw time.)
+    #[test]
+    fn ctrl_up_and_ctrl_down_switch_active_thread_like_plain_arrows_did() {
+        let mut app = app_with_chats(3);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 1);
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 2);
+        // Bounds clamp at the list end — no wrap-around.
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 2);
+
+        // Scroll-reset semantics: stored chat scroll clears on any switch.
+        app.scroll = 9;
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 1);
+        assert_eq!(app.scroll, 0, "thread switch resets chat scroll");
+
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 0);
+        // Bounds clamp at the top — saturating, no panic.
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 0);
+    }
+
+    /// feat_alt_arrows_nav: Alt+↑ / Alt+↓ are a FULL SYNONYM of Ctrl+↑/↓ —
+    /// identical semantics in both directions, bounds-clamped at the list
+    /// edges, chat-scroll reset on every switch. (macOS Mission Control
+    /// hijacks Ctrl+arrows system-wide, so this is the stock-macOS path.)
+    #[test]
+    fn alt_up_and_alt_down_switch_active_thread_like_ctrl_arrows() {
+        let mut app = app_with_chats(3);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(app.active, 1);
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(app.active, 2);
+        // Bounds clamp at the list end — no wrap-around.
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(app.active, 2);
+
+        // Scroll-reset semantics: stored chat scroll clears on any switch.
+        app.scroll = 9;
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.active, 1);
+        assert_eq!(app.scroll, 0, "thread switch resets chat scroll");
+
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.active, 0);
+        // Bounds clamp at the top — saturating, no panic.
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.active, 0);
+    }
+
+    /// feat_alt_arrows_nav parity: Alt+arrows work with a live multi-line
+    /// draft and never disturb it — buffer verbatim, nothing submitted/
+    /// queued/in-flight. And plain ↑/↓ STILL move only the caret (regression:
+    /// the alt synonym must not leak into the plain-arrow path).
+    #[test]
+    fn alt_arrows_switch_threads_without_disturbing_multiline_draft() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "line one");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_in(&mut app, "line two");
+        let draft_before = app.input.lines().to_vec();
+        assert_eq!(draft_before, ["line one", "line two"]);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(app.active, 1, "Alt+Down switched threads");
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.active, 0, "Alt+Up switched back");
+
+        assert_eq!(app.input.lines(), draft_before, "draft untouched");
+        assert!(app.chats.iter().all(|c| c.messages.is_empty()));
+        assert!(app.active_request_id().is_none());
+        assert_eq!(app.active_queue_len(), 0);
+
+        // Plain arrows remain caret-only after alt navigation — the caret
+        // still sits at the end of row 1 (the draft is 2 lines tall).
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.active, 0, "plain Down must not switch threads");
+        assert_eq!(
+            app.input.cursor(),
+            (1, 8),
+            "plain Down must stay caret-level (clamped on the last row)"
+        );
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.active, 0, "plain Up must not switch threads");
+        assert_eq!(
+            app.input.cursor(),
+            (0, 8),
+            "plain Up must move the caret to the previous row"
+        );
+    }
+
+    /// Ctrl+arrows work with a live multi-line draft and never disturb it:
+    /// buffer verbatim, nothing submitted/queued/in-flight.
+    #[test]
+    fn ctrl_arrows_switch_threads_without_disturbing_multiline_draft() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "line one");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_in(&mut app, "line two");
+        let draft_before = app.input.lines().to_vec();
+        assert_eq!(draft_before, ["line one", "line two"]);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 1, "Ctrl+Down switched threads");
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 0, "Ctrl+Up switched back");
+
+        assert_eq!(app.input.lines(), draft_before, "draft untouched");
+        assert!(app.chats.iter().all(|c| c.messages.is_empty()));
+        assert!(app.active_request_id().is_none());
+        assert_eq!(app.active_queue_len(), 0);
+    }
+
+    /// Plain ↑/↓ move the text cursor vertically inside the editor — never
+    /// switching threads. Column preserved across rows (tui-textarea native
+    /// CursorMove), clamped at the first/last row. This exercises the grown
+    /// (MAX_INPUT_LINES-capped) block's caret navigation path.
+    #[test]
+    fn plain_vertical_arrows_move_caret_not_thread() {
+        let mut app = app_with_chats(3);
+        type_in(&mut app, "one");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT); // caret → row 1
+        type_in(&mut app, "two");
+        assert_eq!(app.input.cursor(), (1, 3));
+        assert_eq!(app.input.lines(), ["one", "two"]);
+
+        // Down on the LAST row: clamped no-op; absolutely no thread change.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.input.cursor(), (1, 3));
+
+        // Up moves to the previous row, column preserved.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.active, 0, "plain Up must not switch threads");
+        assert_eq!(app.input.cursor(), (0, 3));
+
+        // Up on the FIRST row: clamped no-op.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.input.cursor(), (0, 3));
+
+        // Down returns the caret to where it was.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.input.cursor(), (1, 3));
+        assert_eq!(app.active, 0);
+    }
+
+    /// Required regression guard: in a SINGLE-LINE input, plain ↑ / ↓ neither
+    /// change the active thread nor leak into the submission machinery —
+    /// buffer stays verbatim, no request begins/cancels/quits, and the
+    /// loop-level gate still rejects every arrow variant.
+    #[test]
+    fn plain_arrows_single_line_no_thread_change_and_no_submit() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "abc");
+        assert_eq!(app.input.cursor(), (0, 3));
+
+        for code in [KeyCode::Up, KeyCode::Down] {
+            press(&mut app, code, KeyModifiers::NONE);
+            assert_eq!(app.active, 0, "{code:?} must not switch threads");
+            assert_eq!(app.input.lines(), ["abc"], "{code:?} must not edit");
+            assert!(
+                app.active_request_id().is_none(),
+                "{code:?} must not submit"
+            );
+            assert!(app.pending_cancel.is_none());
+            assert!(!app.should_quit);
+        }
+        // And the event-loop gate agrees: arrows are never submit keys.
+        for code in [KeyCode::Up, KeyCode::Down] {
+            assert!(!should_submit(&key_event(code, KeyModifiers::NONE)));
+        }
+    }
+
+    // ---- feat_focus_panes: key routing --------------------------------------
+
+    /// THE round-trip criterion through the full key path: Ctrl+T toggles
+    /// pane FOCUS — Chat → Sidebar → Chat. It must not move the selection
+    /// itself (the old wrap-cycling semantics were rejected outright).
+    #[test]
+    fn ctrl_t_toggles_pane_focus_and_round_trips() {
+        let mut app = app_with_chats(3);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat, "default focus");
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.focus,
+            chibi_tui::app::Focus::Chat,
+            "Ctrl+T twice round-trips"
+        );
+
+        // Pure focus flip: no navigation happened.
+        assert_eq!(app.active, 0);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(app.chats.len(), 3);
+
+        // Arrows remain clamped in Normal mode (regression for the removed
+        // wrap semantics — clamping never depended on Ctrl+T).
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 1);
+        app.active = 2;
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.active, 2, "Ctrl+Down still clamps at the last thread");
+    }
+
+    /// Sidebar-focused arrows navigate the selection with LIVE active-chat
+    /// switching and CLAMP at the edges; each switch resets the chat scroll
+    /// to follow-bottom (same mechanics as today's normal-mode arrows).
+    #[test]
+    fn sidebar_arrows_navigate_live_switch_and_clamp() {
+        let mut app = app_with_chats(3);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+
+        app.scroll = 42; // detach from bottom before switching
+        assert!(!app.at_bottom());
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.active, 1, "sidebar ↓ selects the next chat");
+        assert_eq!(app.scroll, 0, "chat view reset to follow-bottom");
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.active, 2);
+        // Clamp at the last edge…
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.active, 2, "↓ clamps at the last thread");
+        // …and back up to the first.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.active, 0, "↑ clamps at the first thread");
+    }
+
+    /// Bare Enter on a Sidebar-focused UI applies and returns focus to Chat
+    /// WITHOUT submitting the draft or disturbing it (the event loop's
+    /// `enter_consumed_by_sidebar` gate suppresses submission for exactly
+    /// this key — handle_key must leave no side effects behind).
+    #[test]
+    fn sidebar_enter_returns_focus_without_submitting() {
+        let mut app = app_with_chats(3);
+        type_in(&mut app, "half typed");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat);
+        assert_eq!(app.input.lines(), ["half typed"], "draft untouched");
+        assert!(app.chats.iter().all(|c| c.messages.is_empty()), "no submit");
+        assert!(app.active_request_id().is_none());
+        assert_eq!(app.active_queue_len(), 0);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        // Loop-gate parity: bare Enter stays a submit-shaped key; only the
+        // was_sidebar_focused snapshot can consume it — covered there.
+        assert!(should_submit(&key_event(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+    }
+
+    /// Esc on a Sidebar-focused UI returns focus to Chat WITHOUT clearing
+    /// the draft — deliberately different from Normal-mode Esc (which clears
+    /// non-empty input).
+    #[test]
+    fn sidebar_esc_returns_focus_and_preserves_draft() {
+        let mut app = app_with_chats(3);
+        type_in(&mut app, "keep me");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat);
+        assert_eq!(
+            app.input.lines(),
+            ["keep me"],
+            "Esc must NOT clear the draft"
+        );
+    }
+
+    /// Typing and text-editing keystrokes are SWALLOWED while the sidebar is
+    /// focused — nothing reaches the textarea: plain chars, backspace,
+    /// Shift+Enter newline inserts, even Space.
+    #[test]
+    fn typing_is_swallowed_while_sidebar_focused() {
+        let mut app = app_with_chats(3);
+        type_in(&mut app, "draft");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT); // newline insert
+        press(&mut app, KeyCode::Enter, KeyModifiers::ALT); // alt-newline
+
+        assert_eq!(app.input.lines(), ["draft"], "textarea untouched");
+        assert_eq!(
+            app.focus,
+            chibi_tui::app::Focus::Sidebar,
+            "swallowed keys keep the focus"
+        );
+    }
+
+    /// PgUp/PgDn STILL scroll the CHAT pane while the sidebar holds focus
+    /// (documented choice: reading works regardless of focus).
+    #[test]
+    fn pgup_pgdn_scroll_chat_while_sidebar_focused() {
+        let mut app = app_with_chats(2);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(app.scroll, 20, "one page up by visible rows");
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.scroll, 0, "back to follow-bottom");
+    }
+
+    /// Global service chords stay live with their exact Normal-mode
+    /// semantics while the sidebar holds focus: ^F / ^⇧F open searches,
+    /// ^D opens the guarded confirm popup, ^L clears input + records the
+    /// screen-wipe intent, ^R enters rename — and closing any of them hands
+    /// focus back to Chat.
+    #[test]
+    fn service_chords_stay_live_while_sidebar_focused() {
+        // Each chord gets its own fresh app so lifecycles can't interfere.
+
+        // ^F in-thread search opens and closes back onto Chat.
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "hello world");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        app.search_push('h');
+        app.search_push('e');
+        app.search_push('l');
+        app.search_push('l');
+        app.search_push('o');
+        assert!(!app.search_matches().is_empty());
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // jump & close
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat, "popup close resets");
+
+        // ^⇧F global search opens from the sidebar too.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::SearchingAll { .. }
+        ));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE); // popup dismisses
+        assert!(app.mode.is_normal());
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat, "popup close resets");
+
+        // ^D opens the confirm popup from the sidebar (idle chat).
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+        assert_eq!(app.chats.len(), 1, "nothing deleted yet");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE); // cancel via modal arm
+        assert!(app.mode.is_normal());
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat, "popup close resets");
+
+        // ^L clears input + wipes screen intent while Sidebar focused.
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "gone");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(app.input.lines().iter().all(|l| l.is_empty()));
+        assert!(app.take_clear_screen_request(), "wipe intent recorded");
+
+        // ^R renames from the sidebar; committing returns focus to Chat.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Renaming { .. }));
+        app.rename_push('z');
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // save via modal arm
+        assert!(app.mode.is_normal());
+        assert_eq!(app.chat_title(), "chat-0z");
+        assert_eq!(
+            app.focus,
+            chibi_tui::app::Focus::Chat,
+            "rename close resets"
+        );
+    }
+
+    /// ^N new-chat works under Sidebar focus and lands focus on Chat with
+    /// the fresh chat selected (editor-bound action).
+    #[test]
+    fn ctrl_n_from_sidebar_lands_focus_on_chat() {
+        let mut app = app_with_chats(2);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat, "^N lands on Chat");
+        assert_eq!(app.active, 2, "the new chat is selected");
+        assert_eq!(app.chats.len(), 3);
+        assert!(app.at_bottom(), "scroll reset to follow-bottom");
+    }
+
+    /// Busy chats participate normally under Sidebar navigation: switching
+    /// away from a running chat is allowed (feat_per_thread_async) and the
+    /// highlighted thread follows the work — nothing in the old cycle path
+    /// cared about lifecycles either.
+    #[test]
+    fn sidebar_navigation_across_busy_chats() {
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "in flight"); // chat 0 busy
+        assert!(app.is_busy());
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.active, 1, "switching away from a busy chat is allowed");
+        assert!(!app.is_busy(), "active chat is the idle one");
+        assert!(app.any_busy(), "background chat still runs");
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.active, 0);
+        assert!(app.is_busy(), "back onto the busy chat");
+    }
+
+    /// Single chat: toggling is still a valid pure focus flip — and with the
+    /// sidebar focused the arrow navigation is a graceful clamp-noop.
+    #[test]
+    fn ctrl_t_single_chat_toggles_focus_without_navigating() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+        assert_eq!(app.active, 0);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.active, 0, "clamped nav around one chat");
+        assert!(app.status_message.is_none(), "no toast spam");
+        assert!(app.error_popup.is_none(), "no popup");
+        assert!(!app.should_quit);
+    }
+
+    /// Zero chats: toggle and navigation stay silent no-ops through the full
+    /// key path — no panic anywhere.
+    #[test]
+    fn ctrl_t_zero_chats_is_silent_noop() {
+        let mut app = chibi_tui::app::App::new(Vec::new());
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.active, 0);
+        assert!(!app.should_quit);
+        assert!(app.status_message.is_none());
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat);
+    }
+
+    /// Modal swallowing: with the GLOBAL search popup open, Ctrl+T goes to
+    /// the popup (swallowed, popup stays, focus unchanged) — never to the
+    /// focus flip or navigation.
+    #[test]
+    fn ctrl_t_swallowed_by_global_search_popup() {
+        let mut app = app_with_chats(3);
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::SearchingAll { .. }
+        ));
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::SearchingAll { .. }),
+            "popup must stay open"
+        );
+        assert_eq!(
+            app.focus,
+            chibi_tui::app::Focus::Chat,
+            "no focus flip through the popup"
+        );
+        assert_eq!(app.active, 0, "Ctrl+T must not navigate through the popup");
+    }
+
+    /// Modal swallowing: the delete-confirm popup swallows Ctrl+T too.
+    #[test]
+    fn ctrl_t_swallowed_by_delete_confirm_popup() {
+        let mut app = app_with_chats(3);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+        assert_eq!(app.active, 0, "no navigation through the popup");
+        assert_eq!(app.chats.len(), 3, "nothing deleted");
+    }
+
+    /// Modal swallowing: the in-thread search popup swallows Ctrl+T too.
+    #[test]
+    fn ctrl_t_swallowed_by_in_thread_search_popup() {
+        let mut app = app_with_chats(3);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        assert_eq!(app.active, 0, "no navigation through the popup");
+    }
+
+    /// Renaming blocks Ctrl+T like every other chord: its branch takes
+    /// precedence (the rename branch returns before the focus branch runs),
+    /// so the chord never flips focus while the rename editor is open.
+    /// The letter lands in the draft instead — the rename arm pushes ANY
+    /// `Char` regardless of modifiers, exactly like Ctrl+N pushes 'n' there
+    /// (documented branch behavior, unchanged by this feature).
+    #[test]
+    fn ctrl_t_blocked_while_renaming() {
+        let mut app = app_with_chats(3);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Renaming { .. }));
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::Renaming { .. }),
+            "rename session must stay open"
+        );
+        assert_eq!(app.active, 0, "no thread switch mid-rename");
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat);
+        // The rename branch consumed the chord: the letter went into the
+        // draft (the arm accepts any Char), never into navigation.
+        assert_eq!(
+            app.rename_buf(),
+            Some("chat-0t"),
+            "rename branch precedence: 't' lands in the draft"
+        );
+    }
+
+    /// Ctrl+T works with a live multi-line draft and never disturbs it:
+    /// buffer verbatim, nothing submitted/queued/in-flight.
+    #[test]
+    fn ctrl_t_switches_focus_without_disturbing_multiline_draft() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "line one");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_in(&mut app, "line two");
+        let draft_before = app.input.lines().to_vec();
+        assert_eq!(draft_before, ["line one", "line two"]);
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar, "focus flipped");
+
+        assert_eq!(app.input.lines(), draft_before, "draft untouched");
+        assert!(app.chats.iter().all(|c| c.messages.is_empty()));
+        assert!(app.active_request_id().is_none());
+        assert_eq!(app.active_queue_len(), 0);
+    }
+
+    // ---- feat_thread_delete: key routing ----------------------------------
+
+    #[test]
+    fn ctrl_d_opens_confirm_popup_on_idle_chat() {
+        let mut app = app_with_chats(2);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+    }
+
+    #[test]
+    fn ctrl_d_on_busy_chat_shows_status_and_never_opens_popup() {
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "in flight");
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert!(app.status_message.is_some(), "refusal toast shown");
+        assert_eq!(app.chats.len(), 1, "nothing deleted");
+    }
+
+    /// Enter and `y` confirm through the full key path; both remove the
+    /// chat and record the pending file deletion for the event loop.
+    #[test]
+    fn confirm_popup_enter_and_y_confirm_deletion() {
+        for code in [KeyCode::Enter, KeyCode::Char('y')] {
+            let mut app = app_with_chats(3);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+            press(&mut app, code, KeyModifiers::NONE);
+            assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+            assert_eq!(app.chats.len(), 2, "{code:?} confirmed deletion");
+            assert!(app.pending_delete.is_some(), "{code:?} set the delete");
+        }
+    }
+
+    /// Esc and `n` cancel through the full key path: nothing is deleted and
+    /// no file removal is requested.
+    #[test]
+    fn confirm_popup_esc_and_n_cancel_deletion() {
+        for code in [KeyCode::Esc, KeyCode::Char('n')] {
+            let mut app = app_with_chats(3);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            press(&mut app, code, KeyModifiers::NONE);
+            assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+            assert_eq!(app.chats.len(), 3, "{code:?} cancelled, nothing deleted");
+            assert!(app.pending_delete.is_none());
+            assert_eq!(app.chats[0].name, "chat-0");
+        }
+    }
+
+    /// The confirm popup swallows every other key: no textarea leakage, no
+    /// global bindings (Ctrl+N/R/L/F, arrows nav), no accidental quit via q.
+    #[test]
+    fn confirm_popup_isolates_keystrokes_and_suspends_global_bindings() {
+        let mut app = app_with_chats(3);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        // Typing must not reach the textarea (letters a/b/c avoid the
+        // popup's own y/n confirm-cancel keys).
+        type_in(&mut app, "abc");
+        assert!(app.input.lines().iter().all(|l| l.is_empty()));
+        // Global bindings suspended.
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        // feat_alt_arrows_nav: the Alt synonym is swallowed by the popup too.
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(app.chats.len(), 3, "Ctrl+N must not fire mid-popup");
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::ConfirmDelete),
+            "popup must stay open"
+        );
+        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(!app.should_quit);
+        // q is deliberately unbound inside the popup — a stray q must not
+        // quit while a destructive confirmation is on screen.
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.should_quit, "q must not quit from the confirm popup");
+
+        // The popup is still fully functional afterwards.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(app.chats.len(), 3);
+    }
+
+    // ---- feat_search_thread: key routing ----------------------------------
+
+    #[test]
+    fn ctrl_f_opens_search_popup() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        assert_eq!(app.search_query(), Some(""));
+    }
+
+    /// Typing while the search popup is open must go to the QUERY buffer,
+    /// never into the message draft (modal-ish isolation).
+    #[test]
+    fn search_typing_goes_to_query_not_input() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "precious draft");
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        type_in(&mut app, "needle");
+
+        assert_eq!(app.search_query(), Some("needle"));
+        assert_eq!(
+            app.input.lines().join(""),
+            "precious draft",
+            "message draft untouched while searching"
+        );
+    }
+
+    #[test]
+    fn search_up_down_navigate_and_enter_jumps() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::user("needle one"));
+        app.chats[0].messages.push(Message::assistant("needle two"));
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        type_in(&mut app, "needle");
+        assert_eq!(app.search_matches().len(), 2);
+        assert_eq!(app.search_selected(), 0);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.search_selected(), 1);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.search_selected(), 0);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal, "Enter closes popup");
+        assert!(app.pending_search_jump.is_some(), "jump recorded");
+        assert_eq!(app.chats[0].messages.len(), 2, "messages untouched");
+    }
+
+    /// Esc closes the search popup WITHOUT a jump; the chat view stays put.
+    #[test]
+    fn search_esc_closes_without_jumping() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::user("needle"));
+        app.scroll_up(12);
+        let scroll_before = app.scroll;
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        type_in(&mut app, "needle");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert!(app.pending_search_jump.is_none(), "Esc must not jump");
+        assert_eq!(app.scroll, scroll_before, "view unchanged by Esc");
+    }
+
+    /// PgUp/PgDn are disabled inside the search popup — the chat scroll is
+    /// driven by the jump, never by page keys.
+    #[test]
+    fn search_popup_swallows_pgup_pgdn_and_arrows() {
+        let mut app = app_with_chats(2);
+        app.scroll_up(30);
+        let scroll_before = app.scroll;
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        // feat_alt_arrows_nav: the Alt synonym is swallowed by the popup too.
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE); // navigation, not caret
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        // feat_alt_arrows_nav: the Alt synonym is swallowed by the popup too.
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::Searching { .. }),
+            "popup must stay open"
+        );
+        assert_eq!(app.active, 0, "thread switch must not fire");
+        assert_eq!(app.chats.len(), 2, "Ctrl+N must not fire");
+        assert_eq!(app.scroll, scroll_before, "PgUp/PgDn must not scroll");
+        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(!app.should_quit);
+        assert!(app.pending_search_jump.is_none());
+    }
+
+    /// Ctrl+C quits from the search popup (same class as the other popups).
+    #[test]
+    fn search_popup_ctrl_c_quits() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert_eq!(app.chats.len(), 1, "quit must not mutate chats");
+    }
+
+    /// The confirm-delete popup and the search popup cannot coexist: Ctrl+F
+    /// is swallowed while the delete confirmation is open, and Ctrl+D is
+    /// swallowed while searching.
+    #[test]
+    fn search_and_delete_popups_cannot_coexist() {
+        // Ctrl+F over the delete confirm popup: swallowed.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::ConfirmDelete));
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::ConfirmDelete),
+            "Ctrl+F must not open search over the delete popup"
+        );
+
+        // Ctrl+D over the search popup: swallowed.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::Searching { .. }),
+            "Ctrl+D must not open delete popup over search"
+        );
+        assert_eq!(app.chats.len(), 1, "nothing deleted");
+    }
+
+    /// The search popup's Enter must never submit the message draft — the
+    /// loop-level `enter_consumed_by_search` gate mirrors the delete-popup
+    /// handling (asserted via handle_key: mode closes, jump recorded, and
+    /// the draft survives untouched; submission is loop-gated identically to
+    /// `enter_consumed_by_delete`).
+    #[test]
+    fn search_enter_never_touches_draft_or_messages() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "draft text");
+        app.chats[0].messages.push(Message::user("needle"));
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        type_in(&mut app, "needle");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert!(app.pending_search_jump.is_some());
+        assert_eq!(
+            app.input.lines().join(""),
+            "draft text",
+            "draft must survive the search Enter"
+        );
+        assert_eq!(app.chats[0].messages.len(), 1, "no message appended");
+        assert!(app.active_request_id().is_none());
+        assert_eq!(app.active_queue_len(), 0);
+    }
+
+    /// Search works on a BUSY chat (read-only): opening the popup and
+    /// jumping leaves the in-flight request untouched.
+    #[test]
+    fn search_opens_while_busy_and_leaves_lifecycle_alone() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::user("needle"));
+        let submitted = submit_text(&mut app, "in flight");
+        assert!(app.is_busy());
+
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        type_in(&mut app, "needle");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(
+            app.chats[0].lifecycle.request_id(),
+            Some(submitted.request_id.as_str()),
+            "in-flight request untouched by search"
+        );
+    }
+
+    /// Ctrl+C inside the confirm popup quits the app (same class as the
+    /// error popup) — it must NOT delete the chat.
+    #[test]
+    fn confirm_popup_ctrl_c_quits_without_deleting() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert_eq!(app.chats.len(), 1, "quit must not delete the chat");
+        assert!(app.pending_delete.is_none());
+    }
+
+    /// Deleting the last chat reaches the clean empty state through the full
+    /// key path; the confirm Enter never submits a pre-typed draft.
+    #[test]
+    fn confirm_delete_last_chat_reaches_empty_state_via_keys() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "draft text");
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(app.chats.is_empty());
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert!(app.pending_delete.is_some());
+        assert!(app.active_request_id().is_none());
+        // The draft survives the deletion untouched (thread ops never clear
+        // the prompt buffer in this app).
+        assert_eq!(app.input.lines().join(""), "draft text");
+    }
+
+    /// With a neighbour present, the confirm Enter must never submit the
+    /// draft to it — the popup owns the Enter.
+    #[test]
+    fn confirm_enter_never_submits_draft_to_neighbour() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "draft text");
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.chats.len(), 1);
+        assert_eq!(app.chats[0].name, "chat-1", "neighbour selected");
+        assert!(
+            app.chats[0].messages.is_empty(),
+            "the draft must not be submitted to the neighbour"
+        );
+        assert!(app.chats[0].queue.is_empty());
+        assert!(app.active_request_id().is_none());
+    }
+
+    // ---- feat_search_all_threads: key routing ----------------------------
+
+    /// Ctrl+Shift+F opens the GLOBAL search popup (kitty-protocol chord:
+    /// Char('f') + CONTROL|SHIFT).
+    #[test]
+    fn ctrl_shift_f_opens_global_search_popup() {
+        let mut app = app_with_chats(2);
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::SearchingAll { .. }
+        ));
+        assert_eq!(app.search_all_query(), Some(""));
+    }
+
+    /// Regression guard: plain Ctrl+F must STILL open the in-thread search —
+    /// the new Shift chord must not steal it.
+    #[test]
+    fn ctrl_f_still_opens_in_thread_search_not_global() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        assert!(!matches!(
+            app.mode,
+            chibi_tui::app::Mode::SearchingAll { .. }
+        ));
+    }
+
+    /// Typing while the global search popup is open must go to the QUERY
+    /// buffer, never into the message draft (modal-ish isolation).
+    #[test]
+    fn global_search_typing_goes_to_query_not_input() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "precious draft");
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        type_in(&mut app, "needle");
+
+        assert_eq!(app.search_all_query(), Some("needle"));
+        assert_eq!(
+            app.input.lines().join(""),
+            "precious draft",
+            "message draft untouched while searching"
+        );
+    }
+
+    #[test]
+    fn global_search_up_down_navigate_and_enter_jumps() {
+        let mut app = app_with_chats(2);
+        app.chats[0].messages.push(Message::user("needle one"));
+        app.chats[1].messages.push(Message::assistant("needle two"));
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        type_in(&mut app, "needle");
+        assert_eq!(app.search_all_matches().len(), 2);
+        assert_eq!(app.search_all_selected(), 0);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.search_all_selected(), 1);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.search_all_selected(), 0);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal, "Enter closes popup");
+        assert_eq!(app.active, 0, "first match belongs to chat 0");
+        assert!(app.pending_global_search_jump.is_some(), "jump recorded");
+        assert!(
+            app.pending_search_jump.is_none(),
+            "in-thread jump state untouched"
+        );
+        assert_eq!(app.chats[0].messages.len(), 1, "messages untouched");
+    }
+
+    /// Enter switches the active chat to the match's thread — including a
+    /// NON-active one (the Ctrl+↑/↓ selection mechanics).
+    #[test]
+    fn global_search_enter_switches_to_non_active_thread() {
+        let mut app = app_with_chats(3);
+        app.chats[2]
+            .messages
+            .push(Message::user("needle in chat two"));
+        app.active = 0;
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        type_in(&mut app, "needle");
+        assert_eq!(app.search_all_matches()[0].chat_index, 2);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(app.active, 2, "target thread activated");
+        assert_eq!(app.scroll, 0, "thread switch resets chat scroll");
+    }
+
+    /// Esc closes the global search popup WITHOUT switching threads or
+    /// jumping; the view stays put.
+    #[test]
+    fn global_search_esc_closes_without_switching_or_jumping() {
+        let mut app = app_with_chats(2);
+        app.chats[1].messages.push(Message::user("needle"));
+        app.active = 0;
+        app.scroll_up(12);
+        let scroll_before = app.scroll;
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        type_in(&mut app, "needle");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(app.active, 0, "no thread switch on Esc");
+        assert_eq!(app.scroll, scroll_before, "view unchanged by Esc");
+        assert!(
+            app.pending_global_search_jump.is_none(),
+            "Esc must not jump"
+        );
+        assert!(app.pending_search_jump.is_none());
+    }
+
+    /// The global search popup swallows every other key: no textarea
+    /// leakage, no global bindings (Ctrl+N/R/L/D/F, arrows nav, PgUp/PgDn),
+    /// no accidental quit via q.
+    #[test]
+    fn global_search_popup_swallows_global_bindings() {
+        let mut app = app_with_chats(2);
+        app.scroll_up(30);
+        let scroll_before = app.scroll;
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        // feat_alt_arrows_nav: the Alt synonym is swallowed by the popup too.
+        press(&mut app, KeyCode::Up, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        // Ctrl+F must not open the in-thread search over the global one.
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::SearchingAll { .. }),
+            "popup must stay open"
+        );
+        assert_eq!(app.active, 0, "thread switch must not fire");
+        assert_eq!(app.chats.len(), 2, "Ctrl+N must not fire");
+        assert_eq!(app.scroll, scroll_before, "PgUp/PgDn must not scroll");
+        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(!app.should_quit);
+        assert!(app.pending_global_search_jump.is_none());
+    }
+
+    /// Ctrl+C quits from the global search popup (same class as the other
+    /// popups).
+    #[test]
+    fn global_search_popup_ctrl_c_quits() {
+        let mut app = app_with_chats(1);
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert_eq!(app.chats.len(), 1, "quit must not mutate chats");
+    }
+
+    /// The confirm-delete popup and the global search popup cannot coexist:
+    /// Ctrl+Shift+F is swallowed while the delete confirmation is open, and
+    /// Ctrl+D is swallowed while searching globally.
+    #[test]
+    fn global_search_and_delete_popups_cannot_coexist() {
+        // Ctrl+Shift+F over the delete confirm popup: swallowed.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::ConfirmDelete));
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::ConfirmDelete),
+            "Ctrl+Shift+F must not open global search over the delete popup"
+        );
+
+        // Ctrl+D over the global search popup: swallowed.
+        let mut app = app_with_chats(1);
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::SearchingAll { .. }),
+            "Ctrl+D must not open delete popup over global search"
+        );
+        assert_eq!(app.chats.len(), 1, "nothing deleted");
+    }
+
+    /// The global search popup's Enter must never submit the message draft —
+    /// the loop-level `enter_consumed_by_search_all` gate mirrors the
+    /// in-thread search handling (asserted via handle_key: mode closes, the
+    /// target thread activates, jump recorded, draft survives untouched).
+    #[test]
+    fn global_search_enter_never_touches_draft_or_messages() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "draft text");
+        app.chats[1].messages.push(Message::user("needle"));
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        type_in(&mut app, "needle");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(app.active, 1, "target thread activated");
+        assert!(app.pending_global_search_jump.is_some());
+        assert_eq!(
+            app.input.lines().join(""),
+            "draft text",
+            "draft must survive the global search Enter"
+        );
+        assert_eq!(app.chats[1].messages.len(), 1, "no message appended");
+        assert!(app.active_request_id().is_none());
+        assert_eq!(app.active_queue_len(), 0);
     }
 }

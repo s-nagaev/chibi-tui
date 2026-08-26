@@ -3,8 +3,10 @@
 use std::collections::VecDeque;
 
 use crate::backend::BackendEvent;
+use crate::markdown;
 use crate::model::{ChatLifecycle, Message};
 use crate::popup::ErrorPopup;
+use crate::theme::Theme;
 use tui_textarea::TextArea;
 
 /// Liveness of the backend link as shown by the status-bar indicator.
@@ -22,7 +24,81 @@ pub enum Connection {
     Disconnected,
 }
 
-/// Input mode of the whole app (feature: inline thread rename).
+/// One search hit inside a message's rendered text (feat_search_thread).
+///
+/// `message_index` addresses [`App::chats`] active chat's `messages`;
+/// `line_index` is the 0-based index of the RENDERED markdown line (as
+/// produced by [`crate::markdown::render`], i.e. the same line the chat pane
+/// shows) containing the hit. `line_text` is the plain text of that rendered
+/// line (style markup already stripped — the snippet source), `col` the
+/// 0-based char offset where the case-insensitive match starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    /// Index into the ACTIVE chat's `messages` vec.
+    pub message_index: usize,
+    /// Index of the rendered markdown line within that message.
+    pub line_index: usize,
+    /// Plain text of the rendered line (markup stripped).
+    pub line_text: String,
+    /// Char offset of the case-insensitive hit inside `line_text`.
+    pub col: usize,
+}
+
+/// State of the open in-thread search popup (feat_search_thread).
+///
+/// Lives in [`Mode::Searching`] — deliberately OUT of the chat mutation
+/// paths: `query` is the popup's own single-line buffer, `matches` the
+/// cached live-computed hit list, `selected` the current selection index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchState {
+    /// Current search query (popup's own buffer, never the message draft).
+    pub query: String,
+    /// Index into `matches` of the currently selected hit.
+    pub selected: usize,
+    /// Live-computed case-insensitive matches for `query`.
+    pub matches: Vec<SearchMatch>,
+}
+
+/// One search hit across ALL threads (feat_search_all_threads).
+///
+/// Extends [`SearchMatch`] with the owning chat: `chat_index` addresses
+/// [`App::chats`] and `chat_title` is the thread-title snapshot shown as
+/// the popup label. `message_index` stays relative to THAT chat's
+/// `messages` vec — the wrapped-row jump math consumes the trio
+/// `(chat_index, message_index, line_index, col)` unchanged from the
+/// in-thread machinery, only scoped to a different chat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobalSearchMatch {
+    /// Index into [`App::chats`] of the owning thread.
+    pub chat_index: usize,
+    /// Thread title at match-computation time (popup label).
+    pub chat_title: String,
+    /// Index into `chats[chat_index].messages` vec.
+    pub message_index: usize,
+    /// Index of the rendered markdown line within that message.
+    pub line_index: usize,
+    /// Plain text of the rendered line (markup stripped).
+    pub line_text: String,
+    /// Char offset of the case-insensitive hit inside `line_text`.
+    pub col: usize,
+}
+
+/// State of the open ALL-threads search popup (feat_search_all_threads).
+///
+/// Lives in [`Mode::SearchingAll`] — the same shape as [`SearchState`], but
+/// `matches` spans every chat, so each entry carries its own
+/// `chat_index`/`chat_title`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobalSearchState {
+    /// Current search query (popup's own buffer, never the message draft).
+    pub query: String,
+    /// Index into `matches` of the currently selected hit.
+    pub selected: usize,
+    /// Live-computed case-insensitive matches across all chats.
+    pub matches: Vec<GlobalSearchMatch>,
+}
+
+/// Input mode of the whole app (feature: inline thread rename / search).
 ///
 /// Deliberately tiny and explicit so tests can drive transitions
 /// deterministically: `Normal` is everyday chatting; `Renaming` captures all
@@ -37,13 +113,46 @@ pub enum Mode {
     /// The ACTIVE chat's title is being edited inline. `buf` holds the raw
     /// untrimmed draft; commit applies trimming and rejects empty results.
     Renaming { buf: String },
+    /// The Ctrl+D delete-confirmation popup is open for the ACTIVE chat
+    /// (feat_thread_delete). Enter/`y` confirm, Esc/`n` cancel; every other
+    /// key is swallowed by the modal branch in `main.rs` so nothing leaks
+    /// into the textarea or triggers a global binding.
+    ConfirmDelete,
+    /// The Ctrl+F in-thread search popup is open (feat_search_thread):
+    /// `state` holds the query buffer, cached match list and selection.
+    /// Modal-ish isolation mirrors ConfirmDelete — keystrokes go to the
+    /// popup only (see `main.rs`), the chat view is read-only, and Enter
+    /// jumps the chat scroll to the selected match via
+    /// [`App::pending_search_jump`] before closing.
+    Searching { state: SearchState },
+    /// The Ctrl+Shift+F ALL-threads search popup is open
+    /// (feat_search_all_threads): `state` holds the query buffer, cached
+    /// match list (spanning every chat, each entry labeled with its thread
+    /// title) and selection. Same modal-ish isolation as [`Mode::Searching`]
+    /// — one popup at a time — but Enter ACTIVATES the match's thread
+    /// (same selection mechanics as Ctrl+↑/↓ switching) and records a
+    /// pending wrapped-row jump via [`App::pending_global_search_jump`].
+    SearchingAll { state: GlobalSearchState },
 }
 
 impl Mode {
-    /// True unless a rename session is open.
+    /// True in the everyday chatting state only — no rename session, no
+    /// delete-confirm popup, and no search popup open.
     pub fn is_normal(&self) -> bool {
         matches!(self, Mode::Normal)
     }
+}
+/// feat_focus_panes: which pane owns the keyboard. NOT an [`AppMode`] —
+/// the rename/delete/search modals remain [`Mode`]s layered above focus:
+/// opening one never changes focus, and closing one always resets it to
+/// [`Focus::Chat`] so the editor regains typing immediately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// Everyday chatting state: keys reach the prompt textarea.
+    Chat,
+    /// The sidebar owns ↑/↓ (thread selection with live active-chat
+    /// switching); printable/text-editing keystrokes are swallowed.
+    Sidebar,
 }
 
 /// Marker: the user pressed `R` in the error popup — the event loop performs
@@ -128,12 +237,47 @@ pub struct App {
     /// Set by `R` in the error popup; the event loop performs the async
     /// reconnect and clears it.
     pub reconnect_requested: Option<ReconnectRequest>,
+    /// One-shot screen-wipe intent set by Ctrl+L (bugfix_ctrl_l_screen_clear)
+    /// and consumed by the main loop, which emits the real crossterm
+    /// `Clear(All)` outside ratatui's diff-based draw and forces a full
+    /// repaint. Visual-only: messages, history and bindings are untouched.
+    pub clear_screen_requested: bool,
     /// Cancel target `(request_id, thread_id)` produced by Ctrl+C; the event
     /// loop sends the actual frame. Targets ONLY the active chat's in-flight
     /// request — queued prompts survive a cancel.
     pub pending_cancel: Option<(String, String)>,
-    /// Global input mode (feature: inline thread rename).
+    /// Thread id whose persisted history file must be removed
+    /// (feat_thread_delete): set by the confirm-popup Enter path; the event
+    /// loop performs the actual `history::delete_chat_file_in` and consumes
+    /// this. Kept out of the I/O-free [`App`] so state logic stays
+    /// unit-testable without a filesystem.
+    pub pending_delete: Option<String>,
+    /// Transient status toast (feat_thread_delete busy-refusal) shown in the
+    /// status line; auto-expires after [`STATUS_MSG_TICKS`] spinner ticks.
+    pub status_message: Option<(String, u8)>,
+    /// feat_focus_panes: which pane owns the keyboard (Chat by default).
+    /// Reset to [`Focus::Chat`] whenever a modal closes — see [`Focus`].
+    pub focus: Focus,
+    /// Global input mode (feature: inline thread rename / thread delete /
+    /// in-thread search).
     pub mode: Mode,
+    /// feat_search_thread: pending search jump `(message_index, line_index,
+    /// col)` — the char offset inside the message's rendered line. Set by
+    /// Enter in the search popup, consumed by `ui::render_chat` (the jump
+    /// math needs the SAME wrapped-row totals as rendering, so it happens
+    /// there, not in the state layer). `col` lets the jump land on the
+    /// WRAPPED row that actually contains the hit inside a long paragraph.
+    pub pending_search_jump: Option<(usize, usize, usize)>,
+    /// feat_search_all_threads: pending GLOBAL search jump `(chat_index,
+    /// message_index, line_index, col)` — `chat_index` is the match's OWNING
+    /// thread. Set by Enter in the all-threads search popup AFTER
+    /// [`App::jump_to_selected_all`] already activated that thread (the
+    /// activation lives in the state layer, the wrapped-row math in
+    /// `ui::render_chat` like the in-thread jump). `chat_index` rides along
+    /// purely as a defensive marker: render verifies the target is still the
+    /// active chat before jumping, so a chat that vanished mid-frame drops
+    /// the jump silently instead of scrolling the wrong thread.
+    pub pending_global_search_jump: Option<(usize, usize, usize, usize)>,
 }
 
 const SPINNER: [&str; 10] = [
@@ -146,6 +290,10 @@ const SPINNER: [&str; 10] = [
 /// textarea view auto-scrolls inside the capped window so the caret always
 /// stays on screen.
 pub const MAX_INPUT_LINES: usize = 20;
+
+/// feat_thread_delete: how many 100 ms spinner ticks a transient status
+/// toast stays visible (~2.5 s).
+pub const STATUS_MSG_TICKS: u8 = 25;
 
 /// Heuristic: does this error message indicate a broken transport (backend
 /// process died, pipe broke, cancel impossible) rather than a per-request
@@ -179,8 +327,14 @@ impl App {
             error_popup: None,
             connection: Connection::Connecting,
             reconnect_requested: None,
+            clear_screen_requested: false,
             pending_cancel: None,
+            pending_delete: None,
+            status_message: None,
+            focus: Focus::Chat,
             mode: Mode::Normal,
+            pending_search_jump: None,
+            pending_global_search_jump: None,
         }
     }
 
@@ -209,12 +363,29 @@ impl App {
         self.scroll = 0;
     }
 
-    /// Create a chat with a fresh UUID thread_id, select it.
+    /// feat_focus_panes: toggle which pane owns the keyboard — Ctrl+T flips
+    /// [`Focus::Chat`] ↔ [`Focus::Sidebar`] (twice round-trips). No chat-list
+    /// side effects: the selection, scroll and lifecycle are untouched; with
+    /// zero or one chats toggling is still meaningful (the highlight/dot
+    /// emphasis moves even though navigation has nothing to navigate to).
+    /// Modal modes swallow this like every other chord — the popup branches
+    /// in `main.rs` return before routing.
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Chat => Focus::Sidebar,
+            Focus::Sidebar => Focus::Chat,
+        };
+    }
+
+    /// Create a chat with a fresh UUID thread_id, select it. feat_focus_panes:
+    /// creating a thread is an editor-bound action — focus lands back on
+    /// Chat so typing goes straight into the prompt.
     pub fn new_chat(&mut self) {
         let n = self.chats.len() + 1;
         self.chats.push(Chat::new(format!("New chat {n}")));
         self.active = self.chats.len() - 1;
         self.scroll = 0;
+        self.focus = Focus::Chat;
     }
 
     // ---- rename mode (feature: inline thread rename) ----------------------
@@ -248,7 +419,12 @@ impl App {
     pub fn rename_buf(&self) -> Option<&str> {
         match &self.mode {
             Mode::Renaming { buf } => Some(buf.as_str()),
-            Mode::Normal => None,
+            // The delete-confirm popup and the search popups have no draft of
+            // their own (search queries live in their own state).
+            Mode::Normal
+            | Mode::ConfirmDelete
+            | Mode::Searching { .. }
+            | Mode::SearchingAll { .. } => None,
         }
     }
 
@@ -263,7 +439,13 @@ impl App {
     pub fn input_lines_height(&self) -> u16 {
         let buffer_lines = match &self.mode {
             Mode::Renaming { buf } => buf.split('\n').count(),
-            Mode::Normal => self.input.lines().len(),
+            // The delete-confirm and search popups overlay the normal
+            // editor: their height derives from the message draft, exactly
+            // like Normal.
+            Mode::Normal
+            | Mode::ConfirmDelete
+            | Mode::Searching { .. }
+            | Mode::SearchingAll { .. } => self.input.lines().len(),
         };
         buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
     }
@@ -278,9 +460,17 @@ impl App {
     pub fn commit_rename(&mut self) -> bool {
         let trimmed = match &self.mode {
             Mode::Renaming { buf } => buf.trim().to_owned(),
-            Mode::Normal => return false,
+            // Not renaming (Normal, the delete-confirm popup, or the search
+            // popups): no-op.
+            Mode::Normal
+            | Mode::ConfirmDelete
+            | Mode::Searching { .. }
+            | Mode::SearchingAll { .. } => return false,
         };
         self.mode = Mode::Normal;
+        // feat_focus_panes: a closed modal returns keyboard ownership to
+        // the editor pane regardless of where focus was before it opened.
+        self.focus = Focus::Chat;
         let Some(chat) = self.chats.get_mut(self.active) else {
             return false;
         };
@@ -299,7 +489,317 @@ impl App {
             return false;
         }
         self.mode = Mode::Normal;
+        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
         true
+    }
+
+    // ---- in-thread search (feat_search_thread) ----------------------------
+
+    /// Open the in-thread search popup for the ACTIVE chat with an empty
+    /// query. No-op when another modal owns the keyboard (rename session,
+    /// delete-confirm popup, an already-open search) or when there is no
+    /// active chat. Works while the chat is Busy — search is strictly
+    /// read-only (matches are computed from a snapshot of the messages).
+    pub fn begin_search(&mut self) {
+        if !self.mode.is_normal() || self.active_thread_id().is_none() {
+            return;
+        }
+        self.mode = Mode::Searching {
+            state: SearchState {
+                query: String::new(),
+                selected: 0,
+                matches: Vec::new(),
+            },
+        };
+    }
+
+    /// Append one character to the search query and recompute matches live.
+    pub fn search_push(&mut self, ch: char) {
+        if let Mode::Searching { state } = &mut self.mode {
+            state.query.push(ch);
+        }
+        self.refresh_search_matches();
+    }
+
+    /// Backspace: drop the last character of the search query and recompute
+    /// matches live.
+    pub fn search_backspace(&mut self) {
+        if let Mode::Searching { state } = &mut self.mode {
+            state.query.pop();
+        }
+        self.refresh_search_matches();
+    }
+
+    /// Recompute the match list + selection clamp from the CURRENT query.
+    /// No-op outside search mode (defensive — key routing only calls this
+    /// from the popup branch).
+    fn refresh_search_matches(&mut self) {
+        let query = match &self.mode {
+            Mode::Searching { state } => state.query.clone(),
+            _ => return,
+        };
+        let matches = self.compute_search_matches(&query);
+        if let Mode::Searching { state } = &mut self.mode {
+            state.matches = matches;
+            state.selected = state.selected.min(state.matches.len().saturating_sub(1));
+        }
+    }
+
+    /// Current search query, when the search popup is open.
+    pub fn search_query(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Searching { state } => Some(state.query.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Live match list of the open search popup (empty when closed).
+    pub fn search_matches(&self) -> &[SearchMatch] {
+        match &self.mode {
+            Mode::Searching { state } => &state.matches,
+            _ => &[],
+        }
+    }
+
+    /// Index of the currently selected match (0 when nothing selected).
+    pub fn search_selected(&self) -> usize {
+        match &self.mode {
+            Mode::Searching { state } => state.selected,
+            _ => 0,
+        }
+    }
+
+    /// Move the selection to the NEXT match (down), clamped at the end.
+    pub fn search_select_next(&mut self) {
+        if let Mode::Searching { state } = &mut self.mode {
+            if !state.matches.is_empty() && state.selected + 1 < state.matches.len() {
+                state.selected += 1;
+            }
+        }
+    }
+
+    /// Move the selection to the PREVIOUS match (up), clamped at the start.
+    pub fn search_select_prev(&mut self) {
+        if let Mode::Searching { state } = &mut self.mode {
+            state.selected = state.selected.saturating_sub(1);
+        }
+    }
+
+    /// Close the search popup WITHOUT jumping. The chat view, messages and
+    /// the message draft are untouched (the query lived in the popup only).
+    pub fn cancel_search(&mut self) -> bool {
+        if !matches!(self.mode, Mode::Searching { .. }) {
+            return false;
+        }
+        self.mode = Mode::Normal;
+        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
+        true
+    }
+
+    /// Enter: record a pending jump to the selected match and close the
+    /// popup. The actual scroll happens in `ui::render_chat` on the next
+    /// frame — it needs the SAME wrapped-row totals as rendering, which
+    /// only exist there. No-op (popup stays open, view unchanged) when the
+    /// query is empty or produced no matches.
+    pub fn jump_to_selected(&mut self) -> bool {
+        let jump = match &self.mode {
+            Mode::Searching { state } => state
+                .matches
+                .get(state.selected)
+                .map(|m| (m.message_index, m.line_index, m.col)),
+            _ => None,
+        };
+        match jump {
+            Some(target) => {
+                self.pending_search_jump = Some(target);
+                self.mode = Mode::Normal;
+                // feat_focus_panes: modal closed → editor pane.
+                self.focus = Focus::Chat;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Case-insensitive substring matches of `query` over the ACTIVE chat's
+    /// rendered messages (style markup stripped, role headers excluded —
+    /// they are UI chrome, not message content).
+    fn compute_search_matches(&self, query: &str) -> Vec<SearchMatch> {
+        match self.chats.get(self.active) {
+            Some(chat) => collect_search_matches(chat.messages.iter(), query),
+            None => Vec::new(),
+        }
+    }
+
+    // ---- all-threads search (feat_search_all_threads) --------------------
+
+    /// Open the GLOBAL search popup over ALL chats with an empty query.
+    /// No-op when another modal owns the keyboard (rename session,
+    /// delete-confirm popup, an already-open in-thread or global search) —
+    /// one modal at a time, exactly like the other popups. Works with any
+    /// number of chats (zero yields a graceful 0-match state) and while any
+    /// chat is Busy: search is strictly read-only (matches are computed
+    /// from snapshots of the messages).
+    pub fn begin_search_all(&mut self) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        self.mode = Mode::SearchingAll {
+            state: GlobalSearchState {
+                query: String::new(),
+                selected: 0,
+                matches: Vec::new(),
+            },
+        };
+    }
+
+    /// Append one character to the global-search query and recompute matches
+    /// live across ALL chats.
+    pub fn search_all_push(&mut self, ch: char) {
+        if let Mode::SearchingAll { state } = &mut self.mode {
+            state.query.push(ch);
+        }
+        self.refresh_search_all_matches();
+    }
+
+    /// Backspace: drop the last character of the global-search query and
+    /// recompute matches live.
+    pub fn search_all_backspace(&mut self) {
+        if let Mode::SearchingAll { state } = &mut self.mode {
+            state.query.pop();
+        }
+        self.refresh_search_all_matches();
+    }
+
+    /// Recompute the all-threads match list + selection clamp from the
+    /// CURRENT query. No-op outside global-search mode (defensive — key
+    /// routing only calls this from the popup branch). A chat removed
+    /// between frames is handled HERE: matches are rebuilt from the live
+    /// chat list on every keystroke, so entries of vanished chats simply
+    /// disappear (the popup recomputes live per keystroke by design).
+    fn refresh_search_all_matches(&mut self) {
+        let query = match &self.mode {
+            Mode::SearchingAll { state } => state.query.clone(),
+            _ => return,
+        };
+        let matches = self.compute_search_matches_all(&query);
+        if let Mode::SearchingAll { state } = &mut self.mode {
+            state.matches = matches;
+            state.selected = state.selected.min(state.matches.len().saturating_sub(1));
+        }
+    }
+
+    /// Current global-search query, when the popup is open.
+    pub fn search_all_query(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::SearchingAll { state } => Some(state.query.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Live all-threads match list of the open popup (empty when closed).
+    pub fn search_all_matches(&self) -> &[GlobalSearchMatch] {
+        match &self.mode {
+            Mode::SearchingAll { state } => &state.matches,
+            _ => &[],
+        }
+    }
+
+    /// Index of the currently selected global match (0 when nothing is
+    /// selected).
+    pub fn search_all_selected(&self) -> usize {
+        match &self.mode {
+            Mode::SearchingAll { state } => state.selected,
+            _ => 0,
+        }
+    }
+
+    /// Move the selection to the NEXT global match (down), clamped at the
+    /// end.
+    pub fn search_all_select_next(&mut self) {
+        if let Mode::SearchingAll { state } = &mut self.mode {
+            if !state.matches.is_empty() && state.selected + 1 < state.matches.len() {
+                state.selected += 1;
+            }
+        }
+    }
+
+    /// Move the selection to the PREVIOUS global match (up), clamped at the
+    /// start.
+    pub fn search_all_select_prev(&mut self) {
+        if let Mode::SearchingAll { state } = &mut self.mode {
+            state.selected = state.selected.saturating_sub(1);
+        }
+    }
+
+    /// Close the global search popup WITHOUT jumping or switching threads.
+    /// The chats, messages and the message draft are untouched (the query
+    /// lived in the popup only).
+    pub fn cancel_search_all(&mut self) -> bool {
+        if !matches!(self.mode, Mode::SearchingAll { .. }) {
+            return false;
+        }
+        self.mode = Mode::Normal;
+        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
+        true
+    }
+
+    /// Enter: activate the TARGET THREAD of the selected global match (same
+    /// selection mechanics as Ctrl+↑/↓ switching — bounds-safe index set +
+    /// chat-scroll reset to follow-bottom) and record a pending
+    /// wrapped-row-accurate jump. The actual scroll happens in
+    /// `ui::render_chat` on the next frame, where the SAME wrapped-row
+    /// totals as rendering exist. The match list is recomputed first so a
+    /// chat that vanished mid-popup is handled by the normal recompute path
+    /// (its matches drop out silently). No-op — popup stays open, view
+    /// unchanged — when the query is empty or produced no matches.
+    pub fn jump_to_selected_all(&mut self) -> bool {
+        self.refresh_search_all_matches();
+        let jump = match &self.mode {
+            Mode::SearchingAll { state } => state
+                .matches
+                .get(state.selected)
+                .map(|m| (m.chat_index, m.message_index, m.line_index, m.col)),
+            _ => None,
+        };
+        match jump {
+            Some((chat_index, message_index, line_index, col)) if chat_index < self.chats.len() => {
+                // Activate the target thread exactly like Ctrl+↑/↓: index
+                // set + scroll reset to follow-bottom (the jump math in
+                // render_chat then overrides scroll with the match's row).
+                self.active = chat_index;
+                self.scroll = 0;
+                self.pending_global_search_jump =
+                    Some((chat_index, message_index, line_index, col));
+                self.mode = Mode::Normal;
+                // feat_focus_panes: modal closed → editor pane.
+                self.focus = Focus::Chat;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Case-insensitive substring matches of `query` over ALL chats'
+    /// rendered messages, ordered by CHAT ORDER then MESSAGE ORDER within
+    /// each chat. Reuses [`collect_search_matches`] per chat — the same
+    /// matching logic, the same rendered-text scope (markup stripped, role
+    /// headers excluded, pending rows skipped); only the scope is additive.
+    fn compute_search_matches_all(&self, query: &str) -> Vec<GlobalSearchMatch> {
+        let mut out = Vec::new();
+        for (chat_index, chat) in self.chats.iter().enumerate() {
+            for m in collect_search_matches(chat.messages.iter(), query) {
+                out.push(GlobalSearchMatch {
+                    chat_index,
+                    chat_title: chat.name.clone(),
+                    message_index: m.message_index,
+                    line_index: m.line_index,
+                    line_text: m.line_text,
+                    col: m.col,
+                });
+            }
+        }
+        out
     }
 
     // ---- lifecycle delegation (active chat) ------------------------------
@@ -458,6 +958,10 @@ impl App {
     /// Dismiss the error popup without reconnecting.
     pub fn dismiss_error(&mut self) {
         self.error_popup = None;
+        // feat_focus_panes: a closed modal returns keyboard ownership to
+        // the editor pane regardless of where focus was before it appeared
+        // (a transport failure can interrupt sidebar navigation).
+        self.focus = Focus::Chat;
     }
 
     /// Clear the whole input buffer and park the cursor at the start
@@ -470,6 +974,121 @@ impl App {
         self.input = TextArea::default();
         self.input
             .set_placeholder_text("Type a message…  (\u{23ce} send)");
+    }
+
+    // ---- screen clear (bugfix_ctrl_l_screen_clear) -------------------------
+
+    /// Testable seam behind `Ctrl+L`: record the one-shot screen-wipe intent
+    /// AND reset the chat view state to follow-bottom (`scroll = 0`), so the
+    /// post-clear full repaint shows the newest messages.
+    ///
+    /// Visual-only: messages, history files, popups and other bindings are
+    /// untouched. The main loop consumes the flag via
+    /// [`App::take_clear_screen_request`] and performs the real terminal
+    /// `Clear(All)` + immediate full repaint — unit tests need no terminal.
+    pub fn request_clear_screen(&mut self) {
+        self.scroll = 0;
+        self.clear_screen_requested = true;
+    }
+
+    /// Consume the pending screen-wipe intent (one-shot; main loop only).
+    pub fn take_clear_screen_request(&mut self) -> bool {
+        std::mem::take(&mut self.clear_screen_requested)
+    }
+
+    // ---- thread delete (feat_thread_delete) -------------------------------
+
+    /// Open the delete-confirmation popup for the ACTIVE chat — IDLE ONLY.
+    ///
+    /// Refuses with a transient status toast ([`App::show_status`], the
+    /// popup never opens) when the active chat has a request in flight
+    /// (`Awaiting`/`Running`) OR prompts waiting in its FIFO queue.
+    /// Background chats' work is irrelevant: the guard deliberately
+    /// inspects only the chat about to be deleted. No-op outside Normal
+    /// mode (a rename session or another popup owns the keyboard) and with
+    /// no active chat.
+    pub fn begin_delete_confirm(&mut self) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        let Some(chat) = self.chats.get(self.active) else {
+            return;
+        };
+        if chat.is_busy() || !chat.queue.is_empty() {
+            self.show_status("can't delete — busy");
+            return;
+        }
+        self.mode = Mode::ConfirmDelete;
+    }
+
+    /// Leave the confirm popup without deleting. The active chat, its
+    /// messages and the message draft are untouched; rename-mode
+    /// interaction is unaffected because the draft lives in the prompt
+    /// buffer, which was never touched by the popup.
+    pub fn cancel_delete(&mut self) -> bool {
+        if !matches!(self.mode, Mode::ConfirmDelete) {
+            return false;
+        }
+        self.mode = Mode::Normal;
+        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
+        true
+    }
+
+    /// Confirm the deletion: removes the ACTIVE chat from state entirely,
+    /// records its thread id in [`App::pending_delete`] (the event loop
+    /// deletes the persisted history file via `history::delete_chat_file_in`
+    /// — idempotent, a missing file is success) and selects the neighbour:
+    /// the NEXT chat if one exists, else the PREV, else the clean empty
+    /// state (zero chats — placeholder input, empty pane, exactly the
+    /// visual of a fresh `App::new(Vec::new())`). The chat view always
+    /// returns to follow-bottom (`scroll = 0`).
+    ///
+    /// Returns the removed thread id (also stored in `pending_delete`).
+    /// No-op when no popup is open (defensive — the key routing only calls
+    /// this from ConfirmDelete mode).
+    pub fn confirm_delete(&mut self) -> Option<String> {
+        if !matches!(self.mode, Mode::ConfirmDelete) {
+            return None;
+        }
+        self.mode = Mode::Normal;
+        // feat_focus_panes: modal closed → editor pane (even into the
+        // clean empty state — focus is pane-level state, not selection).
+        self.focus = Focus::Chat;
+        let chat = self.chats.get(self.active)?;
+        let removed_id = chat.id.clone();
+        self.chats.remove(self.active);
+        if self.chats.is_empty() {
+            // Clean empty state: nothing to select.
+            self.active = 0;
+        } else if self.active >= self.chats.len() {
+            // Removed the LAST chat: the previous one slides into focus.
+            self.active = self.chats.len() - 1;
+        }
+        // Removed a first/middle chat: `active` already points at the chat
+        // that shifted into the slot (the old NEXT neighbour).
+        self.scroll = 0; // follow-bottom for the newly selected chat
+        self.pending_delete = Some(removed_id.clone());
+        Some(removed_id)
+    }
+
+    // ---- transient status toast -------------------------------------------
+
+    /// Show a transient status message in the status line, replacing any
+    /// current toast. Auto-expires after [`STATUS_MSG_TICKS`] spinner ticks
+    /// (see [`App::tick_status_message`]).
+    pub fn show_status(&mut self, message: impl Into<String>) {
+        self.status_message = Some((message.into(), STATUS_MSG_TICKS));
+    }
+
+    /// Decrement the toast lifetime; clears it at zero. Called by the event
+    /// loop's 100 ms spinner tick so the toast vanishes on its own.
+    pub fn tick_status_message(&mut self) {
+        if let Some((_, ticks)) = &mut self.status_message {
+            *ticks = ticks.saturating_sub(1);
+            if *ticks == 0 {
+                self.status_message = None;
+            }
+        }
     }
 
     /// Local fallback for Ctrl+C when there is no live backend to receive a
@@ -633,6 +1252,73 @@ fn is_queued_marker(message: &Message) -> bool {
     message.pending && message.markdown.starts_with("\u{23f3} queued")
 }
 
+/// Collect case-insensitive substring matches of `query` over the RENDERED
+/// text of an iterator of messages (feat_search_thread).
+///
+/// Matching runs on the same [`crate::markdown::render`] output the chat
+/// pane paints — style markup already stripped, so `**bold**` matches
+/// `bold` (never the asterisks) and role header lines are excluded by
+/// construction (they are UI chrome drawn by `ui::render_chat`, not message
+/// content). Pending/queued placeholder rows carry no displayable text and
+/// are skipped. Each hit reports `(message_index, line_index)` so the jump
+/// math in `ui.rs` can map it onto the SAME wrapped-row totals as
+/// rendering.
+///
+/// The iterator parameter is the task-6 hook: an all-threads search chains
+/// every chat's messages through this same function additively — only the
+/// scope argument changes, never the matching logic.
+pub fn collect_search_matches<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+    query: &str,
+) -> Vec<SearchMatch> {
+    let qchars: Vec<char> = query.chars().collect();
+    if qchars.is_empty() {
+        return Vec::new();
+    }
+    let theme = Theme::tokyo_night();
+    let mut out = Vec::new();
+    for (message_index, msg) in messages.enumerate() {
+        if msg.pending {
+            continue; // no displayable text to match
+        }
+        let rendered = markdown::render(&msg.markdown, &theme);
+        for (line_index, line) in rendered.iter().enumerate() {
+            let plain: String = line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>();
+            let chars: Vec<char> = plain.chars().collect();
+            if qchars.len() > chars.len() {
+                continue;
+            }
+            // Char-window case-insensitive search: works on CHARS so `col`
+            // is a valid char offset for the snippet renderer, and never
+            // panics on multi-byte glyphs (byte slicing on a lowercased
+            // copy would be unsafe for non-ASCII).
+            let mut from = 0;
+            while from + qchars.len() <= chars.len() {
+                let hit = chars[from..from + qchars.len()]
+                    .iter()
+                    .zip(&qchars)
+                    .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()));
+                if hit {
+                    out.push(SearchMatch {
+                        message_index,
+                        line_index,
+                        line_text: plain.clone(),
+                        col: from,
+                    });
+                    from += qchars.len();
+                } else {
+                    from += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolve the LIVE pending placeholder of a chat: the newest pending row
 /// that is not a queued marker (those belong to prompts still waiting in the
 /// FIFO queue and are owned by [`App::dequeue_next_for`]). Terminal outcomes
@@ -682,6 +1368,39 @@ mod tests {
         let mut app = App::new(Vec::new());
         app.scroll_up(u16::MAX);
         assert_eq!(app.scroll, u16::MAX / 2);
+    }
+
+    // ---- bugfix_ctrl_l_screen_clear -----------------------------------------
+
+    #[test]
+    fn request_clear_screen_resets_scroll_to_follow_bottom() {
+        let mut app = App::new(Vec::new());
+        app.scroll_up(37);
+        assert!(!app.at_bottom());
+        assert!(!app.clear_screen_requested, "precondition: no wipe pending");
+
+        app.request_clear_screen();
+
+        assert_eq!(
+            app.scroll, 0,
+            "^L snaps the chat view back to follow-bottom"
+        );
+        assert!(app.at_bottom());
+        assert!(
+            app.clear_screen_requested,
+            "wipe intent recorded for the event loop"
+        );
+    }
+
+    #[test]
+    fn take_clear_screen_request_is_one_shot() {
+        let mut app = App::new(Vec::new());
+        app.request_clear_screen();
+        assert!(app.take_clear_screen_request());
+        assert!(
+            !app.take_clear_screen_request(),
+            "a second consume must not re-wipe the screen"
+        );
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -761,6 +1480,196 @@ mod tests {
         // saturating at the top edge
         app.select_prev();
         assert_eq!(app.active, 0);
+    }
+
+    // ---- feat_focus_panes: Chat ↔ Sidebar focus state ----------------------
+
+    /// THE round-trip criterion: Ctrl+T's state flip is a pure pane switch —
+    /// toggling twice lands back on Chat; nothing about the chat list
+    /// (selection, scroll, count) moves along.
+    #[test]
+    fn toggle_focus_round_trips_chat_and_sidebar() {
+        let mut app = app_with_chats(3);
+        app.scroll = 42;
+        assert_eq!(app.focus, Focus::Chat, "default focus");
+
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Chat, "toggle twice round-trips");
+        assert_eq!(app.active, 0, "selection untouched by focus flips");
+        assert_eq!(app.scroll, 42, "scroll untouched by focus flips");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.chats.len(), 3);
+    }
+
+    /// Focus is pane-level state, independent of the list contents: zero and
+    /// single-chat lists toggle too (no navigation semantics involved — no
+    /// toast, popup or quit ever fires).
+    #[test]
+    fn toggle_focus_is_independent_of_list_size() {
+        for n in [0usize, 1usize] {
+            let mut app = App::new((0..n).map(|i| Chat::new(format!("chat-{i}"))).collect());
+            app.toggle_focus();
+            assert_eq!(app.focus, Focus::Sidebar, "n={n}");
+            app.toggle_focus();
+            assert_eq!(app.focus, Focus::Chat, "n={n}");
+            assert!(!app.should_quit);
+            assert!(app.status_message.is_none());
+            assert!(app.error_popup.is_none());
+        }
+    }
+
+    /// Arrows keep CLAMPING after the Ctrl+T rewrite — focus toggling never
+    /// leaks into select_next/select_prev (regression pinned when the old
+    /// wrap-cycling method was removed).
+    #[test]
+    fn toggle_focus_does_not_change_arrow_clamping() {
+        let mut app = app_with_chats(3);
+        app.active = 2;
+        app.select_next();
+        assert_eq!(app.active, 2, "select_next clamps at the last thread");
+        app.select_prev();
+        app.select_prev();
+        assert_eq!(app.active, 0, "select_prev clamps at the first thread");
+        app.select_prev();
+        assert_eq!(app.active, 0, "select_prev stays clamped at the top");
+
+        // And the toggle itself still works from anywhere on the list.
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.active = 2;
+        app.select_next();
+        assert_eq!(app.active, 2, "clamping holds while Sidebar focused");
+    }
+
+    /// Modal closers reset focus to Chat: opening a modal above a Sidebar-
+    /// focused UI and closing it hands the keyboard back to the editor,
+    /// whichever close path was taken.
+    #[test]
+    fn closing_rename_resets_focus_to_chat_on_commit_and_cancel() {
+        // Commit path.
+        let mut app = app_with_chats(1);
+        app.focus = Focus::Sidebar;
+        press_ctrl_r(&mut app);
+        assert!(matches!(app.mode, Mode::Renaming { .. }));
+        app.rename_push('x');
+        assert!(app.commit_rename());
+        assert_eq!(app.focus, Focus::Chat);
+        assert!(app.mode.is_normal());
+
+        // Cancel path.
+        let mut app = app_with_chats(1);
+        app.focus = Focus::Sidebar;
+        press_ctrl_r(&mut app);
+        assert!(matches!(app.mode, Mode::Renaming { .. }));
+        assert!(app.cancel_rename());
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    #[test]
+    fn closing_search_popups_resets_focus_to_chat() {
+        // In-thread search: cancel and jump paths.
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "hello world");
+        app.focus = Focus::Sidebar;
+        press_ctrl_r_cancel_search_all_paths_helper(&mut app);
+        assert_eq!(app.focus, Focus::Chat);
+
+        // Global search: cancel path.
+        let mut app = app_with_chats(1);
+        app.focus = Focus::Sidebar;
+        app.begin_search_all();
+        assert!(matches!(app.mode, Mode::SearchingAll { .. }));
+        assert!(app.cancel_search_all());
+        assert_eq!(app.focus, Focus::Chat);
+
+        // Global search: jump path (activate thread + close).
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "target needle");
+        finish_chat(&mut app, 0);
+        app.focus = Focus::Sidebar;
+        app.begin_search_all();
+        app.search_all_push('n');
+        app.search_all_push('e');
+        assert!(
+            !app.search_all_matches().is_empty(),
+            "precondition: a match exists"
+        );
+        assert!(app.jump_to_selected_all());
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    /// Helper shared by `closing_search_popups_resets_focus_to_chat`: walks
+    /// the in-thread search cancel + jump paths from a Sidebar-focused start.
+    fn press_ctrl_r_cancel_search_all_paths_helper(app: &mut App) {
+        app.begin_search();
+        assert!(matches!(app.mode, Mode::Searching { .. }));
+        for ch in "hello".chars() {
+            app.search_push(ch);
+        }
+        assert!(!app.search_matches().is_empty(), "precondition: matches");
+        // Jump path…
+        assert!(app.jump_to_selected());
+        assert_eq!(app.focus, Focus::Chat);
+        // …then reopen for the cancel path.
+        app.focus = Focus::Sidebar;
+        app.begin_search();
+        assert!(matches!(app.mode, Mode::Searching { .. }));
+        assert!(app.cancel_search());
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    #[test]
+    fn closing_delete_confirm_resets_focus_to_chat() {
+        // Cancel path.
+        let mut app = app_with_chats(2);
+        app.focus = Focus::Sidebar;
+        app.begin_delete_confirm();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        assert!(app.cancel_delete());
+        assert_eq!(app.focus, Focus::Chat);
+
+        // Confirm path (delete leaves ≥1 chat behind).
+        let mut app = app_with_chats(2);
+        app.focus = Focus::Sidebar;
+        app.begin_delete_confirm();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        assert!(app.confirm_delete().is_some());
+        assert_eq!(app.focus, Focus::Chat);
+
+        // Confirm path into the clean EMPTY state (deleted last chat) —
+        // focus still returns to the editor even with no chats left.
+        let mut app = app_with_chats(1);
+        app.focus = Focus::Sidebar;
+        app.begin_delete_confirm();
+        assert!(app.confirm_delete().is_some());
+        assert!(app.chats.is_empty());
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    #[test]
+    fn dismissing_error_popup_resets_focus_to_chat() {
+        let mut app = app_with_chats(1);
+        app.focus = Focus::Sidebar;
+        app.show_error("boom");
+        assert!(app.error_popup.is_some());
+        app.dismiss_error();
+        assert!(app.error_popup.is_none());
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    /// ^N new-chat is editor-bound (feat_focus_panes): creating a thread
+    /// always lands focus back on Chat, whether the chord came from either
+    /// pane.
+    #[test]
+    fn new_chat_lands_focus_on_chat() {
+        let mut app = app_with_chats(2);
+        app.focus = Focus::Sidebar;
+        app.new_chat();
+        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(app.active, 2, "new chat is selected");
     }
 
     // ---- lifecycle (per chat) --------------------------------------------
@@ -1513,5 +2422,898 @@ mod tests {
             buf: "ab\ncd\nef".to_owned(),
         };
         assert_eq!(app.input_lines_height(), 3);
+    }
+
+    // ---- feat_thread_delete: confirm popup state logic --------------------
+
+    #[test]
+    fn ctrl_d_opens_confirm_popup_on_idle_chat() {
+        let mut app = app_with_chats(2);
+        assert_eq!(app.mode, Mode::Normal);
+        app.begin_delete_confirm();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        assert!(
+            app.status_message.is_none(),
+            "no refusal toast on a deletable chat"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_refuses_busy_chat_with_status_toast() {
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "long running");
+        assert!(app.is_busy());
+
+        app.begin_delete_confirm();
+        assert_eq!(app.mode, Mode::Normal, "popup must never open while busy");
+        let (msg, _) = app.status_message.as_ref().expect("toast shown");
+        assert!(msg.contains("busy"), "toast text: {msg:?}");
+        assert_eq!(app.chats.len(), 1, "chat untouched");
+    }
+
+    #[test]
+    fn ctrl_d_refuses_chat_with_queued_prompts() {
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "first");
+        type_in(&mut app, "second");
+        assert!(app.take_input().is_none(), "busy chat enqueues");
+        assert_eq!(app.active_queue_len(), 1);
+
+        app.begin_delete_confirm();
+        assert_eq!(app.mode, Mode::Normal, "queued prompts block deletion");
+        assert!(app.status_message.is_some());
+    }
+
+    /// Deleting an idle chat while ANOTHER thread runs in the background is
+    /// allowed: the guard inspects only the active chat about to be deleted,
+    /// and the background request's lifecycle stays untouched.
+    #[test]
+    fn busy_background_chat_does_not_block_deleting_idle_active_chat() {
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "background work"); // chat 0 busy
+        app.select_next(); // chat 1 (idle) becomes active
+        assert!(!app.is_busy());
+
+        app.begin_delete_confirm();
+        assert_eq!(app.mode, Mode::ConfirmDelete, "idle chat is deletable");
+        assert!(app.status_message.is_none());
+        assert!(
+            matches!(app.chats[0].lifecycle, ChatLifecycle::Awaiting { .. }),
+            "background request untouched"
+        );
+    }
+
+    #[test]
+    fn begin_delete_confirm_noop_outside_normal_mode_and_without_chats() {
+        let mut app = App::new(Vec::new());
+        app.begin_delete_confirm();
+        assert_eq!(app.mode, Mode::Normal, "no active chat ⇒ no popup");
+
+        let mut app = app_with_chats(1);
+        press_ctrl_r(&mut app); // rename session open
+        app.begin_delete_confirm();
+        assert!(
+            matches!(app.mode, Mode::Renaming { .. }),
+            "rename session owns the keyboard — no popup"
+        );
+    }
+
+    #[test]
+    fn confirm_delete_removes_chat_and_selects_next_neighbour() {
+        let mut app = app_with_chats(3);
+        let removed_id = app.chats[0].id.clone();
+        app.scroll_up(30); // detach from bottom before deleting
+        assert!(!app.at_bottom());
+
+        app.begin_delete_confirm();
+        let removed = app.confirm_delete().expect("removed thread id");
+
+        assert_eq!(removed, removed_id);
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(app.active, 0, "next chat slides into the slot");
+        assert_eq!(app.chats[0].name, "chat-1");
+        assert_eq!(app.mode, Mode::Normal, "popup closed by confirm");
+        assert_eq!(
+            app.pending_delete.as_deref(),
+            Some(removed_id.as_str()),
+            "file removal handed to the event loop"
+        );
+        assert_eq!(app.scroll, 0, "follow-bottom after delete");
+        assert!(app.at_bottom());
+    }
+
+    #[test]
+    fn confirm_delete_middle_chat_selects_next() {
+        let mut app = app_with_chats(3);
+        app.active = 1;
+        app.begin_delete_confirm();
+        app.confirm_delete();
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(app.active, 1, "former chat-2 is the next neighbour");
+        assert_eq!(app.chats[1].name, "chat-2");
+    }
+
+    #[test]
+    fn confirm_delete_last_chat_selects_prev_neighbour() {
+        let mut app = app_with_chats(3);
+        app.active = 2;
+        app.begin_delete_confirm();
+        app.confirm_delete();
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(app.active, 1, "previous chat selected after removing last");
+        assert_eq!(app.chats[1].name, "chat-1");
+        assert_eq!(app.scroll, 0);
+    }
+
+    /// Deleting the only chat reaches the clean empty state: zero chats,
+    /// active index parked at 0, follow-bottom, no stuck lifecycle.
+    #[test]
+    fn confirm_delete_last_chat_reaches_clean_empty_state() {
+        let mut app = app_with_chats(1);
+        app.begin_delete_confirm();
+        let removed = app.confirm_delete();
+
+        assert!(removed.is_some());
+        assert!(app.chats.is_empty());
+        assert_eq!(app.active, 0);
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.at_bottom());
+        assert!(!app.is_busy());
+        assert!(app.active_request_id().is_none());
+        assert!(app.pending_delete.is_some());
+    }
+
+    #[test]
+    fn cancel_delete_keeps_chat_and_draft_untouched() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "precious draft");
+        app.begin_delete_confirm();
+
+        assert!(app.cancel_delete());
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.chats.len(), 1);
+        assert_eq!(app.chats[0].name, "chat-0");
+        assert_eq!(app.input.lines().join(""), "precious draft");
+        assert!(app.pending_delete.is_none());
+        assert!(!app.cancel_delete(), "cancelling again is a no-op");
+    }
+
+    #[test]
+    fn confirm_delete_without_popup_is_noop() {
+        let mut app = app_with_chats(1);
+        assert!(app.confirm_delete().is_none());
+        assert_eq!(app.chats.len(), 1);
+        assert!(app.pending_delete.is_none());
+    }
+
+    #[test]
+    fn status_toast_expires_after_ticks() {
+        let mut app = app_with_chats(1);
+        app.show_status("can't delete — busy");
+        assert!(app.status_message.is_some());
+        for _ in 0..STATUS_MSG_TICKS {
+            app.tick_status_message();
+        }
+        assert!(app.status_message.is_none(), "toast auto-cleared");
+        // Further ticks are harmless no-ops.
+        app.tick_status_message();
+        assert!(app.status_message.is_none());
+    }
+
+    // ---- feat_search_thread: popup state logic ----------------------------
+
+    #[test]
+    fn ctrl_f_opens_search_popup_with_empty_query() {
+        let mut app = app_with_chats(2);
+        assert_eq!(app.mode, Mode::Normal);
+        app.begin_search();
+        assert!(matches!(app.mode, Mode::Searching { .. }));
+        assert_eq!(app.search_query(), Some(""));
+        assert!(app.search_matches().is_empty());
+        assert_eq!(app.search_selected(), 0);
+        // Messages untouched by merely opening the popup.
+        assert!(app.chats[0].messages.is_empty());
+    }
+
+    #[test]
+    fn begin_search_noop_without_chats_or_in_other_modes() {
+        // No active chat.
+        let mut app = App::new(Vec::new());
+        app.begin_search();
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Rename session open.
+        let mut app = app_with_chats(1);
+        press_ctrl_r(&mut app);
+        app.begin_search();
+        assert!(matches!(app.mode, Mode::Renaming { .. }));
+
+        // Delete-confirm popup open.
+        let mut app = app_with_chats(1);
+        app.begin_delete_confirm();
+        app.begin_search();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+
+        // Already searching — re-press must not reset the query.
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::user("needle here"));
+        app.begin_search();
+        app.search_push('n');
+        app.begin_search();
+        assert_eq!(app.search_query(), Some("n"), "re-press must not clobber");
+    }
+
+    #[test]
+    fn search_typing_recomputes_matches_live_case_insensitive() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("The Quick Brown Fox"));
+        app.chats[0].messages.push(Message::user("quick check"));
+        app.begin_search();
+
+        app.search_push('q');
+        assert_eq!(app.search_query(), Some("q"));
+        assert_eq!(
+            app.search_matches().len(),
+            2,
+            "case-insensitive: q in Quick/quick"
+        );
+
+        app.search_push('u');
+        assert_eq!(app.search_matches().len(), 2);
+
+        app.search_backspace();
+        app.search_backspace();
+        assert_eq!(app.search_query(), Some(""));
+        assert!(
+            app.search_matches().is_empty(),
+            "empty query ⇒ no match list (graceful empty state)"
+        );
+    }
+
+    #[test]
+    fn search_matches_ignore_role_headers_and_markup_noise() {
+        let mut app = app_with_chats(1);
+        // `**bold**` renders to `bold` — the asterisks are style markup and
+        // must never be matchable; the role header line ("● Chibi") is UI
+        // chrome drawn by render_chat, not part of message text.
+        app.chats[0]
+            .messages
+            .push(Message::assistant("use **bold** sparingly"));
+        app.begin_search();
+
+        for ch in "**".chars() {
+            app.search_push(ch);
+        }
+        assert!(
+            app.search_matches().is_empty(),
+            "style markup must not match"
+        );
+
+        for _ in 0..2 {
+            app.search_backspace();
+        }
+        for ch in "bold".chars() {
+            app.search_push(ch);
+        }
+        assert_eq!(
+            app.search_matches().len(),
+            1,
+            "rendered text (markup stripped) must match"
+        );
+        let m = &app.search_matches()[0];
+        assert_eq!(m.message_index, 0);
+        assert_eq!(m.line_index, 0);
+        assert!(
+            m.line_text.contains("bold") && !m.line_text.contains('*'),
+            "snippet source must be markup-free: {:?}",
+            m.line_text
+        );
+    }
+
+    #[test]
+    fn search_selection_navigation_clamps() {
+        let mut app = app_with_chats(1);
+        for i in 0..5 {
+            app.chats[0]
+                .messages
+                .push(Message::user(format!("hit {i} needle")));
+        }
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.search_push(ch);
+        }
+        assert_eq!(app.search_matches().len(), 5);
+        assert_eq!(app.search_selected(), 0);
+
+        for _ in 0..10 {
+            app.search_select_next();
+        }
+        assert_eq!(app.search_selected(), 4, "next clamps at the last match");
+
+        for _ in 0..10 {
+            app.search_select_prev();
+        }
+        assert_eq!(app.search_selected(), 0, "prev clamps at the first");
+    }
+
+    #[test]
+    fn search_enter_jumps_to_selected_and_closes_popup() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("line one needle"));
+        app.chats[0]
+            .messages
+            .push(Message::user("line two needle again"));
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.search_push(ch);
+        }
+        assert_eq!(app.search_matches().len(), 2);
+
+        app.search_select_next();
+        assert_eq!(app.search_selected(), 1);
+
+        assert!(app.jump_to_selected());
+        assert_eq!(app.mode, Mode::Normal, "Enter closes the popup");
+        assert_eq!(
+            app.pending_search_jump,
+            Some((1, 0, 9)),
+            "pending jump targets message 1, rendered line 0, char col 9"
+        );
+        assert!(app.pending_search_jump.is_some());
+    }
+
+    #[test]
+    fn search_enter_without_matches_is_noop() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::user("nothing to see"));
+        app.begin_search();
+        // Empty query.
+        assert!(!app.jump_to_selected());
+        assert!(
+            matches!(app.mode, Mode::Searching { .. }),
+            "popup stays open on an empty-query Enter"
+        );
+        assert!(app.pending_search_jump.is_none());
+        // Non-matching query.
+        app.search_push('z');
+        assert!(!app.jump_to_selected());
+        assert!(app.pending_search_jump.is_none());
+        // Esc still closes cleanly afterwards.
+        assert!(app.cancel_search());
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn search_esc_cancels_keeps_view_and_messages() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::user("needle"));
+        app.scroll_up(15); // detach from bottom
+        let scroll_before = app.scroll;
+        let msgs_before: Vec<String> = app.chats[0]
+            .messages
+            .iter()
+            .map(|m| m.markdown.clone())
+            .collect();
+
+        app.begin_search();
+        app.search_push('n');
+        assert!(app.cancel_search());
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.scroll, scroll_before, "view unchanged by Esc");
+        assert!(
+            app.pending_search_jump.is_none(),
+            "Esc must never request a jump"
+        );
+        let msgs_after: Vec<String> = app.chats[0]
+            .messages
+            .iter()
+            .map(|m| m.markdown.clone())
+            .collect();
+        assert_eq!(msgs_before, msgs_after, "messages untouched");
+        assert!(!app.cancel_search(), "cancelling again is a no-op");
+    }
+
+    /// The search cycle — open, type, navigate, jump, close — must leave
+    /// every message byte-for-byte identical (search is strictly read-only).
+    #[test]
+    fn search_cycle_is_read_only_on_messages() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::user("first question with needle"));
+        app.chats[0]
+            .messages
+            .push(Message::assistant("answer with needle too"));
+        let before = serde_json::to_string(&app.chats[0].messages).unwrap();
+
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.search_push(ch);
+        }
+        app.search_select_next();
+        app.jump_to_selected();
+        // Reopen and cancel (second cycle, close path).
+        app.begin_search();
+        app.search_push('n');
+        app.cancel_search();
+
+        let after = serde_json::to_string(&app.chats[0].messages).unwrap();
+        assert_eq!(before, after, "message bytes must be unchanged");
+    }
+
+    /// Search works while the ACTIVE chat is busy (read-only by design) —
+    /// the popup opens, matches are found, and the lifecycle stays untouched.
+    #[test]
+    fn search_opens_and_finds_while_chat_is_busy() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::user("busy needle question"));
+        let submitted = submit_text(&mut app, "in flight");
+        assert!(app.is_busy());
+
+        app.begin_search();
+        assert!(matches!(app.mode, Mode::Searching { .. }));
+        for ch in "needle".chars() {
+            app.search_push(ch);
+        }
+        assert_eq!(app.search_matches().len(), 1);
+        assert!(app.jump_to_selected());
+        assert_eq!(
+            app.chats[0].lifecycle.request_id(),
+            Some(submitted.request_id.as_str()),
+            "lifecycle untouched by search"
+        );
+    }
+
+    /// `collect_search_matches` takes an ITERATOR over messages — the task-6
+    /// hook: an all-threads search chains every chat's messages through the
+    /// same function additively.
+    #[test]
+    fn collect_search_matches_chains_any_iterator_scope() {
+        let chat_a = {
+            let mut c = Chat::new("a");
+            c.messages.push(Message::user("needle in chat a"));
+            c
+        };
+        let chat_b = {
+            let mut c = Chat::new("b");
+            c.messages.push(Message::assistant("unrelated"));
+            c.messages.push(Message::user("needle in chat b too"));
+            c
+        };
+        let hits = collect_search_matches(
+            chat_a.messages.iter().chain(chat_b.messages.iter()),
+            "needle",
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!((hits[0].message_index, hits[1].message_index), (0, 2));
+    }
+
+    /// Byte-slicing on a lowercased copy would panic on multi-byte glyphs
+    /// whose lowercase form expands (`İ` → `i̇`); the char-window matcher
+    /// must be byte-agnostic and still find ASCII hits around wide chars.
+    #[test]
+    fn collect_search_matches_is_unicode_safe_and_finds_ascii() {
+        let mut chat = Chat::new("wide");
+        chat.messages
+            .push(Message::assistant("İstanbul needle İzmir"));
+        let hits = collect_search_matches(chat.messages.iter(), "needle");
+        assert_eq!(hits.len(), 1, "ASCII hit next to multi-byte glyphs found");
+        assert_eq!(hits[0].col, 9, "char offset into the original line");
+        // A hit on the wide-glyph word itself is found without panicking.
+        let hits = collect_search_matches(chat.messages.iter(), "zmir");
+        assert_eq!(hits.len(), 1, "trailing ASCII of a wide-prefixed word");
+    }
+
+    /// Multiple occurrences on one rendered line yield one match each.
+    #[test]
+    fn collect_search_matches_reports_every_occurrence() {
+        let mut chat = Chat::new("multi");
+        chat.messages
+            .push(Message::assistant("x needle y needle z"));
+        let hits = collect_search_matches(chat.messages.iter(), "needle");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].col, 2);
+        assert_eq!(hits[1].col, 11);
+        assert_eq!(hits[0].line_text, "x needle y needle z");
+    }
+
+    #[test]
+    fn input_lines_height_counts_draft_while_searching() {
+        let mut app = app_with_chats(1);
+        app.input.insert_str("one\ntwo");
+        assert_eq!(app.input_lines_height(), 2);
+        app.begin_search();
+        assert_eq!(
+            app.input_lines_height(),
+            2,
+            "search overlays the editor; draft height unchanged"
+        );
+        app.search_push('n');
+        assert_eq!(app.input_lines_height(), 2, "query lives in the popup");
+    }
+
+    /// per_thread_async tolerance: a terminal event addressed to a REMOVED
+    /// chat's thread id must be dropped silently — no panic, no corruption
+    /// of surviving chats (their in-flight requests keep routing normally).
+    #[test]
+    fn terminal_event_for_removed_thread_is_dropped_silently() {
+        let mut app = app_with_chats(2);
+        let bg = submit_text(&mut app, "background"); // chat 0 busy
+        app.select_next(); // chat 1 (idle) active
+        app.begin_delete_confirm();
+        let removed_id = app.confirm_delete().expect("chat 1 removed");
+        assert_ne!(removed_id, bg.thread_id, "busy chat still present");
+        assert_eq!(app.chats.len(), 1);
+
+        // Stale event for the REMOVED thread id: silently dropped.
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: 987,
+            markdown: "ghost".into(),
+            thread_id: removed_id.clone(),
+        });
+        assert_eq!(app.chats.len(), 1);
+        assert!(
+            matches!(app.chats[0].lifecycle, ChatLifecycle::Awaiting { .. }),
+            "surviving chat's request untouched by the ghost event"
+        );
+
+        // A late event for the still-present busy chat still routes normally.
+        let bg_req = bg.request_id.clone();
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&bg_req),
+            markdown: "**done**".into(),
+            thread_id: bg.thread_id.clone(),
+        });
+        assert_eq!(app.chats[0].messages[1].markdown, "**done**");
+        assert_eq!(app.chats[0].lifecycle, ChatLifecycle::Idle);
+    }
+
+    // ---- feat_search_all_threads: popup state logic ----------------------
+
+    #[test]
+    fn ctrl_shift_f_opens_global_search_popup_with_empty_query() {
+        let mut app = app_with_chats(2);
+        assert_eq!(app.mode, Mode::Normal);
+        app.begin_search_all();
+        assert!(matches!(app.mode, Mode::SearchingAll { .. }));
+        assert_eq!(app.search_all_query(), Some(""));
+        assert!(app.search_all_matches().is_empty());
+        assert_eq!(app.search_all_selected(), 0);
+        // Messages untouched by merely opening the popup.
+        assert!(app.chats[0].messages.is_empty());
+        assert!(app.chats[1].messages.is_empty());
+        assert!(app.pending_global_search_jump.is_none());
+    }
+
+    /// One modal at a time: global search never opens over a rename session,
+    /// the delete-confirm popup, or an already-open search (in-thread or
+    /// global — re-press must not clobber the query).
+    #[test]
+    fn begin_search_all_noop_with_open_modal() {
+        // Rename session open.
+        let mut app = app_with_chats(1);
+        press_ctrl_r(&mut app);
+        app.begin_search_all();
+        assert!(matches!(app.mode, Mode::Renaming { .. }));
+
+        // Delete-confirm popup open.
+        let mut app = app_with_chats(1);
+        app.begin_delete_confirm();
+        app.begin_search_all();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+
+        // In-thread search open.
+        let mut app = app_with_chats(1);
+        app.begin_search();
+        app.begin_search_all();
+        assert!(matches!(app.mode, Mode::Searching { .. }));
+
+        // Already searching globally — re-press must not reset the query.
+        let mut app = app_with_chats(1);
+        app.begin_search_all();
+        app.search_all_push('n');
+        app.begin_search_all();
+        assert_eq!(
+            app.search_all_query(),
+            Some("n"),
+            "re-press must not clobber"
+        );
+    }
+
+    /// The all-threads match list is ordered by CHAT ORDER then MESSAGE
+    /// ORDER within each chat, labeled with each thread's title, and
+    /// recomputed live (case-insensitive) on every keystroke. Empty query →
+    /// graceful empty list.
+    #[test]
+    fn global_search_typing_recomputes_across_all_chats_in_order() {
+        let mut app = app_with_chats(3);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("needle in chat zero"));
+        app.chats[1].messages.push(Message::user("unrelated"));
+        app.chats[1]
+            .messages
+            .push(Message::user("needle first in chat one"));
+        app.chats[1]
+            .messages
+            .push(Message::user("needle second in chat one"));
+        app.chats[2]
+            .messages
+            .push(Message::assistant("needle in chat two"));
+        app.begin_search_all();
+
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_query(), Some("needle"));
+        let matches = app.search_all_matches();
+        assert_eq!(matches.len(), 4);
+        // Order = chat order, then message order within each chat.
+        assert_eq!(
+            matches.iter().map(|m| m.chat_index).collect::<Vec<_>>(),
+            vec![0, 1, 1, 2]
+        );
+        assert_eq!(matches[0].chat_title, "chat-0");
+        assert_eq!(matches[1].chat_title, "chat-1");
+        assert_eq!((matches[1].message_index, matches[2].message_index), (1, 2));
+        assert_eq!(matches[3].chat_index, 2, "single match in chat 2");
+
+        // Empty query → graceful empty state.
+        for _ in 0..6 {
+            app.search_all_backspace();
+        }
+        assert_eq!(app.search_all_query(), Some(""));
+        assert!(app.search_all_matches().is_empty());
+    }
+
+    #[test]
+    fn global_search_navigation_clamps() {
+        let mut app = app_with_chats(2);
+        for i in 0..3 {
+            app.chats[0]
+                .messages
+                .push(Message::user(format!("hit {i} needle")));
+        }
+        for i in 0..2 {
+            app.chats[1]
+                .messages
+                .push(Message::user(format!("hit {i} needle")));
+        }
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_matches().len(), 5);
+        assert_eq!(app.search_all_selected(), 0);
+
+        for _ in 0..10 {
+            app.search_all_select_next();
+        }
+        assert_eq!(
+            app.search_all_selected(),
+            4,
+            "next clamps at the last match"
+        );
+
+        for _ in 0..10 {
+            app.search_all_select_prev();
+        }
+        assert_eq!(app.search_all_selected(), 0, "prev clamps at the first");
+    }
+
+    /// THE activation criterion (state layer): Enter activates the TARGET
+    /// thread (even a NON-active one) with Ctrl+↑/↓ semantics — index set +
+    /// scroll reset — and records the pending jump carrying that chat.
+    #[test]
+    fn global_search_enter_activates_target_thread_and_records_jump() {
+        let mut app = app_with_chats(3);
+        app.chats[0]
+            .messages
+            .push(Message::user("needle in chat zero"));
+        app.chats[2]
+            .messages
+            .push(Message::assistant("needle deep in chat two"));
+        app.active = 1; // searching from chat 1; hits live in chats 0 and 2
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_matches()[0].chat_index, 0);
+        // Select the SECOND match — the NON-active thread.
+        app.search_all_select_next();
+        assert_eq!(
+            app.search_all_matches()[app.search_all_selected()].chat_index,
+            2
+        );
+
+        assert!(app.jump_to_selected_all());
+        assert_eq!(app.mode, Mode::Normal, "Enter closes the popup");
+        assert_eq!(app.active, 2, "target thread activated");
+        assert_eq!(
+            app.pending_global_search_jump,
+            Some((2, 0, 0, 0)),
+            "pending jump carries chat 2, message 0, rendered line 0, col 0"
+        );
+        assert!(
+            app.pending_search_jump.is_none(),
+            "in-thread jump state untouched"
+        );
+        assert_eq!(app.scroll, 0, "thread switch resets scroll (follow-bottom)");
+    }
+
+    #[test]
+    fn global_search_enter_without_matches_is_noop() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::user("nothing to see"));
+        app.begin_search_all();
+        // Empty query.
+        assert!(!app.jump_to_selected_all());
+        assert!(
+            matches!(app.mode, Mode::SearchingAll { .. }),
+            "popup stays open on an empty-query Enter"
+        );
+        assert!(app.pending_global_search_jump.is_none());
+        // Non-matching query.
+        app.search_all_push('z');
+        assert!(!app.jump_to_selected_all());
+        assert!(app.pending_global_search_jump.is_none());
+        assert_eq!(app.active, 0, "no thread switch without a match");
+        // Esc still closes cleanly afterwards.
+        assert!(app.cancel_search_all());
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn global_search_esc_cancels_keeps_threads_and_messages() {
+        let mut app = app_with_chats(2);
+        app.chats[1].messages.push(Message::user("needle"));
+        app.scroll_up(15); // detach from bottom
+        let scroll_before = app.scroll;
+        let active_before = app.active;
+
+        app.begin_search_all();
+        app.search_all_push('n');
+        assert!(app.cancel_search_all());
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.active, active_before, "no thread switch on Esc");
+        assert_eq!(app.scroll, scroll_before, "view unchanged by Esc");
+        assert!(
+            app.pending_global_search_jump.is_none(),
+            "Esc must never request a jump"
+        );
+        assert_eq!(app.chats.len(), 2, "chats untouched");
+        assert_eq!(app.chats[1].messages.len(), 1, "messages untouched");
+        assert!(!app.cancel_search_all(), "cancelling again is a no-op");
+    }
+
+    /// The global search cycle — open, type, navigate, jump, close — must
+    /// leave every chat's messages byte-for-byte identical (read-only).
+    #[test]
+    fn global_search_cycle_is_read_only_on_messages() {
+        let mut app = app_with_chats(2);
+        app.chats[0].messages.push(Message::user("needle in zero"));
+        app.chats[1]
+            .messages
+            .push(Message::assistant("needle in one"));
+        let before: Vec<String> = app
+            .chats
+            .iter()
+            .map(|c| serde_json::to_string(&c.messages).unwrap())
+            .collect();
+
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        app.search_all_select_next();
+        app.jump_to_selected_all();
+        // Reopen and cancel (second cycle, close path).
+        app.begin_search_all();
+        app.search_all_push('n');
+        app.cancel_search_all();
+
+        let after: Vec<String> = app
+            .chats
+            .iter()
+            .map(|c| serde_json::to_string(&c.messages).unwrap())
+            .collect();
+        assert_eq!(before, after, "message bytes must be unchanged");
+    }
+
+    /// Global search works while ANY chat is busy (read-only by design) —
+    /// and its jump may freely switch to a busy background chat.
+    #[test]
+    fn global_search_works_while_chats_are_busy() {
+        let mut app = app_with_chats(2);
+        app.chats[1]
+            .messages
+            .push(Message::user("needle in background"));
+        let submitted = submit_text(&mut app, "in flight"); // chat 0 busy
+        assert!(app.is_busy());
+
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_matches().len(), 1);
+        assert_eq!(app.search_all_matches()[0].chat_index, 1);
+        assert!(app.jump_to_selected_all());
+        assert_eq!(app.active, 1, "busy background chat activated");
+        assert_eq!(
+            app.chats[0].lifecycle.request_id(),
+            Some(submitted.request_id.as_str()),
+            "lifecycle untouched by search"
+        );
+    }
+
+    /// Zero chats: the popup opens and shows a graceful empty state; Enter
+    /// is a no-op and Esc closes cleanly.
+    #[test]
+    fn global_search_works_with_zero_chats_gracefully() {
+        let mut app = App::new(Vec::new());
+        app.begin_search_all();
+        assert!(matches!(app.mode, Mode::SearchingAll { .. }));
+        app.search_all_push('n');
+        assert!(app.search_all_matches().is_empty());
+        assert!(!app.jump_to_selected_all());
+        assert!(app.cancel_search_all());
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// A single-thread dataset behaves exactly like the in-thread search —
+    /// no special casing needed, the global path just works.
+    #[test]
+    fn global_search_single_thread_dataset_works() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("sole needle here"));
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_matches().len(), 1);
+        let m = &app.search_all_matches()[0];
+        assert_eq!((m.chat_index, m.chat_title.as_str()), (0, "chat-0"));
+        assert!(app.jump_to_selected_all());
+        assert_eq!(app.active, 0);
+        assert_eq!(app.pending_global_search_jump, Some((0, 0, 0, 5)));
+    }
+
+    /// Rendering-wise the popup must stay consistent with its own state:
+    /// role headers and markdown markup never match (the per-chat
+    /// [`collect_search_matches`] guarantees carry over verbatim).
+    #[test]
+    fn global_search_matches_ignore_role_headers_and_markup_noise() {
+        let mut app = app_with_chats(2);
+        app.chats[1]
+            .messages
+            .push(Message::assistant("use **bold** sparingly"));
+        app.begin_search_all();
+        for ch in "**".chars() {
+            app.search_all_push(ch);
+        }
+        assert!(app.search_all_matches().is_empty(), "markup must not match");
+        for _ in 0..2 {
+            app.search_all_backspace();
+        }
+        for ch in "bold".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_matches().len(), 1);
+        let m = &app.search_all_matches()[0];
+        assert_eq!((m.chat_index, m.message_index, m.line_index), (1, 0, 0));
+        assert!(
+            m.line_text.contains("bold") && !m.line_text.contains('*'),
+            "snippet source must be markup-free: {:?}",
+            m.line_text
+        );
     }
 }

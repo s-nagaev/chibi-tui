@@ -107,6 +107,24 @@ pub fn save_chat_in(override_dir: Option<&Path>, chat: &Chat) -> std::io::Result
     Ok(path)
 }
 
+/// Delete one chat's persisted history snapshot, keyed by its stable thread
+/// id (feat_thread_delete). A missing file is treated as success — deleting
+/// an already-deleted or never-saved chat is idempotent, never an error.
+pub fn delete_chat_file(chat_id: &str) -> std::io::Result<()> {
+    delete_chat_file_in(None, chat_id)
+}
+
+/// [`delete_chat_file`] with an explicit directory override (tests).
+pub fn delete_chat_file_in(override_dir: Option<&Path>, chat_id: &str) -> std::io::Result<()> {
+    let dir = resolve_dir(override_dir);
+    let path = dir.join(format!("{}.json", sanitize_file_name(chat_id)));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Load every persisted chat, ordered by file name (UUIDs are random, so this
 /// is not recency order — it is merely deterministic). Corrupt or unreadable
 /// files are skipped silently: one bad snapshot must not hide the rest.
@@ -340,5 +358,57 @@ mod tests {
         );
         assert_eq!(second_path.file_name().unwrap(), initial_file_name);
         assert_eq!(load_chats_from(Some(&root))[0].name, "after");
+    }
+
+    // ---- feat_thread_delete: history file removal ------------------------
+
+    /// Deleting a chat removes its persisted snapshot: the file is gone and
+    /// a subsequent load yields nothing.
+    #[test]
+    fn delete_chat_file_removes_snapshot() {
+        let root = temp_root("delete");
+        let chat = sample_chat("doomed");
+        save_chat_in(Some(&root), &chat).expect("save before delete");
+        assert!(!load_chats_from(Some(&root)).is_empty());
+
+        delete_chat_file_in(Some(&root), &chat.id).expect("delete succeeds");
+        assert!(
+            load_chats_from(Some(&root)).is_empty(),
+            "snapshot must be gone after delete"
+        );
+        // The threads directory itself may remain — harmless.
+    }
+
+    /// Idempotency: deleting an already-deleted chat or a thread id that
+    /// was never saved is success, never an error.
+    #[test]
+    fn delete_chat_file_is_idempotent_and_missing_is_ok() {
+        let root = temp_root("delete-idem");
+        let chat = sample_chat("twice");
+        save_chat_in(Some(&root), &chat).expect("save");
+
+        delete_chat_file_in(Some(&root), &chat.id).expect("first delete");
+        // File already gone — still Ok.
+        delete_chat_file_in(Some(&root), &chat.id).expect("idempotent re-delete");
+        // A thread id that was never saved is also a silent no-op.
+        delete_chat_file_in(Some(&root), "00000000-0000-0000-0000-00000000dead")
+            .expect("never-saved id is a no-op");
+    }
+
+    /// Deleting one chat never touches the snapshots of its neighbours.
+    #[test]
+    fn delete_chat_file_leaves_other_chats_intact() {
+        let root = temp_root("delete-others");
+        let keep = sample_chat("keeper");
+        let doomed = sample_chat("doomed");
+        save_chat_in(Some(&root), &keep).expect("save keeper");
+        save_chat_in(Some(&root), &doomed).expect("save doomed");
+
+        delete_chat_file_in(Some(&root), &doomed.id).expect("delete doomed");
+
+        let loaded = load_chats_from(Some(&root));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, keep.id, "keeper snapshot untouched");
+        assert_eq!(loaded[0].name, "keeper");
     }
 }

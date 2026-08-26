@@ -55,28 +55,101 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` | Switch chat (when input is empty) |
+| `Ctrl+↑` / `Ctrl+↓` | Switch to previous / next thread (resets the chat scroll; clamped at list edges) |
+| `Alt+↑` / `Alt+↓` | Same as `Ctrl+↑` / `Ctrl+↓` — a full synonym (see the macOS note below) |
+| `Ctrl+T` | **Toggle pane focus** Chat ↔ Sidebar (see the pane-focus section below). While the Sidebar holds focus, `↑`/`↓` move the thread selection with live switching and bare `Enter`/`Esc` return to the editor. Works in ANY terminal: it is a plain Ctrl+letter chord, so it never degrades the way the arrow chords do without the kitty protocol. The previous wrap-cycling thread switcher this key used to bind was removed |
+| `↑` / `↓` | Move the text cursor up/down inside the input (navigate the multi-line draft); while the Sidebar holds focus they move the thread selection instead (see pane focus below) |
 | `Ctrl+N` | New chat |
 | `Ctrl+R` | Rename the current thread inline (`Enter` save · `Esc` cancel) |
+| `Ctrl+D` | Delete the current thread (`Enter`/`y` confirm · `Esc`/`n` cancel; refused while the thread is busy) |
+| `Ctrl+F` | Find in the current thread (type to filter, `↑`/`↓` navigate matches, `Enter` jump to match, `Esc` close) |
+| `Ctrl+Shift+F` | Find in ALL threads (global search; same popup family with thread-title labels and total counts; `Enter` switches to the match's thread and jumps; requires the kitty keyboard protocol) |
 | `Enter` | Send message (or queue it while this chat is busy) |
 | `⇧↵` / `⌥↵` | Insert a newline into the input (multi-line prompts) |
 | `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
 | `PgUp` / `PgDn` | Scroll chat view up/down one page (by visible rows) |
 | macOS: `fn`+`↑` / `fn`+`↓` | Equivalent to PgUp/PgDn on laptops without a dedicated Page key |
-| `Esc` | Clear input / dismiss popup |
+| `Esc` | Clear input / dismiss popup; while the Sidebar holds focus it just returns focus to Chat (draft untouched) |
 | `Ctrl+V` | Paste clipboard (macOS: Cmd+V) |
-
-> **Terminal support note:** `⇧↵` / `⌥↵` require a terminal that implements
-> the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
-> (kitty, WezTerm, foot, recent Ghostty, …). chibi-tui requests it at startup
-> via crossterm's `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`
-> and pops the flags on exit. On terminals without support the request is
-> ignored and **Shift+Enter degrades to plain Enter — i.e. it sends the
-> message** instead of inserting a newline. There is no reliable way to
-> distinguish the keys there; this is a terminal limitation, not a bug.
 | `Ctrl+A` / `Ctrl+E` | Move cursor to start / end of line |
 | `Ctrl+U` | Delete from cursor to start of line |
-| `Ctrl+L` | Clear input |
+| `Ctrl+L` | Clear input and wipe the visible screen (chat view returns to bottom) |
+
+> **Terminal support note:** `⇧↵` / `⌥↵` (newline inserts), `Ctrl+↑` /
+> `Ctrl+↓` and `Alt+↑` / `Alt+↓` (thread switching) and `Ctrl+Shift+F`
+> (global search) require a terminal that implements the
+> [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+> (kitty, WezTerm, foot, recent Ghostty, iTerm2, …). chibi-tui requests it at
+> startup via crossterm's `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`
+> and pops the flags on exit. On terminals without support the request is
+> silently ignored:
+>
+> - **Shift+Enter degrades to plain Enter — i.e. it sends the message**
+>   instead of inserting a newline.
+> - **`Ctrl+↑` / `Ctrl+↓` become indistinguishable from plain `↑` / `↓`**
+>   (legacy terminals send the same escape bytes as plain arrows, or nothing
+>   for the combination): those presses then move the text cursor instead of
+>   switching threads. On stock macOS this flavor is additionally hijacked by
+>   Mission Control *before* the terminal ever sees it — use `Alt+↑` /
+>   `Alt+↓` there (see the macOS note below).
+> - **`Alt+↑` / `Alt+↓` arrive as an Esc press followed by a plain arrow** on
+>   legacy terminals: crossterm splits the `ESC ESC [ A`-style sequence into
+>   two events, so Esc clears the input and the arrow then moves the caret —
+>   no thread switch. This is a terminal limitation, not a bug: use a
+>   kitty-protocol-capable terminal (or iTerm2, which sends proper Alt+arrow
+>   sequences out of the box) if you need Alt thread switching there.
+> - **`Ctrl+Shift+F` becomes indistinguishable from `Ctrl+F`** (the Shift
+>   modifier is lost on such terminals): those presses then open the
+>   in-thread search instead of the global one. There is no other keyboard
+>   path to global search, so on such terminals it is unavailable; use a
+>   kitty-protocol-capable terminal if you need it. There is no reliable way
+>   to distinguish these keys there; this is a terminal limitation, not a bug.
+
+**macOS note (Mission Control):** macOS binds `Ctrl+↑` / `Ctrl+↓` to the
+*Move between spaces* shortcuts system-wide, so on stock macOS those chords
+are swallowed by Mission Control before the terminal ever receives them. This
+is why chibi-tui also binds `Alt+↑` / `Alt+↓` as a **full synonym** — identical
+thread-switching semantics, no behavior divergence. To re-enable the Ctrl
+variant instead, turn the system shortcuts off: **System Settings → Keyboard →
+Keyboard Shortcuts → Mission Control** → uncheck *Move left a space* / *Move
+right a space* (the `Ctrl+↑`/`Ctrl+↓` entries). Per-terminal Alt behavior:
+**kitty** is native (its keyboard protocol is requested at startup), **iTerm2**
+sends proper Option+arrow sequences out of the box, and **Terminal.app**
+needs **Use Option as Meta Key** (*Settings → Profiles → Keys*) so Option
+reaches the app at all — but on terminals without kitty-protocol support the
+chord may still be split into Esc + arrow (see the terminal support note
+above); verify on your terminal.
+
+**Pane focus (`Ctrl+T`):** `Ctrl+T` toggles the keyboard between the two
+panes — **Chat** (the prompt editor, default) and **Sidebar** (the thread
+list). It deliberately remains a plain Ctrl+letter chord, so it arrives
+intact in **every** terminal; modals (rename, delete confirm, both search
+popups) sit above focus and closing any of them always lands back on Chat.
+
+While the **Sidebar** holds focus:
+
+- `↑` / `↓` move the thread selection with **live switching** — exactly the
+  clamped mechanics of `Ctrl+↑`/`Ctrl+↓` (the active chat and its view
+  follow instantly; every switch resets scrolling to follow-bottom).
+- bare `Enter` applies and returns focus to Chat (the highlighted chat
+  stays active; it never submits the draft), `Esc` returns WITHOUT touching
+  what you have typed.
+- plain typing never leaks into the editor: printable keys, Backspace,
+  Shift/Alt+Enter newlines and readline edits are all swallowed.
+- `PgUp`/`PgDn` still scroll the CHAT pane — reading works regardless of
+  which pane holds focus.
+- global service chords stay live: `^N` (new chat — then focus lands on
+  Chat), `^R` rename, `^D` delete (still refused while busy), `^F` /
+  `Ctrl+Shift+F` search popups, `^L` clear screen, `^C` cancel/quit.
+
+The focused sidebar signals itself through the theme only: its divider and
+`Chats` title lift to a brighter accent and the idle dot column brightens;
+the chat pane's `❯` marker dims while typing is parked.
+
+The old wrap-around *cycling* semantics this key used to carry ("jump to
+the NEXT thread, last wraps to first") was removed in favor of the toggle:
+use `Ctrl+↑` / `Ctrl+↓` (or their Alt synonyms) for sequential thread
+switching.
 
 **Growing input block:** the editor area expands from one up to twenty rows as
 the multiline draft grows (`Shift+Enter`), while the chat pane shrinks to make
@@ -98,6 +171,62 @@ While renaming, `Shift+Enter` / `Alt+Enter` insert a literal newline into the
 draft (multi-line titles render as one space-separated line in the sidebar).
 Every Enter press inside the rename editor belongs to the editor — it never
 submits the message prompt.
+
+### Deleting threads
+
+`Ctrl+D` opens a centered confirmation popup for the current thread
+(`Delete thread`). `Enter` or `y` confirms, `Esc` or `n` cancels, `Ctrl+C`
+quits without deleting. While the popup is open, all other keys are ignored —
+nothing leaks into the message draft and no global binding fires.
+
+Only **idle** threads can be deleted: if the current thread has a request in
+flight or prompts queued, `Ctrl+D` refuses with a brief status message
+(`can't delete — busy`) and no popup appears. Deleting an idle thread while
+another thread runs in the background is fine — the background request is
+untouched. On confirm the thread is removed from the list and its persisted
+history file is deleted (a missing file is treated as success). The **next**
+thread is selected, or the **previous** one when the last was deleted, or the
+clean empty state when no threads remain; the chat view returns to
+follow-bottom. Terminal events arriving later for a removed thread are dropped
+silently.
+
+### Finding text in a thread
+
+`Ctrl+F` opens a centered search popup scoped to the current thread. Type to
+filter: matches are recomputed live, case-insensitively, over the rendered
+message text (markdown markup like `**` or backticks is never matched). Each
+match is listed as `role · snippet` with a short context window around the
+hit, and the total count is shown in the popup title.
+
+`↑` / `↓` move the selection, `Enter` jumps the chat view to the selected
+match (the wrapped row containing the hit is placed near the top of the
+pane — accurate even for long, visually-wrapped paragraphs) and closes the
+popup, `Esc` closes without moving the view, `Ctrl+C` quits. While the popup
+is open, all other keys are ignored — the message draft is never touched and
+no global binding fires. Searching is strictly read-only and works even while
+the thread is busy with a request; `PgUp`/`PgDn` scrolling is suspended while
+the popup is open (the jump drives the view instead).
+
+### Finding text everywhere
+
+`Ctrl+Shift+F` opens the same popup family scoped to **all** threads: matches
+from every chat are combined — ordered by chat, then by message within each
+chat — and each entry is labeled with its **thread title** before the role
+label and snippet. The popup title shows the total match count and the number
+of threads searched.
+
+`↑` / `↓` move the selection, `Enter` **switches to the match's thread** (the
+same selection mechanics as `Ctrl+↑` / `Ctrl+↓` — and `Alt+↑` / `Alt+↓`) and
+jumps the chat view to the selected match — the wrapped row containing the
+hit is placed near the top of the pane, accurate even for long,
+visually-wrapped paragraphs — then closes the popup. `Esc` closes without
+switching or jumping, `Ctrl+C` quits.
+Like the in-thread search, it is strictly read-only, works while threads are
+busy, and all other keys are ignored while the popup is open.
+
+`Ctrl+Shift+F` needs the kitty keyboard protocol (see the terminal support
+note above): on terminals without it the Shift modifier is lost and the chord
+degrades to plain `Ctrl+F` (in-thread search).
 
 If the backend fails to connect or drops mid-session, a modal error popup
 appears instead of crashing; `R` retries, `Esc` dismisses, `q` or `Ctrl+C` quits.
