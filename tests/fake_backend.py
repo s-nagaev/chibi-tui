@@ -16,6 +16,9 @@ Optional behaviour flags (used by the integration tests):
 ``--garbage-on-start``   emit one non-JSON line right after ``ready``
 ``--crash-after-running`` emit ``status running`` for a request, then hard-exit
                          with code 69 via ``os._exit`` (broken-pipe scenario)
+``--result-without-model`` omit the optional ``model``/``provider`` fields on
+                         result frames (feat_agent_model_label fallback: old
+                         backend / fieldless variant)
 """
 
 from __future__ import annotations
@@ -70,6 +73,11 @@ def main() -> int:
         action="store_true",
         help="hard-exit with code 69 right after emitting status running",
     )
+    parser.add_argument(
+        "--result-without-model",
+        action="store_true",
+        help="omit model/provider on result frames (fieldless fallback)",
+    )
     args = parser.parse_args()
 
     initialized = False
@@ -81,15 +89,15 @@ def main() -> int:
         if request_id not in inflight:
             return  # cancelled (or crash raced): never answer twice
         inflight.discard(request_id)
-        emit(
-            {
-                "type": "result",
-                "request_id": request_id,
-                "content": RESULT_CONTENT,
-                "model": "gpt-example",
-                "provider": "openai",
-            }
-        )
+        result = {
+            "type": "result",
+            "request_id": request_id,
+            "content": RESULT_CONTENT,
+        }
+        if not args.result_without_model:
+            result["model"] = "gpt-example"
+            result["provider"] = "openai"
+        emit(result)
 
     def schedule_result(request_id: str, delay: float = 0.25) -> None:
         timer = threading.Timer(delay, emit_result, args=(request_id,))

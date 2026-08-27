@@ -51,6 +51,28 @@ Options:
 
 The app starts in fullscreen alternate-screen mode; the terminal is restored on exit.
 
+### Model label
+
+When the backend reports which model produced an answer (the protocol `result`
+frame carries optional `model`/`provider` fields), the assistant's header line
+shows it next to the agent name in a dim parenthetical:
+
+```
+● Chibi (glm-5.2)
+```
+
+If both fields are present the short `model` display name wins; a
+`provider`-only answer labels itself with the provider. The label is attached
+per message at answer time, so two consecutive replies from different models
+are each labeled with their own.
+
+The parenthetical is **absent** — a plain `● Chibi` — when the answer carries
+no model information: an older backend, a `result` frame without the optional
+fields, or historical messages. Known limitation: the label is session-scoped
+and intentionally not persisted in the history file (its format is unchanged),
+so after a restart every restored message shows the plain header again; a
+later wave may revisit this.
+
 ## Keybindings
 
 | Key | Action |

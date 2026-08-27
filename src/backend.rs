@@ -20,10 +20,16 @@ pub enum BackendEvent {
     /// Backend is processing the request.
     Running { request_id: u64, thread_id: String },
     /// Final markdown answer.
+    ///
+    /// `model` is the display label of the model that produced the answer
+    /// (feat_agent_model_label) — already resolved by the source (prefer
+    /// `model`, fall back to `provider`); `None` renders the plain role
+    /// header (fieldless frame, old backend, mock fallback variant).
     Result {
         request_id: u64,
         markdown: String,
         thread_id: String,
+        model: Option<String>,
     },
     /// Request failed.
     Error {
@@ -79,6 +85,16 @@ impl Backend for MockBackend {
         self.reply_counter = (self.reply_counter + 1) % crate::mock::MOCK_REPLIES.len();
         let markdown = crate::mock::MOCK_REPLIES[self.reply_counter].to_string();
 
+        // feat_agent_model_label: mock results alternate between a labelled
+        // reply (even index) and a fieldless one (odd index) so both the
+        // `● Chibi (model)` and the plain fallback rendering are exercised
+        // end-to-end in demo/mock mode.
+        let model = if self.reply_counter.is_multiple_of(2) {
+            Some("chibi-mock".to_owned())
+        } else {
+            None
+        };
+
         tokio::spawn(async move {
             let _ = tx
                 .send(BackendEvent::Queued {
@@ -100,6 +116,7 @@ impl Backend for MockBackend {
                     request_id,
                     markdown,
                     thread_id: String::new(),
+                    model,
                 })
                 .await;
         });

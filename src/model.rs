@@ -19,6 +19,15 @@ pub struct Message {
     /// Never persisted as `true`: a snapshot saved mid-request is reloaded
     /// with the placeholder resolved (see [`Self::normalized_for_storage`]).
     pub pending: bool,
+    /// Model that produced an assistant answer (feat_agent_model_label).
+    ///
+    /// Stamped per-message at result-resolution time, because future
+    /// per-message model switching must not mislabel earlier replies.
+    /// Session-scoped: stripped by [`Self::normalized_for_storage`] so the
+    /// history file format stays untouched — restored chats render the plain
+    /// label (old backend / historical rows alike).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Message {
@@ -27,6 +36,7 @@ impl Message {
             role: Role::User,
             markdown: markdown.into(),
             pending: false,
+            model: None,
         }
     }
 
@@ -35,6 +45,17 @@ impl Message {
             role: Role::Assistant,
             markdown: markdown.into(),
             pending: false,
+            model: None,
+        }
+    }
+
+    /// Assistant reply that knows which model produced it.
+    pub fn assistant_with_model(markdown: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            markdown: markdown.into(),
+            pending: false,
+            model: Some(model.into()),
         }
     }
 
@@ -44,6 +65,7 @@ impl Message {
             role: Role::Assistant,
             markdown: String::new(),
             pending: true,
+            model: None,
         }
     }
 
@@ -55,17 +77,30 @@ impl Message {
             role: Role::Assistant,
             markdown: format!("\u{23f3} queued (#{position})"),
             pending: true,
+            model: None,
         }
     }
 
     /// Storage view of a message: pending placeholders become empty assistant
     /// messages so a restored history never shows a stuck spinner row.
+    ///
+    /// The model label is session-scoped and dropped here: the persisted
+    /// format stays byte-compatible with pre-label snapshots and a reloaded
+    /// chat intentionally shows the plain role header again.
     pub fn normalized_for_storage(&self) -> Self {
         if self.pending {
             Message::assistant("")
         } else {
-            self.clone()
+            let mut copy = self.clone();
+            copy.model = None;
+            copy
         }
+    }
+
+    /// Display label for the role header: `Some("glm-5.2")` renders as
+    /// `● Chibi (glm-5.2)`; `None` keeps the plain `● Chibi`.
+    pub fn model_label(&self) -> Option<&str> {
+        self.model.as_deref().filter(|m| !m.trim().is_empty())
     }
 }
 
@@ -155,6 +190,51 @@ mod tests {
         assert_eq!(
             role,
             serde_json::from_str::<Role>(&serde_json::to_string(&role).unwrap()).unwrap()
+        );
+    }
+
+    // ---- feat_agent_model_label: per-message model metadata ---------------
+
+    #[test]
+    fn model_label_is_absent_by_default_and_trim_guarded() {
+        assert_eq!(Message::assistant("hi").model_label(), None);
+        assert_eq!(
+            Message::assistant_with_model("hi", "glm-5.2").model_label(),
+            Some("glm-5.2")
+        );
+        // Whitespace-only metadata must not render as "()" — treated absent.
+        assert_eq!(
+            Message::assistant_with_model("hi", "   ").model_label(),
+            None
+        );
+    }
+
+    /// Backward compatibility: snapshots written before the label existed
+    /// (no `model` key) must still deserialize.
+    #[test]
+    fn message_without_model_field_deserializes_from_legacy_json() {
+        let legacy = r#"{"role":"Assistant","markdown":"**42**","pending":false}"#;
+        let msg: Message = serde_json::from_str(legacy).expect("legacy message parses");
+        assert_eq!(msg.model_label(), None);
+        assert_eq!(msg.markdown, "**42**");
+    }
+
+    /// History format contract: the model label is session-scoped and never
+    /// persisted — `normalized_for_storage` strips it, so the on-disk shape
+    /// stays identical to pre-label snapshots and reloaded chats show the
+    /// plain role header.
+    #[test]
+    fn storage_normalization_strips_model_label() {
+        let live = Message::assistant_with_model("answer", "glm-5.2");
+        let stored = live.normalized_for_storage();
+        assert_eq!(stored.model_label(), None, "label must not be persisted");
+        assert_eq!(stored.markdown, "answer");
+        assert!(!stored.pending);
+
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(
+            !json.contains("model"),
+            "serialized storage form must not carry a model key: {json}"
         );
     }
 }

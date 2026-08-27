@@ -320,3 +320,39 @@ async fn status_channel_is_broadcast_not_oneshot() {
 
     pipeline.shutdown().await.unwrap();
 }
+
+// ---- feat_agent_model_label: fieldless result frame -----------------------
+
+/// A backend variant that omits the optional `model`/`provider` fields on
+/// the result frame (old backend / fallback) must parse leniently into
+/// `None` on both — the UI then keeps the plain `● Chibi` header.
+#[tokio::test]
+async fn result_without_model_fields_parses_with_none() {
+    let pipeline = connect(&["--result-without-model"]).await;
+
+    let rx = send(
+        &pipeline,
+        RequestArgs::new("01NOMODELFIELD001", 5, "who answered?"),
+    )
+    .await;
+    let outcome = tokio::time::timeout(TIMEOUT, rx)
+        .await
+        .expect("result within timeout")
+        .expect("final frame present");
+    match outcome.expect("request succeeds") {
+        chibi_tui::protocol::ServerMessage::Result {
+            request_id,
+            content,
+            model,
+            provider,
+        } => {
+            assert_eq!(request_id, "01NOMODELFIELD001");
+            assert!(content.contains("42"));
+            assert_eq!(model, None, "fieldless frame → no model label");
+            assert_eq!(provider, None, "fieldless frame → no provider label");
+        }
+        other => panic!("expected Result, got: {other:?}"),
+    }
+
+    pipeline.shutdown().await.unwrap();
+}

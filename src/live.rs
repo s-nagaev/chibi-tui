@@ -48,7 +48,17 @@ impl LiveBackend {
     /// `chibi` binary (from PATH) and can be overridden with `CHIBI_FAKE_BACKEND`
     /// (seam for integration tests).
     pub async fn connect(workspace_root: impl AsRef<Path>) -> Result<Self, BackendError> {
-        let pipeline = RequestPipeline::connect(workspace_root.as_ref(), 64).await?;
+        Self::connect_with_args(workspace_root, &[]).await
+    }
+
+    /// [`LiveBackend::connect`] with extra peer argv (fake-backend behaviour
+    /// flags in integration tests, e.g. `--result-without-model`).
+    pub async fn connect_with_args(
+        workspace_root: impl AsRef<Path>,
+        extra_args: &[String],
+    ) -> Result<Self, BackendError> {
+        let pipeline =
+            RequestPipeline::connect_with_args(workspace_root.as_ref(), 64, extra_args).await?;
         Ok(Self { pipeline })
     }
 
@@ -174,10 +184,16 @@ fn terminal_event(
     thread_id: String,
 ) -> BackendEvent {
     match outcome {
-        Ok(Ok(ServerMessage::Result { content, .. })) => BackendEvent::Result {
+        Ok(Ok(ServerMessage::Result {
+            content,
+            model,
+            provider,
+            ..
+        })) => BackendEvent::Result {
             request_id: event_id,
             markdown: content,
             thread_id,
+            model: resolve_model_label(model.as_deref(), provider.as_deref()),
         },
         Ok(Ok(unexpected)) => BackendEvent::Error {
             request_id: event_id,
@@ -195,6 +211,19 @@ fn terminal_event(
             thread_id: Some(thread_id),
         },
     }
+}
+
+/// feat_agent_model_label: pick the display label from a `result` frame.
+///
+/// The backend sends `model`/`provider` when it knows them. If both are
+/// present, `model` wins (short display name); a `provider`-only frame still
+/// labels the reply; whitespace-only values count as absent. `None` means
+/// "no reliable identity" → the UI keeps the plain header (no "unknown").
+fn resolve_model_label(model: Option<&str>, provider: Option<&str>) -> Option<String> {
+    fn clean(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    clean(model).or_else(|| clean(provider)).map(str::to_owned)
 }
 
 /// The chat's stable thread id travels with the glue task (it owns the
@@ -292,7 +321,8 @@ mod tests {
     }
 
     /// Terminal-event mapping: a normal result frame becomes
-    /// `BackendEvent::Result` carrying the content verbatim.
+    /// `BackendEvent::Result` carrying the content verbatim; a fieldless
+    /// frame (old backend / fixtures without model) yields no label.
     #[test]
     fn terminal_event_maps_result_content_verbatim() {
         let outcome: Result<PipelineResult, oneshot::error::RecvError> =
@@ -307,11 +337,62 @@ mod tests {
                 request_id,
                 markdown,
                 thread_id,
+                model,
             } => {
                 assert_eq!(request_id, 7);
                 assert_eq!(markdown, "**42**");
                 assert_eq!(thread_id, "thread-a");
+                assert_eq!(model, None, "fieldless frame → plain label");
             }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    // ---- feat_agent_model_label: result-frame model label -----------------
+
+    /// Both fields present → the short `model` display name wins.
+    #[test]
+    fn resolve_model_label_prefers_model_over_provider() {
+        assert_eq!(
+            resolve_model_label(Some("glm-5.2"), Some("zhipu")),
+            Some("glm-5.2".to_owned())
+        );
+    }
+
+    /// Provider-only frames still label the reply; whitespace-only values
+    /// count as absent; nothing at all stays `None`.
+    #[test]
+    fn resolve_model_label_falls_back_to_provider() {
+        assert_eq!(
+            resolve_model_label(None, Some("moonshot")),
+            Some("moonshot".to_owned())
+        );
+        assert_eq!(
+            resolve_model_label(Some("  "), Some("moonshot")),
+            Some("moonshot".to_owned()),
+            "blank model must not shadow a usable provider"
+        );
+        assert_eq!(
+            resolve_model_label(Some("kimi-k2.7"), None),
+            Some("kimi-k2.7".to_owned())
+        );
+        assert_eq!(resolve_model_label(None, None), None);
+        assert_eq!(resolve_model_label(Some(" "), Some("  ")), None);
+    }
+
+    /// A labelled result frame stamps the resolved label onto the event that
+    /// resolves the pending message.
+    #[test]
+    fn terminal_event_carries_resolved_model_label() {
+        let outcome: Result<PipelineResult, oneshot::error::RecvError> =
+            Ok(Ok(ServerMessage::Result {
+                request_id: "x".into(),
+                content: "answer".into(),
+                model: Some("glm-5.2".into()),
+                provider: Some("zhipu".into()),
+            }));
+        match terminal_event(outcome, 1, "t".to_owned()) {
+            BackendEvent::Result { model, .. } => assert_eq!(model.as_deref(), Some("glm-5.2")),
             other => panic!("expected Result, got {other:?}"),
         }
     }
@@ -450,6 +531,7 @@ mod tests {
             BackendEvent::Result {
                 markdown,
                 thread_id,
+                model,
                 ..
             } => {
                 assert_eq!(
@@ -461,6 +543,11 @@ mod tests {
                     sample.thread_id,
                     "event routed by thread id"
                 );
+                assert_eq!(
+                    model.as_deref(),
+                    Some("gpt-example"),
+                    "labelled fake frame carries the model label end-to-end"
+                );
             }
             other => panic!("third event must be Result, got {other:?}"),
         }
@@ -471,6 +558,42 @@ mod tests {
                 assert_eq!(thread_id.as_str(), sample.thread_id)
             }
             other => panic!("fourth event must be QueueDrain, got {other:?}"),
+        }
+
+        let _ = live.shutdown().await;
+    }
+
+    /// feat_agent_model_label fallback, end-to-end: a backend variant that
+    /// omits `model`/`provider` on the result frame must yield `None` on the
+    /// terminal event — the UI then keeps the plain `● Chibi` header.
+    #[tokio::test]
+    async fn fieldless_result_frame_yields_no_model_label_end_to_end() {
+        with_fake_backend();
+        let fieldless: Vec<String> = vec!["--result-without-model".to_owned()];
+        let live = tokio::time::timeout(TIMEOUT, LiveBackend::connect_with_args(".", &fieldless))
+            .await
+            .expect("connect within timeout")
+            .expect("handshake ok");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        live.submit_encoded(sample_submitted(), tx);
+
+        // Drain the four deterministic events of one request.
+        let mut terminal = None;
+        for _ in 0..4 {
+            let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+                .await
+                .expect("event in time")
+                .expect("channel alive");
+            if matches!(evt, BackendEvent::Result { .. }) {
+                terminal = Some(evt);
+            }
+        }
+        match terminal {
+            Some(BackendEvent::Result { model, .. }) => {
+                assert_eq!(model, None, "fieldless frame must not invent a label");
+            }
+            other => panic!("expected terminal Result, got {other:?}"),
         }
 
         let _ = live.shutdown().await;

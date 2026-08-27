@@ -7,6 +7,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Model label in the assistant header: when the backend's `result` frame
+  carries the optional `model`/`provider` fields, the answer's header renders
+  as `● Chibi (model)` with a dim parenthetical (model preferred, provider as
+  fallback); fieldless frames and restored history keep the plain `● Chibi`.
+  Labels attach per message; a long model name wraps safely with the
+  row-accurate scroll math. The label is session-scoped — the history file
+  format is unchanged.
 - Growing input block: the editor area now expands from 1 up to 20 rows with
   the multiline draft (`Shift+Enter`), squeezing the chat pane; past 20 lines
   the view auto-follows the caret. The `⏎ send` chip moves to the first row of

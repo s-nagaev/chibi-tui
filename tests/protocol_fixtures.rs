@@ -294,3 +294,31 @@ fn status_state_serializes_to_lowercase_tags() {
     );
     assert_eq!(StatusState::Queued.to_string(), "queued");
 }
+
+// ---- feat_agent_model_label: optional model/provider on result frames -----
+
+/// Backward compatibility at the type level: a `result` frame WITHOUT the
+/// optional `model`/`provider` keys (old backend, fieldless variant) parses
+/// leniently into `None`, and re-serializes without inventing the keys —
+/// so the TUI keeps the plain `● Chibi` header and the wire shape stays
+/// forward/backward compatible.
+#[test]
+fn result_frame_without_model_fields_roundtrips_without_them() {
+    let fieldless = r#"{"type": "result", "request_id": "01NOMODEL", "content": "answer"}"#;
+    let msg: ServerMessage = serde_json::from_str(fieldless).expect("fieldless result parses");
+    match &msg {
+        ServerMessage::Result {
+            model, provider, ..
+        } => {
+            assert_eq!(model, &None);
+            assert_eq!(provider, &None);
+        }
+        other => panic!("expected Result, got {other:?}"),
+    }
+    let back = serde_json::to_value(&msg).unwrap();
+    assert!(back.get("model").is_none(), "no model key invented: {back}");
+    assert!(
+        back.get("provider").is_none(),
+        "no provider key invented: {back}"
+    );
+}

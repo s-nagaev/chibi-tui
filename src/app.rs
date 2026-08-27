@@ -1099,7 +1099,7 @@ impl App {
     /// pump (same trade-off as before this feature).
     pub fn resolve_cancel_locally(&mut self) {
         if let Some(chat) = self.chats.get_mut(self.active) {
-            resolve_live_placeholder(chat, "_Cancelled._".to_owned());
+            resolve_live_placeholder(chat, "_Cancelled._".to_owned(), None);
             chat.lifecycle = ChatLifecycle::Idle;
         }
     }
@@ -1171,11 +1171,12 @@ impl App {
             BackendEvent::Result {
                 markdown,
                 request_id,
+                model,
                 ..
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
                     let chat = &mut self.chats[chat_index];
-                    resolve_live_placeholder(chat, markdown);
+                    resolve_live_placeholder(chat, markdown, model);
                     chat.lifecycle = ChatLifecycle::Idle;
                     self.scroll = 0;
                 }
@@ -1187,7 +1188,7 @@ impl App {
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
                     let chat = &mut self.chats[chat_index];
-                    resolve_live_placeholder(chat, format!("**Error:** {message}"));
+                    resolve_live_placeholder(chat, format!("**Error:** {message}"), None);
                     chat.lifecycle = ChatLifecycle::Idle;
 
                     // Transport-level failures (broken pipe, lost backend,
@@ -1323,7 +1324,12 @@ pub fn collect_search_matches<'a>(
 /// that is not a queued marker (those belong to prompts still waiting in the
 /// FIFO queue and are owned by [`App::dequeue_next_for`]). Terminal outcomes
 /// (`result`, `error`, cancel) must never touch queued markers.
-fn resolve_live_placeholder(chat: &mut Chat, markdown: String) {
+/// Resolve the live pending placeholder of `chat` into a finished message.
+///
+/// `model` (feat_agent_model_label) is stamped ONLY onto this one message at
+/// result-resolution time: replies are labelled per-message, so future
+/// per-message model switching can never mislabel an earlier answer.
+fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<String>) {
     if let Some(row) = chat
         .messages
         .iter_mut()
@@ -1332,6 +1338,7 @@ fn resolve_live_placeholder(chat: &mut Chat, markdown: String) {
     {
         row.pending = false;
         row.markdown = markdown;
+        row.model = model;
     }
 }
 
@@ -1442,12 +1449,18 @@ mod tests {
 
     /// Deliver a terminal Result event to `index`'s tracked request id.
     fn finish_chat(app: &mut App, index: usize) {
+        finish_chat_with_model(app, index, None);
+    }
+
+    /// [`finish_chat`] with a model label (feat_agent_model_label).
+    fn finish_chat_with_model(app: &mut App, index: usize, model: Option<&str>) {
         let request_id = app.chats[index].lifecycle.request_id().unwrap().to_owned();
         let thread_id = app.chats[index].id.clone();
         app.apply_backend_event(BackendEvent::Result {
             request_id: event_id_of(&request_id),
             markdown: "**done**".into(),
             thread_id,
+            model: model.map(str::to_owned),
         });
     }
 
@@ -1806,6 +1819,50 @@ mod tests {
         );
     }
 
+    // ---- feat_agent_model_label: per-message labelling --------------------
+
+    /// THE per-message contract: two consecutive replies produced by
+    /// DIFFERENT models each carry their own label — the second resolution
+    /// must never overwrite the first message's metadata (future
+    /// per-message model switching must not mislabel earlier answers).
+    #[test]
+    fn consecutive_results_label_their_own_messages() {
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "first prompt");
+        finish_chat_with_model(&mut app, 0, Some("glm-5.2"));
+
+        // Second round-trip in the same chat, different model this time.
+        submit_text(&mut app, "second prompt");
+        finish_chat_with_model(&mut app, 0, Some("kimi-k2.7"));
+
+        let msgs = &app.chats[0].messages;
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(
+            msgs[1].model.as_deref(),
+            Some("glm-5.2"),
+            "first answer keeps its own label"
+        );
+        assert_eq!(
+            msgs[3].model.as_deref(),
+            Some("kimi-k2.7"),
+            "second answer carries the new label"
+        );
+    }
+
+    /// Fallback: a fieldless result (model = None) resolves to a message
+    /// with NO metadata — rendered later as the plain `● Chibi` header.
+    #[test]
+    fn fieldless_result_resolves_to_plain_unlabelled_message() {
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "old backend");
+        finish_chat_with_model(&mut app, 0, None);
+
+        let msgs = &app.chats[0].messages;
+        assert!(!msgs[1].pending);
+        assert_eq!(msgs[1].markdown, "**done**");
+        assert_eq!(msgs[1].model_label(), None);
+    }
+
     #[test]
     fn fifo_queue_drains_in_order_on_terminal_events() {
         let mut app = app_with_chats(1);
@@ -1888,6 +1945,7 @@ mod tests {
             request_id: event_id_of(&second_req),
             markdown: "B done".into(),
             thread_id: second.thread_id.clone(),
+            model: None,
         });
         assert_eq!(app.chats[0].messages.len(), 2, "A still pending");
         assert_eq!(app.chats[1].messages[1].markdown, "B done");
@@ -2005,6 +2063,7 @@ mod tests {
             request_id: event_id_of(&submitted.request_id),
             markdown: "answer".into(),
             thread_id: submitted.thread_id.clone(),
+            model: None,
         });
         // Late duplicate / stale event for an already-finished request:
         app.apply_backend_event(BackendEvent::Error {
@@ -2025,6 +2084,7 @@ mod tests {
             request_id: 12345,
             markdown: "not mine".into(),
             thread_id: "00000000-0000-0000-0000-00000000dead".into(),
+            model: None,
         });
         assert!(matches!(
             app.chats[0].lifecycle,
@@ -2957,6 +3017,7 @@ mod tests {
             request_id: 987,
             markdown: "ghost".into(),
             thread_id: removed_id.clone(),
+            model: None,
         });
         assert_eq!(app.chats.len(), 1);
         assert!(
@@ -2970,6 +3031,7 @@ mod tests {
             request_id: event_id_of(&bg_req),
             markdown: "**done**".into(),
             thread_id: bg.thread_id.clone(),
+            model: None,
         });
         assert_eq!(app.chats[0].messages[1].markdown, "**done**");
         assert_eq!(app.chats[0].lifecycle, ChatLifecycle::Idle);

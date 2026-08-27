@@ -260,6 +260,31 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 }
 
+/// feat_agent_model_label: the assistant role header line.
+///
+/// `Some(label)` appends a DIM parenthetical — `● Chibi (glm-5.2)` — via
+/// [`Theme::dim`]; `None` keeps the plain `● Chibi` (historical rows, old
+/// backend or fieldless frames: never a placeholder like "(unknown)").
+/// The name itself stays hardcoded `Chibi` (B2/BOT_NAME is a later task).
+///
+/// Returns a single logical line: a long model name simply wraps within it,
+/// and the row-accurate scroll math counts display rows, so nothing else
+/// has to change.
+fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::MdLine {
+    let mut spans = vec![Span::styled(
+        "\u{25cf} Chibi",
+        Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
+    )];
+    // Trim-guarded: whitespace-only metadata must never render as "()".
+    if let Some(label) = model_label.map(str::trim).filter(|l| !l.is_empty()) {
+        spans.push(Span::styled(
+            format!(" ({label})"),
+            Style::new().fg(theme.dim),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_line: Rect) {
     let title = app.chat_title().replace('\n', " ");
     let block = Block::default()
@@ -298,10 +323,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
                 )));
             }
             Role::Assistant => {
-                lines.push(Line::from(Span::styled(
-                    "\u{25cf} Chibi",
-                    Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
-                )));
+                lines.push(assistant_header_line(msg.model_label(), theme));
             }
         }
         if msg.pending {
@@ -3296,6 +3318,157 @@ mod tests {
         assert!(
             visible_named(&rows, "chat-0"),
             "selection returned to the visible top"
+        );
+    }
+
+    // ---- feat_agent_model_label: header rendering -------------------------
+
+    /// A message without model metadata renders the plain `● Chibi` header —
+    /// no parentheses, no "unknown" placeholder (old backend / historical
+    /// rows / fieldless frames).
+    #[test]
+    fn assistant_header_without_metadata_is_plain() {
+        let theme = Theme::tokyo_night();
+        let line = assistant_header_line(None, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(text, "\u{25cf} Chibi", "fallback must stay plain: {text:?}");
+        assert_eq!(line.spans.len(), 1);
+    }
+
+    /// A labelled message renders `● Chibi (model)`: the parenthetical is a
+    /// separate span styled with `theme.dim` (not bold, not the header blue).
+    #[test]
+    fn assistant_header_renders_dim_parenthetical_model_label() {
+        let theme = Theme::tokyo_night();
+        let line = assistant_header_line(Some("glm-5.2"), &theme);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(text, "\u{25cf} Chibi (glm-5.2)");
+
+        assert_eq!(line.spans.len(), 2);
+        let header = &line.spans[0];
+        assert_eq!(header.content, "\u{25cf} Chibi");
+        assert_eq!(header.style.fg, Some(theme.blue), "header keeps its blue");
+        assert!(header.style.add_modifier.contains(Modifier::BOLD));
+
+        let paren = &line.spans[1];
+        assert_eq!(paren.content, " (glm-5.2)");
+        assert_eq!(paren.style.fg, Some(theme.dim), "parenthetical must be dim");
+        assert!(
+            !paren.style.add_modifier.contains(Modifier::BOLD),
+            "parenthetical must not inherit the bold header"
+        );
+    }
+
+    /// Whitespace-only metadata must not render an empty "()" suffix.
+    #[test]
+    fn assistant_header_ignores_blank_model_labels() {
+        let theme = Theme::tokyo_night();
+        let line = assistant_header_line(Some("   "), &theme);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(text, "\u{25cf} Chibi");
+    }
+
+    /// THE wrap regression: a long model name can wrap the header line in a
+    /// narrow viewport. (1) The renderer's row total must grow with the
+    /// wrapped header (row-accurate math counts display rows). (2) In
+    /// follow-bottom mode the newest reply must still be fully visible —
+    /// a miscounted total would hide its tail behind the input block
+    /// (bugfix_bottom_reply_hidden class of failure).
+    #[test]
+    fn long_model_name_wrap_is_absorbed_by_row_math() {
+        const FRAME_W: u16 = 60;
+        const FRAME_H: u16 = 24;
+        // Chat pane inner width = frame - sidebar(26).
+        let pane_width = (FRAME_W - 26) as usize;
+
+        let model_name = "super-long-model-name-ultra-extended-edition-v42";
+        let tail_word = "tail42";
+
+        let mut app = App::new(vec![Chat::new("wrap")]);
+        app.chats[0].messages.push(Message::user("question"));
+        app.chats[0].messages.push(Message::assistant_with_model(
+            format!("answer one-liner {tail_word}"),
+            model_name,
+        ));
+
+        // (1) Row math: the labelled header must occupy MORE display rows
+        // than the plain header at this width (the wrap is absorbed by the
+        // same totals the renderer consumes).
+        let theme = Theme::tokyo_night();
+        let build_lines = |label: Option<&str>| {
+            let mut lines: Vec<markdown::MdLine> = Vec::new();
+            for msg in [
+                Message::user("question"),
+                Message::assistant_with_model(
+                    format!("answer one-liner {tail_word}"),
+                    label.unwrap_or(""),
+                ),
+            ] {
+                match msg.role {
+                    Role::User => {
+                        lines.push(Line::from(Span::styled("\u{25cf} You", Style::new())))
+                    }
+                    Role::Assistant => lines.push(assistant_header_line(msg.model_label(), &theme)),
+                }
+                lines.extend(markdown::render(&msg.markdown, &theme));
+                lines.push(Line::from(""));
+            }
+            lines
+        };
+        let plain_rows = wrap_message_rows_indexed(&build_lines(None), pane_width)
+            .0
+            .len();
+        let labelled_rows = wrap_message_rows_indexed(&build_lines(Some(model_name)), pane_width)
+            .0
+            .len();
+        assert!(
+            labelled_rows > plain_rows,
+            "long model name must wrap and add display rows: {labelled_rows} vs {plain_rows}"
+        );
+
+        // (2) Full render, follow-bottom: the labelled header START (it
+        // wrapped) may scroll off, but the newest reply's tail must remain
+        // visible right above the input row.
+        let (rows, _) = render_grid_at_with_buffer(&mut app, FRAME_W, FRAME_H);
+        let flat = rows.join("\n");
+        assert!(
+            flat.contains(tail_word),
+            "newest reply tail hidden — wrap row math regressed:\n{flat}"
+        );
+        // The wrapped label itself renders across rows: its head chunk and
+        // tail chunk must both be present (split-point-agnostic — the exact
+        // break column depends on the pane width, not on the label's
+        // integrity, which is precisely what the row math absorbs).
+        assert!(
+            flat.contains("(super-long-model-name") && flat.contains("edition-v42"),
+            "wrapped label rows themselves must render:\n{flat}"
+        );
+    }
+
+    /// End-to-end render: labelled and unlabelled messages coexist in one
+    /// thread, each rendering exactly its own header shape.
+    #[test]
+    fn mixed_labelled_and_plain_messages_render_per_message() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].messages.push(Message::user("q1"));
+        app.chats[0]
+            .messages
+            .push(Message::assistant_with_model("old answer", "glm-5.2"));
+        app.chats[0].messages.push(Message::user("q2"));
+        app.chats[0].messages.push(Message::assistant("new answer"));
+
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.contains("(glm-5.2)"),
+            "labelled header missing:\n{flat}"
+        );
+        let lines_with_label = flat
+            .lines()
+            .filter(|r| r.contains("\u{25cf} Chibi"))
+            .count();
+        assert!(
+            lines_with_label >= 2,
+            "both assistant headers must render: {flat}"
         );
     }
 }
