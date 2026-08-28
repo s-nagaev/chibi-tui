@@ -73,6 +73,15 @@ and intentionally not persisted in the history file (its format is unchanged),
 so after a restart every restored message shows the plain header again; a
 later wave may revisit this.
 
+### Behavior notes
+
+Empty agent acknowledgements are hidden; the spinner is the signal that work
+continues. When an agent answers with nothing (or only the protocol-level
+`<chibi>ACK</chibi>` marker), no assistant bubble appears at all — the pending
+spinner simply resolves and the next queued prompt (if any) sends immediately.
+An answer that merely *contains* the marker next to real text is shown as-is,
+raw; cleaning up partial markers is the backend's job, not the TUI's.
+
 ## Keybindings
 
 | Key | Action |

@@ -294,6 +294,15 @@ pub const MAX_INPUT_LINES: usize = 20;
 /// feat_thread_delete: how many 100 ms spinner ticks a transient status
 /// toast stays visible (~2.5 s).
 pub const STATUS_MSG_TICKS: u8 = 25;
+/// fix_ack_silent_absorb: the protocol-level acknowledgement marker the
+/// backend uses for silent turns ("THE ACK RULE" in the chibi backend,
+/// `chibi/constants.py`). An agent answer whose ENTIRE content is one or
+/// more of these markers (plus optional surrounding whitespace) is a
+/// protocol ack, not a user-facing answer — the TUI absorbs it invisibly:
+/// no assistant bubble, no error, the pending spinner just resolves to
+/// Idle (and the per-thread queue drains normally). Content that merely
+/// CONTAINS the marker alongside real text is shown as-is, raw.
+pub const ACK_MARKER: &str = "<chibi>ACK</chibi>";
 
 /// Heuristic: does this error message indicate a broken transport (backend
 /// process died, pipe broke, cancel impossible) rather than a per-request
@@ -1176,7 +1185,20 @@ impl App {
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
                     let chat = &mut self.chats[chat_index];
-                    resolve_live_placeholder(chat, markdown, model);
+                    if is_invisible_result(&markdown) {
+                        // fix_ack_silent_absorb: an empty or pure-ACK answer is
+                        // a protocol-level acknowledgement, not a user-facing
+                        // reply — absorb it invisibly. The pending placeholder
+                        // is dropped (no empty bubble), the lifecycle resolves
+                        // to Idle so the active-chat spinner stops cleanly and
+                        // re-arms on the next prompt, and NO error/toast fires.
+                        // The per-thread queue drain is unaffected: the live
+                        // glue emits QueueDrain after every terminal event
+                        // regardless of content, so queued prompts still send.
+                        drop_live_pending_placeholder(chat);
+                    } else {
+                        resolve_live_placeholder(chat, markdown, model);
+                    }
                     chat.lifecycle = ChatLifecycle::Idle;
                     self.scroll = 0;
                 }
@@ -1339,6 +1361,39 @@ fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<Str
         row.pending = false;
         row.markdown = markdown;
         row.model = model;
+    }
+}
+/// fix_ack_silent_absorb: is this answer content invisible-by-contract?
+///
+/// True when the content is empty/whitespace-only, or consists ONLY of the
+/// [`ACK_MARKER`] — exact, repeated, or embedded in whitespace. Content that
+/// contains the marker PLUS any other text is a real (if odd) answer and is
+/// shown raw: marker cleanup is the backend's job, not the TUI's.
+pub fn is_invisible_result(markdown: &str) -> bool {
+    let mut rest = markdown.trim();
+    loop {
+        if rest.is_empty() {
+            return true;
+        }
+        match rest.strip_prefix(ACK_MARKER) {
+            Some(after) => rest = after.trim_start(),
+            None => return false,
+        }
+    }
+}
+
+/// Remove the live pending placeholder row WITHOUT leaving an answer behind
+/// (fix_ack_silent_absorb). Targets the same row [`resolve_live_placeholder`]
+/// would — the last pending, non-queued placeholder — but drops it so an
+/// absorbed (blank / pure-ACK) result leaves no bubble at all. A no-op when
+/// no live placeholder exists (stray result).
+fn drop_live_pending_placeholder(chat: &mut Chat) {
+    if let Some(row) = chat
+        .messages
+        .iter_mut()
+        .rposition(|m| m.pending && !is_queued_marker(m))
+    {
+        chat.messages.remove(row);
     }
 }
 
@@ -1861,6 +1916,169 @@ mod tests {
         assert!(!msgs[1].pending);
         assert_eq!(msgs[1].markdown, "**done**");
         assert_eq!(msgs[1].model_label(), None);
+    }
+
+    // ---- fix_ack_silent_absorb: invisible ACK / blank answers --------------
+
+    /// [`finish_chat_with_model`] with arbitrary answer content.
+    fn finish_chat_with_content(app: &mut App, index: usize, markdown: &str) {
+        let request_id = app.chats[index].lifecycle.request_id().unwrap().to_owned();
+        let thread_id = app.chats[index].id.clone();
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&request_id),
+            markdown: markdown.to_owned(),
+            thread_id,
+            model: None,
+        });
+    }
+
+    /// Predicate contract: whitespace-only and pure-marker contents are
+    /// invisible; anything that also contains other text — even alongside
+    /// the marker — is a real answer.
+    #[test]
+    fn invisible_result_predicate_matches_blank_and_pure_ack_only() {
+        for blank in ["", "   ", " \n\t "] {
+            assert!(is_invisible_result(blank), "blank {blank:?} must absorb");
+        }
+        let doubled = format!("{ACK_MARKER}{ACK_MARKER}");
+        let spaced = format!(" {ACK_MARKER}  {ACK_MARKER} ");
+        for ack in [
+            ACK_MARKER,
+            "  <chibi>ACK</chibi>  ",
+            "\n<chibi>ACK</chibi>\n",
+            doubled.as_str(),
+            spaced.as_str(),
+        ] {
+            assert!(is_invisible_result(ack), "pure ack {ack:?} must absorb");
+        }
+        for mixed in [
+            "real answer",
+            &format!("{ACK_MARKER} partial text"),
+            &format!("text {ACK_MARKER}"),
+            &format!("{ACK_MARKER}ish"), // marker must match whole segments only
+        ] {
+            assert!(!is_invisible_result(mixed), "mixed {mixed:?} must show");
+        }
+    }
+
+    /// A blank result leaves NO assistant bubble: the pending placeholder is
+    /// dropped, the lifecycle resolves to Idle (spinner stops cleanly and
+    /// re-arms on the next prompt), and no error popup/toast fires.
+    #[test]
+    fn blank_result_is_absorbed_without_bubble() {
+        for content in ["", "   \n\t "] {
+            let mut app = app_with_chats(1);
+            submit_text(&mut app, "question");
+            assert_eq!(app.chats[0].messages.len(), 2, "user + pending");
+
+            finish_chat_with_content(&mut app, 0, content);
+
+            let msgs = &app.chats[0].messages;
+            assert_eq!(msgs.len(), 1, "placeholder dropped, no bubble");
+            assert_eq!(msgs[0].role, Role::User);
+            assert!(msgs.iter().all(|m| !m.pending), "no stuck spinner row");
+            assert_eq!(app.active_lifecycle(), &ChatLifecycle::Idle);
+            assert!(app.error_popup.is_none(), "blank result is not an error");
+        }
+    }
+
+    /// A pure-ACK answer (exact marker, whitespace-wrapped, repeated) behaves
+    /// exactly like a blank one: absorbed invisibly, clean Idle, no error.
+    #[test]
+    fn pure_ack_result_is_absorbed_without_bubble() {
+        let wrapped = format!("  {ACK_MARKER}\n");
+        let doubled = format!("{ACK_MARKER}{ACK_MARKER}");
+        let spaced = format!(" {ACK_MARKER}  {ACK_MARKER} ");
+        for content in [
+            ACK_MARKER,
+            wrapped.as_str(),
+            doubled.as_str(),
+            spaced.as_str(),
+        ] {
+            let mut app = app_with_chats(1);
+            submit_text(&mut app, "question");
+            finish_chat_with_content(&mut app, 0, content);
+
+            let msgs = &app.chats[0].messages;
+            assert_eq!(msgs.len(), 1, "pure ACK {content:?} leaves no bubble");
+            assert!(msgs.iter().all(|m| !m.pending));
+            assert_eq!(app.active_lifecycle(), &ChatLifecycle::Idle);
+            assert!(app.error_popup.is_none());
+        }
+    }
+
+    /// Content that CONTAINS the marker but also real text is a real answer:
+    /// shown as-is, raw — the TUI does not clean up partial markers (that is
+    /// the backend's job).
+    #[test]
+    fn mixed_marker_content_is_shown_raw() {
+        for content in [
+            format!("before {ACK_MARKER} after"),
+            format!("{ACK_MARKER} partial text"),
+            format!("{ACK_MARKER}ish"),
+        ] {
+            let mut app = app_with_chats(1);
+            submit_text(&mut app, "question");
+            finish_chat_with_content(&mut app, 0, &content);
+
+            let msgs = &app.chats[0].messages;
+            assert_eq!(msgs.len(), 2, "mixed content renders a bubble");
+            assert!(!msgs[1].pending);
+            assert_eq!(msgs[1].markdown, content, "shown raw, unmodified");
+            assert_eq!(app.active_lifecycle(), &ChatLifecycle::Idle);
+        }
+    }
+
+    /// Queue interplay: absorbing an ACK result must still hand the FIFO to
+    /// the drain step — the next queued prompt sends (mirrors the event-loop
+    /// glue: terminal Result → QueueDrain → dequeue_next_for).
+    #[test]
+    fn absorbed_result_still_drains_queued_prompt() {
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "one");
+        type_in(&mut app, "two");
+        assert!(app.take_input().is_none(), "busy chat enqueues");
+
+        finish_chat_with_content(&mut app, 0, ACK_MARKER);
+
+        assert_eq!(app.active_lifecycle(), &ChatLifecycle::Idle);
+        assert_eq!(app.active_queue_len(), 1);
+
+        // The drain step owned by the event loop after QueueDrain.
+        let thread = app.chats[0].id.clone();
+        let next = app
+            .dequeue_next_for(&thread)
+            .expect("queued prompt must send after ACK absorb");
+        assert_eq!(next.prompt, "two");
+        assert!(matches!(
+            app.chats[0].lifecycle,
+            ChatLifecycle::Awaiting { .. }
+        ));
+
+        // Shape after the swap: [user(one), user(two), pending(live)] — the
+        // absorbed round added no bubble and the queued marker became the
+        // live placeholder.
+        let msgs = &app.chats[0].messages;
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[2].pending && !is_queued_marker(&msgs[2]));
+    }
+
+    /// A background chat's absorbed result stays invisible there too and
+    /// must not disturb the ACTIVE chat's state or view.
+    #[test]
+    fn absorbed_result_in_background_chat_is_invisible() {
+        let mut app = app_with_chats(2);
+        app.select_next(); // active = chat 1 (the "background" one)
+        submit_text(&mut app, "background question");
+        app.select_prev(); // foreground chat 0 stays empty
+
+        finish_chat_with_content(&mut app, 1, ACK_MARKER);
+
+        assert_eq!(app.chats[1].messages.len(), 1, "no bubble in bg chat");
+        assert!(app.chats[1].messages.iter().all(|m| !m.pending));
+        assert_eq!(app.chats[1].lifecycle, ChatLifecycle::Idle);
+        assert!(app.chats[0].messages.is_empty(), "foreground untouched");
+        assert!(app.error_popup.is_none());
     }
 
     #[test]
