@@ -591,6 +591,32 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         return;
     }
 
+    // ---- feat_stderr_log_modal: diagnostics log viewer modal ----
+    //
+    // While the ^G log viewer is open, ONLY viewer keys work: PgUp/PgDn (and
+    // ↑/↓) scroll — PgUp/↑ detach from the live tail, PgDn/↓ return towards
+    // it (reaching the bottom re-arms live-tail) —, Esc closes, Ctrl+C quits
+    // (same class as the other popups). Everything else — typing, global
+    // chords (^N/^R/^D/^T/^L/^F), thread switching — is swallowed so no
+    // keystroke leaks into the textarea and no global binding fires. There
+    // is no Enter action: the viewer is strictly read-only, so Enter is
+    // swallowed and the loop's submit gates need no extra snapshot flag.
+    if matches!(app.mode, Mode::LogViewer { .. }) {
+        match key.code {
+            KeyCode::PageUp => app.log_scroll_up(app.log_visible_rows),
+            KeyCode::PageDown => app.log_scroll_down(app.log_visible_rows),
+            // One-line flavor of the same scroll (plain arrows are nav here).
+            KeyCode::Up => app.log_scroll_up(1),
+            KeyCode::Down => app.log_scroll_down(1),
+            KeyCode::Esc => {
+                app.close_log_viewer();
+            }
+            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            _ => {}
+        }
+        return;
+    }
+
     // ---- feat_thread_delete: modal confirm popup captures everything ----
     //
     // While the Ctrl+D confirmation is open, ONLY the destructive decision
@@ -774,8 +800,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     //   semantics (parity by contract with the chord match below): ^T
     //   toggles back to Chat, ^F / ^⇧F open the search popups (each close
     //   resets focus to Chat via App), ^N creates a chat (App lands focus
-    //   on Chat), ^D opens the guarded confirm popup, ^L clears input +
-    //   screen. ^C quit/cancel is serviced even earlier (global section).
+    //   on Chat), ^D opens the guarded confirm popup, ^G opens the
+    //   diagnostics log viewer, ^L clears input + screen. ^C quit/cancel
+    //   is serviced even earlier (global section).
     //   ^R rename also never reaches this branch: its entry guard sits
     //   above, so renaming from a Sidebar-focused UI works and closing the
     //   session returns focus to Chat (App::commit/cancel_rename).
@@ -787,6 +814,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('t') if ctrl => app.toggle_focus(),
             KeyCode::Char('n') if ctrl => app.new_chat(),
             KeyCode::Char('d') if ctrl => app.begin_delete_confirm(),
+            // feat_stderr_log_modal: read-only viewer = service chord; same
+            // Normal-mode ^G semantics under sidebar focus (parity contract).
+            KeyCode::Char('g') if ctrl => app.begin_log_viewer(),
             KeyCode::Char('l') if ctrl => {
                 // Same pair as the global ^L arm below (clear + wipe intent).
                 app.clear_input();
@@ -849,6 +879,23 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // App::begin_delete_confirm — the popup never opens there.
         (KeyCode::Char('d'), true) => {
             app.begin_delete_confirm();
+            return;
+        }
+        // Ctrl+G: open the diagnostics log viewer (feat_stderr_log_modal).
+        //
+        // Chord verification (feat task discipline, see the executor report
+        // for the full audit): the first-choice ^Y candidate was REJECTED —
+        // tui-textarea 0.7 maps Ctrl+Y to paste-from-internal-yank (src/
+        // textarea.rs:589), and the yank buffer IS populated in this app:
+        // our own ^U override calls delete_line_by_head() → delete_piece()
+        // which stores the killed text (textarea.rs:1022), so ^U→^Y (kill
+        // line, paste it back) is live behavior today. Taking ^Y would break
+        // that readline kill/yank family (^U/^K/^W/^Y). ^G is verified FREE:
+        // no app binding anywhere in src/, no tui-textarea 0.7 mapping, no
+        // macOS system hijack, no flow-control semantics, and its readline
+        // meaning (abort) has no function in this TUI. Mnemonic: loG.
+        (KeyCode::Char('g'), true) => {
+            app.begin_log_viewer();
             return;
         }
         // Ctrl+Shift+F: GLOBAL search across ALL threads
@@ -2747,5 +2794,185 @@ mod tests {
         assert_eq!(app.chats[1].messages.len(), 1, "no message appended");
         assert!(app.active_request_id().is_none());
         assert_eq!(app.active_queue_len(), 0);
+    }
+
+    // ---- feat_stderr_log_modal: ^G log viewer ------------------------------
+
+    #[test]
+    fn ctrl_g_opens_log_viewer_from_normal_mode() {
+        let marker = format!(
+            "routing-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        chibi_tui::diag::append(&marker);
+        let mut app = app_with_chats(1);
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        assert!(matches!(app.mode, chibi_tui::app::Mode::LogViewer { .. }));
+        let state = match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state,
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+        assert_eq!(state.scroll, 0, "opens live-tailing");
+        assert!(
+            state.lines.contains(&marker),
+            "the modal snapshot carries the buffered marker"
+        );
+    }
+
+    /// Chord-freedom regression: ^G is consumed as the hotkey — it must not
+    /// insert anything into the prompt textarea.
+    #[test]
+    fn ctrl_g_in_normal_mode_never_touches_input_buffer() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        app.close_log_viewer();
+        assert!(app.input.lines().iter().all(|l| l.is_empty()));
+    }
+
+    #[test]
+    fn ctrl_g_opens_log_viewer_from_sidebar_focus_too() {
+        let mut app = app_with_chats(2);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        assert!(matches!(app.mode, chibi_tui::app::Mode::LogViewer { .. }));
+        // Closing returns to the editor pane (modal close semantics).
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat);
+        assert!(app.mode.is_normal());
+    }
+
+    #[test]
+    fn log_viewer_pgup_pgdn_and_arrows_scroll() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(app.log_visible_rows, 20, "page = one modal page");
+        let scroll = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.scroll,
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+        assert_eq!(scroll(&app), 20, "PgUp detaches by one page");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(scroll(&app), 21, "↑ scrolls one row");
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(scroll(&app), 1);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(scroll(&app), 0, "back at the live tail");
+    }
+
+    #[test]
+    fn log_viewer_esc_closes_and_keeps_state_intact() {
+        let mut app = app_with_chats(2);
+        app.scroll_up(7);
+        let scroll_before = app.scroll;
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.mode.is_normal(), "Esc closes the viewer");
+        assert_eq!(app.scroll, scroll_before, "chat view untouched");
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat);
+    }
+
+    /// Modal isolation: while the log viewer is open, typing and every
+    /// global binding is swallowed — nothing reaches the textarea, nothing
+    /// fires, and the popup stays open.
+    #[test]
+    fn log_viewer_swallows_typing_and_global_chords() {
+        let mut app = app_with_chats(3);
+        type_in(&mut app, "draft");
+        app.scroll_up(30);
+        let scroll_before = app.scroll;
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let state_scroll = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.scroll,
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+
+        // Typing must not reach the textarea and must not scroll (letters
+        // avoid the popup's own keys — though none exist beyond nav/Esc).
+        type_in(&mut app, "xyz");
+        assert_eq!(state_scroll(&app), 0);
+        // Global chords suspended: nav, new chat, rename entry, wipe,
+        // delete, searches, focus toggle.
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        // Left/Right are not nav here: swallowed too.
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::LogViewer { .. }),
+            "popup must stay open"
+        );
+        assert_eq!(app.chats.len(), 3, "Ctrl+N must not fire");
+        assert_eq!(app.scroll, scroll_before, "PgUp-style chat scroll blocked");
+        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.input.lines().join(""),
+            "draft",
+            "typing must not leak into (nor disturb) the prompt textarea"
+        );
+        assert_eq!(
+            state_scroll(&app),
+            0,
+            "swallowed keys must not move the read position"
+        );
+    }
+
+    /// Ctrl+C keeps its popup-class meaning: quit from the log viewer.
+    #[test]
+    fn log_viewer_ctrl_c_quits() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert_eq!(app.chats.len(), 1, "quit must not mutate chats");
+    }
+
+    /// Other modals own ^G: the confirm popup swallows it; the search
+    /// popups swallow the Ctrl flavor (plain chars feed the query); the
+    /// rename editor consumes any Char into its draft (documented branch
+    /// behavior, same as Ctrl+N pushing 'n' there).
+    #[test]
+    fn ctrl_g_swallowed_by_other_modals() {
+        // Delete-confirm popup: swallowed, popup stays.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+
+        // In-thread search popup: swallowed, query untouched.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        assert_eq!(app.search_query(), Some(""));
+
+        // Rename session: 'g' lands in the draft (any-Char branch).
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Renaming { .. }));
+        assert_eq!(app.rename_buf(), Some("chat-0g"));
     }
 }

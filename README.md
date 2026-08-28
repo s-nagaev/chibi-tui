@@ -95,6 +95,7 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+D` | Delete the current thread (`Enter`/`y` confirm · `Esc`/`n` cancel; refused while the thread is busy) |
 | `Ctrl+F` | Find in the current thread (type to filter, `↑`/`↓` navigate matches, `Enter` jump to match, `Esc` close) |
 | `Ctrl+Shift+F` | Find in ALL threads (global search; same popup family with thread-title labels and total counts; `Enter` switches to the match's thread and jumps; requires the kitty keyboard protocol) |
+| `Ctrl+G` | Open the diagnostics log viewer (backend stderr + TUI lifecycle events; `PgUp`/`PgDn` or `↑`/`↓` scroll, `Esc` close — see the Diagnostics section) |
 | `Enter` | Send message (or queue it while this chat is busy) |
 | `⇧↵` / `⌥↵` | Insert a newline into the input (multi-line prompts) |
 | `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
@@ -262,6 +263,33 @@ degrades to plain `Ctrl+F` (in-thread search).
 If the backend fails to connect or drops mid-session, a modal error popup
 appears instead of crashing; `R` retries, `Esc` dismisses, `q` or `Ctrl+C` quits.
 
+### Diagnostics log
+
+chibi-tui keeps the last **512 lines** of diagnostics in memory and shows them
+in a modal viewer opened with **`Ctrl+G`** (also works while the Sidebar pane
+holds focus):
+
+- **What lands in the log** — everything the backend prints to its **stderr**
+  (lines appended verbatim; timestamps come from the backend itself), plus
+  TUI-side lifecycle events stamped with a `[tui]` prefix in the same stream:
+  backend spawn, handshake ok/fail, reconnect, pipe closed. One unified
+  diagnostic stream.
+- **Reading it** — the viewer opens live-tailing at the bottom; new lines
+  stream in while you sit there. `PgUp`/`PgDn` (or `↑`/`↓`) scroll; scrolling
+  up freezes the view and a `+K new lines` footer counts what arrived while
+  you were detached — page back down to re-arm the tail. `Esc` closes. When
+  unseen lines arrived while the viewer was closed, a dim `log*` token shows
+  on the status line.
+- **File sink (opt-in)** — set `CHIBI_TUI_LOG=/path/to/file.log` before
+  starting and every line that lands in the ring buffer is mirrored to that
+  file (append mode; parent directories are created). Unset (the default)
+  means memory only. A file that cannot be opened/created is silently
+  ignored — diagnostics never break the app.
+- **Honest limitation** — only the backend's **stderr** reaches the buffer.
+  The backend's loguru logging currently writes to its **stdout** (the
+  protocol channel), so backend log lines do not appear here; the
+  backend-side log sink fix is a separate backend task.
+
 ## Configuration & Data
 
 Chat history is stored locally under the platform data directory:
@@ -275,6 +303,10 @@ Chat history is stored locally under the platform data directory:
 Each chat is saved as `<chat-id>.json` and restored on startup. Corrupt files
 are skipped rather than blocking startup. Override with `CHIBI_TUI_HOME` or
 `--history-dir`.
+
+Diagnostics file sink: set `CHIBI_TUI_LOG` to a path to mirror the in-memory
+diagnostic stream (backend stderr + `[tui]` lifecycle events, see the
+Diagnostics section) to a file. Unset by default.
 
 No other configuration files, no network access beyond what the spawned
 backend performs.

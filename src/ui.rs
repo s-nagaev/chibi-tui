@@ -72,13 +72,15 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     render_spinner_line(f, app, theme, root[1]);
     match &app.mode {
         Mode::Renaming { .. } => render_rename_line(f, app, theme, chat_column),
-        // feat_thread_delete / feat_search_thread / feat_search_all_threads:
-        // while the confirm or a search popup is open the underlying editor
-        // keeps rendering as the normal input row (the popup overlays it and
-        // captures all keys).
-        Mode::Normal | Mode::ConfirmDelete | Mode::Searching { .. } | Mode::SearchingAll { .. } => {
-            render_input(f, app, theme, chat_column)
-        }
+        // feat_thread_delete / feat_search_thread / feat_search_all_threads
+        // / feat_stderr_log_modal: while the confirm, a search or the log
+        // viewer popup is open the underlying editor keeps rendering as the
+        // normal input row (the popup overlays it and captures all keys).
+        Mode::Normal
+        | Mode::ConfirmDelete
+        | Mode::Searching { .. }
+        | Mode::SearchingAll { .. }
+        | Mode::LogViewer { .. } => render_input(f, app, theme, chat_column),
     }
     render_status(f, app, theme, root[3]);
 
@@ -97,6 +99,10 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // feat_search_all_threads: all-threads search popup (rendered last).
     if matches!(app.mode, Mode::SearchingAll { .. }) {
         render_search_all_popup(f, app, theme);
+    }
+    // feat_stderr_log_modal: diagnostics log viewer (rendered last).
+    if matches!(app.mode, Mode::LogViewer { .. }) {
+        render_log_viewer(f, app, theme);
     }
 }
 
@@ -631,20 +637,127 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Span::styled(status_label, Style::new().fg(status_color)),
         ]
     } else {
-        vec![
-            Span::styled(
-                "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D del \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T panel",
-                Style::new().fg(theme.selection),
-            ),
-            Span::raw("  "),
-            Span::styled(status_label, Style::new().fg(status_color)),
-        ]
+        let mut spans = vec![Span::styled(
+            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D del \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T panel",
+            Style::new().fg(theme.selection),
+        )];
+        // feat_stderr_log_modal: subtle dim `log*` token when unseen
+        // diagnostic lines arrived since the last viewer visit (consumer-side
+        // watermark over the monotonic producer total — race-free). Placement
+        // check (documented in the task report): hints (87 cols) + ` · log*`
+        // (7) + separator (2) + the longest status label
+        // `● disconnected (press R)` (24) = 120 ≤ 120 — it FITS the status
+        // line, so the chat-header fallback was not needed. Hidden while a
+        // modal is open (transient states) and under toasts.
+        if app.mode.is_normal() && crate::diag::total_appended() > app.log_seen_total {
+            spans.push(Span::styled(" \u{00b7} log*", Style::new().fg(theme.dim)));
+        }
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(status_label, Style::new().fg(status_color)));
+        spans
     };
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::new().bg(theme.panel)),
         area,
     );
+}
+
+/// feat_stderr_log_modal: the diagnostics-log viewer modal — a large
+/// centered monospace view over a SNAPSHOT copy of the diag ring buffer
+/// (`App::begin_log_viewer` / `log_scroll_*` own the state, `main.rs` owns
+/// the keys). Live-tail at the bottom: parked at scroll 0 the snapshot
+/// refreshes every frame so new lines stream in; scrolled up, the snapshot
+/// freezes and a `+K new lines` footer counts arrivals instead. Long lines
+/// are right-truncated (no wrap) so one buffer line is always exactly one
+/// row — read-position math stays exact. `[tui]` lifecycle events render
+/// dimmed to visually separate them from verbatim backend stderr.
+fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
+    use ratatui::widgets::{Clear, Padding};
+
+    // Live-tail: while parked at the bottom, refresh the snapshot every
+    // frame (atomic snapshot + baseline, see `diag::view`).
+    if let Mode::LogViewer { state } = &mut app.mode {
+        if state.scroll == 0 {
+            let (lines, total) = crate::diag::view();
+            state.lines = lines;
+            state.snapshot_total = total;
+        }
+    }
+    let (lines, scroll, snapshot_total) = match &app.mode {
+        Mode::LogViewer { state } => (state.lines.clone(), state.scroll, state.snapshot_total),
+        _ => return,
+    };
+    let new_since = crate::diag::total_appended().saturating_sub(snapshot_total);
+
+    // ~3/4 of the frame, sane caps so tiny terminals never panic.
+    let max_h = f.area().height.saturating_sub(2).max(3);
+    let width = f.area().width.saturating_sub(4).clamp(20, 110);
+    let height = (f.area().height * 3 / 4).clamp(3, max_h);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.blue))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            " Diagnostics log ",
+            Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Content above, one permanent footer row below (the hint never clips).
+    let panes = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let content = panes[0];
+    let footer = panes[1];
+
+    // Page size seam for PgUp/PgDn (same pattern as chat_visible_rows).
+    app.log_visible_rows = content.height.max(1);
+
+    if content.height > 0 {
+        let visible = content.height as usize;
+        // Bottom-anchored scroll: `scroll` counts rows up from the bottom.
+        let max_scroll = lines.len().saturating_sub(visible);
+        let scrolled = (scroll as usize).min(max_scroll);
+        let skip = (max_scroll - scrolled) as u16;
+
+        let rows: Vec<Line<'static>> = lines
+            .iter()
+            .map(|l| {
+                if l.starts_with(crate::diag::TUI_EVENT_PREFIX) {
+                    Line::from(Span::styled(l.clone(), Style::new().fg(theme.dim)))
+                } else {
+                    Line::from(Span::styled(l.clone(), Style::new().fg(theme.fg)))
+                }
+            })
+            .collect();
+        let paragraph = Paragraph::new(Text::from(rows)).scroll((skip, 0));
+        f.render_widget(paragraph, content);
+    }
+
+    if footer.height > 0 {
+        let mut hint = "Esc close \u{00b7} PgUp/PgDn scroll".to_owned();
+        if new_since > 0 && scroll > 0 {
+            hint.push_str(&format!(" \u{00b7} +{new_since} new lines"));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::new().fg(theme.yellow),
+            ))),
+            footer,
+        );
+    }
 }
 
 /// Centered modal error popup over a dimmed backdrop. Purely visual — all
@@ -3469,6 +3582,148 @@ mod tests {
         assert!(
             lines_with_label >= 2,
             "both assistant headers must render: {flat}"
+        );
+    }
+
+    // ---- feat_stderr_log_modal: log viewer + status marker -----------------
+
+    fn unique_marker(tag: &str) -> String {
+        format!(
+            "ui-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    /// The `log*` unseen-lines marker appears on the status line (dim token
+    /// after the hints) when the viewer is closed and unseen lines exist —
+    /// and the whole row still fits the 120-col discipline with the LONGEST
+    /// status label (`● disconnected (press R)`).
+    #[test]
+    fn log_marker_shows_on_status_line_and_fits_120_cols() {
+        let marker = unique_marker("unseen");
+        crate::diag::append(&marker);
+
+        let mut app = App::new(mock::initial_chats()); // popup-free state
+        app.connection = crate::app::Connection::Disconnected;
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 34);
+        let status_row = rows.last().expect("status row exists");
+
+        assert!(
+            status_row.contains("log*"),
+            "unseen marker must show: {status_row:?}"
+        );
+        let width: usize = UnicodeWidthStr::width(status_row.as_str());
+        assert!(
+            width <= 120,
+            "status row must fit 120 cols with the marker + longest label, got {width}: {status_row:?}"
+        );
+    }
+
+    /// The marker hides while the log viewer modal is open (the user is
+    /// looking at the stream) — mode-gated, so no global-state racing.
+    #[test]
+    fn log_marker_hidden_while_viewer_modal_is_open() {
+        let mut app = App::new(mock::initial_chats());
+        app.begin_log_viewer();
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 34);
+        let status_row = rows.last().expect("status row exists");
+        assert!(
+            !status_row.contains("log*"),
+            "marker must hide while the viewer is open: {status_row:?}"
+        );
+    }
+
+    /// The viewer modal renders buffered lines (mono view) with the closing
+    /// hint; live-tail shows the newest content.
+    #[test]
+    fn log_viewer_modal_renders_lines_and_hint() {
+        let marker = unique_marker("modal");
+        crate::diag::append(&marker);
+
+        let mut app = App::new(mock::initial_chats());
+        app.begin_log_viewer();
+        let flat = render_grid(&mut app).join("\n");
+
+        assert!(flat.contains("Diagnostics log"), "title: {flat}");
+        assert!(
+            flat.contains(&marker),
+            "buffered line visible in the modal: {flat}"
+        );
+        assert!(
+            flat.contains("Esc close") && flat.contains("PgUp/PgDn scroll"),
+            "footer hint visible: {flat}"
+        );
+        // At the bottom: no "+K new lines" (nothing arrived since the open).
+        assert!(
+            !flat.contains("new lines"),
+            "no +K hint at the live tail: {flat}"
+        );
+    }
+
+    /// Scrolled up with arrivals pending: the frozen view keeps its position
+    /// and the footer counts the new lines (`+K new lines`).
+    #[test]
+    fn log_viewer_modal_shows_plus_k_hint_when_detached() {
+        let mut app = App::new(mock::initial_chats());
+        app.begin_log_viewer();
+        app.log_scroll_up(3);
+
+        let marker = unique_marker("arrived");
+        crate::diag::append(&marker);
+
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.contains("new lines"),
+            "+K footer must show while detached with arrivals: {flat}"
+        );
+        assert!(
+            !flat.contains(&marker),
+            "frozen snapshot must NOT show lines that arrived while detached: {flat}"
+        );
+
+        // Re-arming the tail (back to the bottom) refreshes the snapshot and
+        // clears the hint.
+        app.log_scroll_down(3);
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.contains(&marker),
+            "live-tail shows the arrival: {flat}"
+        );
+        assert!(
+            !flat.contains("new lines"),
+            "hint clears at the bottom: {flat}"
+        );
+    }
+
+    /// `[tui]` lifecycle events render (so the unified stream is visible);
+    /// long stderr lines are right-truncated instead of wrapping (row math):
+    /// the line HEAD is visible, the tail is cut, and the content never
+    /// spills onto a second row.
+    #[test]
+    fn log_viewer_renders_tui_events_and_truncates_long_lines() {
+        crate::diag::append_tui("spawn `chibi` (pid 4242)");
+        let long = format!("LONGHEAD-{}", "x".repeat(300));
+        crate::diag::append(&long);
+
+        let mut app = App::new(mock::initial_chats());
+        app.begin_log_viewer();
+        let flat = render_grid(&mut app).join("\n");
+
+        assert!(
+            flat.contains("[tui] spawn `chibi` (pid 4242)"),
+            "[tui] event visible: {flat}"
+        );
+        assert!(
+            flat.contains("LONGHEAD-"),
+            "long line reaches the modal: {flat}"
+        );
+        // No wrap: the 300-x tail must NOT reappear on any row (truncated).
+        assert!(
+            !flat.contains(&"x".repeat(150)),
+            "long line must be truncated, never wrapped: {flat}"
         );
     }
 }

@@ -26,6 +26,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time;
 
+use crate::diag;
 use crate::protocol::{
     ClientInfo, ClientMessage, ErrorCode, ProtocolVersion, ServerInfo, ServerMessage,
 };
@@ -180,17 +181,18 @@ impl BackendClient {
             source: std::io::Error::other("child stdout not captured"),
         })?;
 
-        // Drain stderr in the background; content discarded for now (logging
-        // hooks arrive with real backend integration). Prevents deadlocks on
-        // a full stderr pipe.
+        // feat_stderr_log_modal: pump stderr into the diagnostics ring buffer
+        // (verbatim lines + optional CHIBI_TUI_LOG file mirror) instead of
+        // discarding it. Still a fire-and-forget background task: a chatty
+        // backend can never deadlock on a full stderr pipe, and the append
+        // only holds the diag mutex for the instant of one push.
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut stderr = stderr;
-                let mut sink = Vec::new();
-                let _ = stderr.read_to_end(&mut sink).await;
-            });
+            tokio::spawn(capture_stderr(stderr));
         }
+        diag::append_tui(format!(
+            "spawn `{program_display}` (pid {})",
+            child.id().unwrap_or(0)
+        ));
 
         Ok(Self {
             workspace_root,
@@ -229,7 +231,27 @@ impl BackendClient {
     /// - premature exit: non-zero status → [`BackendError::UnexpectedExit`],
     ///   zero status → [`BackendError::Handshake`];
     /// - any other frame kind → [`BackendError::Handshake`].
+    ///
+    /// feat_stderr_log_modal: the outcome is stamped into the diagnostics
+    /// stream as a `[tui] handshake ok/failed` lifecycle event.
     pub async fn handshake(&mut self) -> Result<Ready, BackendError> {
+        let result = self.handshake_inner().await;
+        match &result {
+            Ok(ready) => {
+                let server = ready
+                    .server
+                    .as_ref()
+                    .map(|s| format!(" (server {} {})", s.name, s.version))
+                    .unwrap_or_default();
+                diag::append_tui(format!("handshake ok (protocol v1){server}"));
+            }
+            Err(e) => diag::append_tui(format!("handshake failed: {e}")),
+        }
+        result
+    }
+
+    /// The handshake proper (logging wrapper above).
+    async fn handshake_inner(&mut self) -> Result<Ready, BackendError> {
         let initialize = ClientMessage::Initialize {
             protocol_version: ProtocolVersion::CURRENT,
             client: Some(ClientInfo {
@@ -413,6 +435,66 @@ pub(crate) async fn spawn_argv(
     argv: Vec<std::ffi::OsString>,
 ) -> Result<BackendClient, BackendError> {
     BackendClient::spawn_command(workspace_root, &argv).await
+}
+
+// ---------------------------------------------------------------------------
+// feat_stderr_log_modal: stderr → diagnostics ring buffer
+// ---------------------------------------------------------------------------
+
+/// Pump the backend's stderr into the diagnostics log, line by line.
+///
+/// Reads run in fixed-size chunks (stderr lines may be partial/chunky —
+/// a single `read` never corresponds to a line). Complete lines are appended
+/// verbatim as they complete; a trailing partial line with no newline is
+/// flushed as one final line at EOF. The task never fails and never touches
+/// the protocol path: it holds the diag mutex only for the instant of one
+/// push, so it can never block the event loop or request handling.
+async fn capture_stderr<R>(mut stderr: R)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&chunk[..n]);
+                for line in drain_complete_lines(&mut pending) {
+                    diag::append(line);
+                }
+            }
+        }
+    }
+    // EOF: a partial line without its newline is still a line (flush as the
+    // final entry, matching AsyncBufReadExt::read_line semantics).
+    if !pending.is_empty() {
+        diag::append(clean_line(&pending));
+    }
+}
+
+/// Split and remove all complete (`\n`-terminated) lines out of `pending`,
+/// returning them newline-stripped. Incomplete trailing bytes stay buffered
+/// for the next chunk. Pure (sync) so the splitting rules are unit-testable
+/// without a pipe.
+fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = pending.drain(..=pos).collect();
+        lines.push(clean_line(&line));
+    }
+    lines
+}
+
+/// Decode one raw line: lossy UTF-8 (a broken byte must not kill the stream),
+/// trailing `\n` and `\r` stripped (CRLF piping noise). Empty lines stay
+/// verbatim — the buffer is a faithful mirror of what the backend printed.
+fn clean_line(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_owned()
 }
 
 /// Ownership of the still-running child process after
@@ -662,6 +744,98 @@ while true; do sleep 1; done
         assert!(
             matches!(err, BackendError::UnexpectedExit { status } if status.0 == 3),
             "got: {err:?}"
+        );
+    }
+
+    // ---- feat_stderr_log_modal: stderr capture ------------------------------
+
+    // Pure splitting rules (no pipe needed).
+
+    #[test]
+    fn drain_complete_lines_splits_and_keeps_partial() {
+        let mut buf = b"one\ntwo\nthr".to_vec();
+        let lines = drain_complete_lines(&mut buf);
+        assert_eq!(lines, ["one".to_owned(), "two".to_owned()]);
+        assert_eq!(buf, b"thr", "partial line stays buffered");
+
+        // The remainder completes on the NEXT chunk (chunky reads):
+        buf.extend_from_slice(b"ee\nfour");
+        let lines = drain_complete_lines(&mut buf);
+        assert_eq!(lines, ["three".to_owned()]);
+        assert_eq!(buf, b"four");
+    }
+
+    #[test]
+    fn clean_line_strips_crlf_and_handles_empty_and_bad_utf8() {
+        assert_eq!(clean_line(b"abc\r\n"), "abc");
+        assert_eq!(clean_line(b"abc\n"), "abc");
+        assert_eq!(clean_line(b"abc"), "abc");
+        assert_eq!(clean_line(b"\r\n"), "", "empty lines stay verbatim");
+        assert_eq!(clean_line(&[0xff, b'a']), "\u{fffd}a", "lossy UTF-8");
+    }
+
+    /// End-to-end through a real spawned process: stderr lands in the diag
+    /// ring verbatim (complete line + EOF-flushed partial) and the `[tui]`
+    /// spawn lifecycle event is stamped. Assertions are CONTAINS-based — the
+    /// global buffer is process state shared with other concurrent tests.
+    #[tokio::test]
+    async fn stderr_lines_land_in_diag_ring_buffer() {
+        let marker = format!(
+            "diag-marker-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // The script writes to stderr, then BLOCKS on `read` so the child
+        // cannot die (and close the pipe) before its writes land.
+        let script =
+            format!("echo out-stdout; echo '{marker}' >&2; printf 'partial-tail' >&2; read line");
+        let mut client = BackendClient::spawn_script(&script).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // writes settle
+        client.kill().await; // stderr EOF → capture task flushes and exits
+                             // Give the background capture task a beat to drain and append.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let snap = diag::snapshot();
+        assert!(snap.contains(&marker), "stderr line captured verbatim");
+        assert!(
+            snap.iter().any(|l| l == "partial-tail"),
+            "trailing partial line flushed as a final line at EOF"
+        );
+        assert!(
+            snap.iter().any(|l| l.starts_with("[tui] spawn `/bin/sh`")),
+            "spawn lifecycle event stamped with the [tui] prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_outcome_lands_in_diag_stream() {
+        // Success path.
+        let script = r#"
+read line
+echo '{"type":"ready","protocol_version":1,"server":{"name":"chibi","version":"1.0.0"}}'
+"#;
+        let mut client = BackendClient::spawn_script(script).await.unwrap();
+        client.handshake().await.expect("handshake ok");
+        client.kill().await;
+        let snap = diag::snapshot();
+        assert!(
+            snap.iter()
+                .any(|l| l.starts_with("[tui] handshake ok (protocol v1)")),
+            "ok handshake stamped: {:?}",
+            snap.last()
+        );
+
+        // Failure path.
+        let mut client = BackendClient::spawn_script("read line; exit 7")
+            .await
+            .unwrap();
+        assert!(client.handshake().await.is_err());
+        let snap = diag::snapshot();
+        assert!(
+            snap.iter().any(|l| l.starts_with("[tui] handshake failed")),
+            "failed handshake stamped"
         );
     }
 }

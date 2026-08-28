@@ -98,6 +98,28 @@ pub struct GlobalSearchState {
     pub matches: Vec<GlobalSearchMatch>,
 }
 
+/// State of the open diagnostics-log viewer modal (feat_stderr_log_modal).
+///
+/// Read position management is deliberately simple, snapshot-copy based:
+/// the modal holds a COPY of the ring buffer taken at the last refresh, so
+/// the capture task can keep appending (and evicting) freely underneath.
+/// `scroll` counts rows scrolled UP from the bottom — `0` is live-tail mode,
+/// where the snapshot is refreshed every frame so new lines stream in; any
+/// offset > 0 detaches the view: the snapshot freezes and lines arriving
+/// after `snapshot_total` are only counted (the `+K new lines` footer), never
+/// rendered until the user pages back to the bottom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogViewerState {
+    /// Snapshot copy of the buffered lines (oldest → newest) at the last
+    /// refresh (open, live-tail frame, or return-to-bottom).
+    pub lines: Vec<String>,
+    /// Rows scrolled up from the bottom (0 = live-tail at the bottom).
+    pub scroll: u16,
+    /// [`crate::diag::total_appended()`] at snapshot time — the baseline the
+    /// `+K new lines` footer hint is computed against.
+    pub snapshot_total: u64,
+}
+
 /// Input mode of the whole app (feature: inline thread rename / search).
 ///
 /// Deliberately tiny and explicit so tests can drive transitions
@@ -133,6 +155,13 @@ pub enum Mode {
     /// (same selection mechanics as Ctrl+↑/↓ switching) and records a
     /// pending wrapped-row jump via [`App::pending_global_search_jump`].
     SearchingAll { state: GlobalSearchState },
+    /// The ^G diagnostics-log viewer modal is open (feat_stderr_log_modal):
+    /// a monospace view of the unified backend-stderr + `[tui]` lifecycle
+    /// ring buffer. Modal isolation like the search popups — PgUp/PgDn (and
+    /// ↑/↓) scroll, Esc closes, every other key is swallowed. Opening
+    /// resets the unseen-lines counter; live-tail at the bottom, frozen
+    /// snapshot with a `+K new lines` footer while scrolled up.
+    LogViewer { state: LogViewerState },
 }
 
 impl Mode {
@@ -278,6 +307,19 @@ pub struct App {
     /// active chat before jumping, so a chat that vanished mid-frame drops
     /// the jump silently instead of scrolling the wrong thread.
     pub pending_global_search_jump: Option<(usize, usize, usize, usize)>,
+    /// feat_stderr_log_modal: visible height (rows) of the log-viewer
+    /// modal's content area, set during `ui::render_log_viewer` so PgUp/PgDn
+    /// scroll exactly one page of modal rows. Defaults to 20 until first
+    /// render (same seam as [`App::chat_visible_rows`]).
+    pub log_visible_rows: u16,
+    /// feat_stderr_log_modal: the consumer-side "seen" watermark — the
+    /// [`crate::diag::DiagLog::total`] value at the moment the log stream
+    /// was last fully viewed (viewer opened / re-tailed / closed at the
+    /// bottom). The `log*` status marker fires while
+    /// `diag::total_appended() > log_seen_total` and the viewer is closed.
+    /// Tracking unseen state on the consumer side of a monotonic producer
+    /// total is race-free by construction — no counter resets to coordinate.
+    pub log_seen_total: u64,
 }
 
 const SPINNER: [&str; 10] = [
@@ -344,6 +386,8 @@ impl App {
             mode: Mode::Normal,
             pending_search_jump: None,
             pending_global_search_jump: None,
+            log_visible_rows: 20,
+            log_seen_total: 0,
         }
     }
 
@@ -428,12 +472,14 @@ impl App {
     pub fn rename_buf(&self) -> Option<&str> {
         match &self.mode {
             Mode::Renaming { buf } => Some(buf.as_str()),
-            // The delete-confirm popup and the search popups have no draft of
-            // their own (search queries live in their own state).
+            // The delete-confirm popup, the search popups and the log
+            // viewer have no draft of their own (search queries live in
+            // their own state).
             Mode::Normal
             | Mode::ConfirmDelete
             | Mode::Searching { .. }
-            | Mode::SearchingAll { .. } => None,
+            | Mode::SearchingAll { .. }
+            | Mode::LogViewer { .. } => None,
         }
     }
 
@@ -448,13 +494,14 @@ impl App {
     pub fn input_lines_height(&self) -> u16 {
         let buffer_lines = match &self.mode {
             Mode::Renaming { buf } => buf.split('\n').count(),
-            // The delete-confirm and search popups overlay the normal
-            // editor: their height derives from the message draft, exactly
-            // like Normal.
+            // The delete-confirm, search and log-viewer popups overlay the
+            // normal editor: their height derives from the message draft,
+            // exactly like Normal.
             Mode::Normal
             | Mode::ConfirmDelete
             | Mode::Searching { .. }
-            | Mode::SearchingAll { .. } => self.input.lines().len(),
+            | Mode::SearchingAll { .. }
+            | Mode::LogViewer { .. } => self.input.lines().len(),
         };
         buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
     }
@@ -469,12 +516,13 @@ impl App {
     pub fn commit_rename(&mut self) -> bool {
         let trimmed = match &self.mode {
             Mode::Renaming { buf } => buf.trim().to_owned(),
-            // Not renaming (Normal, the delete-confirm popup, or the search
-            // popups): no-op.
+            // Not renaming (Normal, any popup — delete-confirm, search, log
+            // viewer): no-op.
             Mode::Normal
             | Mode::ConfirmDelete
             | Mode::Searching { .. }
-            | Mode::SearchingAll { .. } => return false,
+            | Mode::SearchingAll { .. }
+            | Mode::LogViewer { .. } => return false,
         };
         self.mode = Mode::Normal;
         // feat_focus_panes: a closed modal returns keyboard ownership to
@@ -809,6 +857,76 @@ impl App {
             }
         }
         out
+    }
+
+    // ---- diagnostics log viewer (feat_stderr_log_modal) -------------------
+
+    /// Open the ^G diagnostics-log viewer modal with a snapshot of the ring
+    /// buffer, live-tailing at the bottom. Opening resets the unseen-lines
+    /// counter — everything buffered up to now becomes "seen"; lines that
+    /// arrive afterwards drive the `log*` status marker again. No-op when
+    /// another modal owns the keyboard (rename session, delete-confirm
+    /// popup, a search popup, an already-open viewer) — one modal at a time,
+    /// exactly like the other popups. Works with any connection state and
+    /// any number of chats: the viewer reads the process-global diag stream,
+    /// never the chat state.
+    pub fn begin_log_viewer(&mut self) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        let (lines, snapshot_total) = crate::diag::view();
+        // Reset-on-open, consumer-side: everything up to this total is seen.
+        self.log_seen_total = snapshot_total;
+        self.mode = Mode::LogViewer {
+            state: LogViewerState {
+                lines,
+                scroll: 0,
+                snapshot_total,
+            },
+        };
+    }
+
+    /// PgUp (or ↑): detach from the bottom / scroll further up. The snapshot
+    /// freezes — lines arriving while detached are only counted (the
+    /// `+K new lines` footer), never rendered into the frozen view.
+    pub fn log_scroll_up(&mut self, amount: u16) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            state.scroll = state.scroll.saturating_add(amount);
+        }
+    }
+
+    /// PgDn (or ↓): back towards the bottom. Reaching `0` re-arms live-tail:
+    /// the snapshot refreshes to the current ring content and everything
+    /// shown counts as seen.
+    pub fn log_scroll_down(&mut self, amount: u16) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            state.scroll = state.scroll.saturating_sub(amount);
+            if state.scroll == 0 {
+                let (lines, snapshot_total) = crate::diag::view();
+                state.lines = lines;
+                state.snapshot_total = snapshot_total;
+                self.log_seen_total = snapshot_total;
+            }
+        }
+    }
+
+    /// Close the log viewer (Esc). Closing while live-tailing (at the
+    /// bottom) marks the stream as seen — the user just watched those lines
+    /// arrive. Closing while scrolled UP keeps the unseen counter, so the
+    /// `log*` status marker keeps flagging the lines missed while detached.
+    pub fn close_log_viewer(&mut self) -> bool {
+        let at_bottom = match &self.mode {
+            Mode::LogViewer { state } => state.scroll == 0,
+            _ => return false,
+        };
+        self.mode = Mode::Normal;
+        // feat_focus_panes: modal closed → editor pane.
+        self.focus = Focus::Chat;
+        if at_bottom {
+            // The user just watched the tail arrive: everything is seen.
+            self.log_seen_total = crate::diag::total_appended();
+        }
+        true
     }
 
     // ---- lifecycle delegation (active chat) ------------------------------
@@ -3595,5 +3713,236 @@ mod tests {
             "snippet source must be markup-free: {:?}",
             m.line_text
         );
+    }
+
+    // ---- feat_stderr_log_modal: log viewer state ---------------------------
+
+    /// Unique marker line for global-buffer assertions: other tests append
+    /// to the same process-global stream concurrently, so assertions are
+    /// contains-based / monotonic, never exact-position.
+    fn unique_line(tag: &str) -> String {
+        format!(
+            "app-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn log_state(app: &App) -> &LogViewerState {
+        match &app.mode {
+            Mode::LogViewer { state } => state,
+            other => panic!("expected LogViewer mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_log_viewer_snapshots_ring_and_lives_tail() {
+        let marker = unique_line("snap");
+        crate::diag::append(&marker);
+        let total_before_open = crate::diag::total_appended();
+
+        // Works with ZERO chats: the viewer reads the global diag stream.
+        let mut app = App::new(Vec::new());
+        app.begin_log_viewer();
+
+        let state = log_state(&app);
+        assert_eq!(state.scroll, 0, "opens live-tailing at the bottom");
+        assert!(
+            state.lines.contains(&marker),
+            "snapshot copy contains the buffered marker"
+        );
+        // Reset-on-open (consumer-side watermark): everything up to the
+        // open-time total is seen. Monotonicity makes `>=` exact — the
+        // watermark must have captured a total that already includes the
+        // pre-open marker.
+        assert!(
+            app.log_seen_total >= total_before_open,
+            "seen watermark advanced past the pre-open marker: {} < {}",
+            app.log_seen_total,
+            total_before_open
+        );
+        assert_eq!(
+            app.log_seen_total, state.snapshot_total,
+            "watermark and +K baseline coincide at open"
+        );
+    }
+
+    /// The unseen marker logic end to end at the state level: unseen arrivals
+    /// after open/close keep the app "dirty" (marker would show); re-opening
+    /// (and closing at the bottom) marks everything seen again.
+    #[test]
+    fn seen_watermark_resets_on_open_and_close_at_bottom() {
+        let mut app = App::new(Vec::new());
+        crate::diag::append("pre-existing");
+        assert!(
+            crate::diag::total_appended() > app.log_seen_total,
+            "precondition: fresh app has unseen lines"
+        );
+
+        app.begin_log_viewer();
+        let seen_at_open = app.log_seen_total;
+
+        // Lines arriving while the viewer is OPEN at the tail are watched
+        // live: closing at the bottom marks them seen too.
+        crate::diag::append("watched-live");
+        assert!(app.close_log_viewer());
+        assert!(
+            app.log_seen_total > seen_at_open,
+            "close-at-bottom advances the watermark past arrivals"
+        );
+
+        // Closing while DETACHED does not mark: the missed lines stay unseen.
+        let mut app = App::new(Vec::new());
+        app.begin_log_viewer();
+        let seen_at_open = app.log_seen_total;
+        app.log_scroll_up(5);
+        crate::diag::append("missed-while-detached");
+        assert!(app.close_log_viewer());
+        assert_eq!(
+            app.log_seen_total, seen_at_open,
+            "close while scrolled up must not mark the missed lines seen"
+        );
+        assert!(
+            crate::diag::total_appended() > app.log_seen_total,
+            "the missed line still counts as unseen (marker shows)"
+        );
+    }
+
+    #[test]
+    fn opening_log_viewer_noop_while_another_modal_owns_the_keyboard() {
+        // Rename session.
+        let mut app = app_with_chats(1);
+        app.begin_rename();
+        app.begin_log_viewer();
+        assert!(matches!(app.mode, Mode::Renaming { .. }));
+
+        // Delete-confirm popup.
+        let mut app = app_with_chats(1);
+        app.begin_delete_confirm();
+        app.begin_log_viewer();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+
+        // In-thread search popup.
+        let mut app = app_with_chats(1);
+        app.begin_search();
+        app.begin_log_viewer();
+        assert!(matches!(app.mode, Mode::Searching { .. }));
+
+        // Global search popup.
+        let mut app = app_with_chats(1);
+        app.begin_search_all();
+        app.begin_log_viewer();
+        assert!(matches!(app.mode, Mode::SearchingAll { .. }));
+
+        // Already-open viewer: re-open must not reset the scroll.
+        let mut app = app_with_chats(0);
+        app.begin_log_viewer();
+        app.log_scroll_up(7);
+        app.begin_log_viewer();
+        assert_eq!(log_state(&app).scroll, 7, "re-open does not clobber");
+    }
+
+    #[test]
+    fn log_scrolling_detaches_and_return_to_bottom_re_arms_live_tail() {
+        let mut app = app_with_chats(0);
+        app.begin_log_viewer();
+        let baseline = log_state(&app).snapshot_total;
+
+        // Detach: scroll freezes the snapshot (baseline stays put).
+        app.log_scroll_up(30);
+        app.log_scroll_up(30);
+        assert_eq!(log_state(&app).scroll, 60, "PgUp accumulates");
+        app.log_scroll_down(10);
+        assert_eq!(log_state(&app).scroll, 50);
+
+        // Lines arriving while detached count against the baseline…
+        let detached_marker = unique_line("detached");
+        crate::diag::append(&detached_marker);
+        assert_eq!(
+            log_state(&app).snapshot_total,
+            baseline,
+            "snapshot frozen while scrolled up"
+        );
+        let total_now = crate::diag::total_appended();
+        assert!(
+            total_now >= baseline,
+            "monotonic total includes the detached arrival"
+        );
+
+        // …and re-arming the tail refreshes the snapshot to CURRENT content.
+        app.log_scroll_down(50);
+        let state = log_state(&app);
+        assert_eq!(state.scroll, 0, "back at the bottom");
+        assert!(
+            state.lines.contains(&detached_marker),
+            "live-tail refresh picked up the detached arrival"
+        );
+        assert!(
+            state.snapshot_total >= baseline,
+            "baseline advanced to the current ring content"
+        );
+    }
+
+    #[test]
+    fn closing_log_viewer_resets_mode_and_focus() {
+        // At the bottom (live-tail): close marks everything seen.
+        let mut app = app_with_chats(2);
+        app.focus = Focus::Sidebar;
+        app.begin_log_viewer();
+        assert!(app.close_log_viewer());
+        assert!(app.mode.is_normal());
+        assert_eq!(app.focus, Focus::Chat, "modal close returns to editor");
+        assert!(!app.close_log_viewer(), "closing again is a no-op");
+
+        // Scrolled up: close still resets the UI…
+        let mut app = App::new(Vec::new());
+        app.begin_log_viewer();
+        let seen_at_open = app.log_seen_total;
+        app.log_scroll_up(9);
+        crate::diag::append("missed-while-detached");
+        assert!(app.close_log_viewer());
+        assert!(app.mode.is_normal());
+        assert_eq!(app.focus, Focus::Chat);
+        // …and the watermark did NOT advance: the missed line stays unseen.
+        assert_eq!(
+            app.log_seen_total, seen_at_open,
+            "close while detached must not mark missed lines seen"
+        );
+    }
+
+    #[test]
+    fn log_viewer_leaves_chats_and_draft_untouched() {
+        let mut app = app_with_chats(2);
+        type_in(&mut app, "precious draft");
+        // Message is Serialize; Chat itself is not — snapshot names, ids,
+        // lifecycle states and message bytes (the state the viewer could
+        // possibly disturb).
+        let chats_before: Vec<String> = app
+            .chats
+            .iter()
+            .map(|c| {
+                serde_json::to_string(&c.messages).unwrap()
+                    + &format!("|{}|{}|{:?}", c.name, c.id, c.lifecycle)
+            })
+            .collect();
+        app.scroll_up(12);
+
+        app.begin_log_viewer();
+        app.log_scroll_up(3);
+        app.close_log_viewer();
+
+        let chats_after: Vec<String> = app
+            .chats
+            .iter()
+            .map(|c| {
+                serde_json::to_string(&c.messages).unwrap()
+                    + &format!("|{}|{}|{:?}", c.name, c.id, c.lifecycle)
+            })
+            .collect();
+        assert_eq!(chats_after, chats_before, "viewer is read-only on chats");
+        assert_eq!(app.input.lines().join(""), "precious draft");
+        assert_eq!(app.scroll, 12, "chat scroll untouched by the modal");
     }
 }

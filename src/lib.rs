@@ -13,6 +13,7 @@ pub mod app;
 pub mod backend;
 pub mod backend_client;
 pub mod clipboard;
+pub mod diag;
 pub mod history;
 pub mod live;
 pub mod markdown;

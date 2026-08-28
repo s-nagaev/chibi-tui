@@ -47,6 +47,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::backend_client::{spawn_argv, BackendError, ReapHandle};
+use crate::diag;
 use crate::protocol::{ClientMessage, ServerMessage, StatusState};
 
 /// How long [`Command::Shutdown`] waits for the backend to exit gracefully
@@ -437,7 +438,12 @@ async fn actor_loop(
                 Some(ActorEvent::Frame(msg)) => {
                     dispatch_frame(&mut state, &status_tx, msg).await;
                 }
-                Some(ActorEvent::Died(reason)) => state.broken_pipe(reason),
+                Some(ActorEvent::Died(reason)) => {
+                    // feat_stderr_log_modal: pipe death is a diagnostic
+                    // lifecycle event too — one unified stream with stderr.
+                    diag::append_tui(format!("pipe closed: {reason}"));
+                    state.broken_pipe(reason);
+                }
                 // The reader is the only event sender: None means it is gone
                 // (child death after shutdown). Nothing to do.
                 None => {}
@@ -565,10 +571,12 @@ async fn handle_reconnect(
                 spawn_reader(stdout, event_tx.clone());
             }
             state.broken_reason = None;
+            diag::append_tui("reconnect ok");
             Ok(())
         }
         Err(err) => {
             state.broken_reason = Some(format!("reconnect failed: {err}"));
+            diag::append_tui(format!("reconnect failed: {err}"));
             Err(err)
         }
     }
