@@ -19,6 +19,7 @@ pub mod live;
 pub mod markdown;
 pub mod mock;
 pub mod model;
+pub mod model_picker;
 pub mod popup;
 pub mod protocol;
 pub mod request_pipeline;

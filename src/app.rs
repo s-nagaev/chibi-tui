@@ -1,10 +1,11 @@
 //! Application state: chats, selection, input buffer, request lifecycle.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::backend::BackendEvent;
 use crate::markdown;
 use crate::model::{ChatLifecycle, Message};
+use crate::model_picker::{parse_model_listing, parse_selection_confirmation, ModelEntry};
 use crate::popup::ErrorPopup;
 use crate::theme::Theme;
 use tui_textarea::TextArea;
@@ -120,6 +121,36 @@ pub struct LogViewerState {
     pub snapshot_total: u64,
 }
 
+/// Phase of the open model-picker popup (feat_model_picker_lite).
+///
+/// The popup opens IMMEDIATELY on ^M (modal isolation is active from the
+/// first keystroke) while the `/model` listing request travels the normal
+/// pipeline; `Loading` is that in-flight placeholder. The first parseable
+/// result flips the state to `Ready` — or closes the popup via the
+/// degradation path when the listing is unusable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelPickerPhase {
+    /// Listing request in flight; rows not known yet.
+    Loading,
+    /// Listing parsed; `entries` is non-empty and navigable.
+    Ready,
+}
+
+/// State of the open model-picker popup (feat_model_picker_lite).
+///
+/// Same modal-family shape as the search popups: the popup owns its own
+/// state, the chat draft is untouched, and there is no text input here —
+/// the listing is short enough to navigate directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelPickerState {
+    /// `Loading` until the hidden `/model` result resolves.
+    pub phase: ModelPickerPhase,
+    /// Parsed listing rows (empty while loading).
+    pub entries: Vec<ModelEntry>,
+    /// Index into `entries` of the highlighted row.
+    pub selected: usize,
+}
+
 /// Input mode of the whole app (feature: inline thread rename / search).
 ///
 /// Deliberately tiny and explicit so tests can drive transitions
@@ -162,6 +193,12 @@ pub enum Mode {
     /// resets the unseen-lines counter; live-tail at the bottom, frozen
     /// snapshot with a `+K new lines` footer while scrolled up.
     LogViewer { state: LogViewerState },
+    /// The ^M model-picker popup is open (feat_model_picker_lite). Modal
+    /// isolation like the search family: ↑/↓ navigate, Enter selects,
+    /// Esc closes, everything else is swallowed. The listing arrives through
+    /// the NORMAL request pipeline as a hidden exchange — see
+    /// [`HiddenPurpose`] and [`App::begin_model_picker`].
+    ModelPicking { state: ModelPickerState },
 }
 
 impl Mode {
@@ -333,6 +370,42 @@ pub struct App {
     /// the new basename — today it is CLI-only and never changes.
     /// `None` renders as the `—` placeholder.
     pub workspace_root: Option<String>,
+    /// feat_model_picker_lite: hidden exchange bundle staged by the key
+    /// handlers (`^M` open, Enter selection) for the event loop to hand to
+    /// the backend source via the SAME `send_submitted` path as any prompt.
+    /// The bundle carries its own ids; nothing here touches the transcript.
+    pub picker_submission: Option<Submitted>,
+    /// feat_model_picker_lite: purpose registry of in-flight hidden
+    /// exchanges, keyed by protocol request id. A terminal event whose
+    /// tracked id is found here is suppressed from the transcript and
+    /// resolved into the picker/toast state instead of a chat bubble.
+    hidden_requests: HashMap<String, HiddenPurpose>,
+    /// feat_model_picker_lite: hidden requests deferred behind the per-thread
+    /// busy rules — `(thread_id, prompt)` FIFO. A picker action taken while
+    /// the chat is busy must wait for an idle drain (the same rule any
+    /// visible prompt obeys), but it must NOT enter the chat's VISIBLE queue
+    /// (it would render bubbles for plumbing). Flushed one-per-drain by the
+    /// event loop via [`App::take_deferred_hidden_request`].
+    hidden_queue: VecDeque<(String, String)>,
+    /// feat_model_picker_lite: session-scoped last-known model labels staged
+    /// by a hidden `/model <n>` switch, keyed by thread id. Bridges the gap
+    /// until the chat's next visible reply stamps its OWN label (which
+    /// retires the override) — the status strip reads
+    /// [`App::active_model_label`] and picks the switch up with zero
+    /// coupling. Session-scoped exactly like the per-message labels; never
+    /// persisted.
+    picker_model_labels: HashMap<String, String>,
+}
+
+/// feat_model_picker_lite: what a hidden (transcript-suppressed) request is
+/// FOR — the terminal event's handling depends on it. The wire exchange is
+/// identical to a visible prompt; only the resolution differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HiddenPurpose {
+    /// Bare `/model`: the listing resolves into the picker (or degrades).
+    FetchListing,
+    /// `/model <n>`: the confirmation resolves into a status toast.
+    SelectModel,
 }
 
 const SPINNER: [&str; 10] = [
@@ -349,6 +422,14 @@ pub const MAX_INPUT_LINES: usize = 20;
 /// feat_thread_delete: how many 100 ms spinner ticks a transient status
 /// toast stays visible (~2.5 s).
 pub const STATUS_MSG_TICKS: u8 = 25;
+
+/// feat_model_picker_lite: the bare listing request. Sent verbatim through
+/// the normal pipeline; the real backend treats it as a slash command and
+/// answers with the textual model listing in `result.content` (no LLM turn).
+pub const MODEL_LISTING_PROMPT: &str = "/model";
+/// feat_model_picker_lite: toast shown when a hidden listing request
+/// resolves to an unusable listing (unparsable / zero rows).
+const MODEL_LIST_UNAVAILABLE: &str = "model list unavailable";
 /// fix_ack_silent_absorb: the protocol-level acknowledgement marker the
 /// backend uses for silent turns ("THE ACK RULE" in the chibi backend,
 /// `chibi/constants.py`). An agent answer whose ENTIRE content is one or
@@ -403,6 +484,10 @@ impl App {
             log_seen_total: 0,
             status_strip_visible: false,
             workspace_root: None,
+            picker_submission: None,
+            hidden_requests: HashMap::new(),
+            hidden_queue: VecDeque::new(),
+            picker_model_labels: HashMap::new(),
         }
     }
 
@@ -484,13 +569,22 @@ impl App {
     /// switching chats re-labels from that chat's own message history.
     /// Session-scoped exactly like the header labels — never persisted.
     /// `None` renders as the `—` placeholder.
+    ///
+    /// feat_model_picker_lite: a hidden `/model <n>` switch has no transcript
+    /// bubble to derive from, so it stages a session-scoped override (see
+    /// [`App::picker_model_labels`]) that this getter prefers; the chat's
+    /// next visible labeled reply retires it and message-derived truth
+    /// resumes.
     pub fn active_model_label(&self) -> Option<&str> {
-        self.chats
-            .get(self.active)?
-            .messages
-            .iter()
-            .rev()
-            .find_map(|m| m.model_label())
+        let chat = self.chats.get(self.active)?;
+        // feat_model_picker_lite: a hidden `/model <n>` switch updates the
+        // last-known model WITHOUT a transcript bubble — the staged override
+        // shadows the message-derived label until the chat's next visible
+        // reply stamps its own (and retires the override).
+        if let Some(label) = self.picker_model_labels.get(&chat.id) {
+            return Some(label);
+        }
+        chat.messages.iter().rev().find_map(|m| m.model_label())
     }
 
     /// Create a chat with a fresh UUID thread_id, select it. feat_focus_panes:
@@ -542,7 +636,8 @@ impl App {
             | Mode::ConfirmDelete
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
-            | Mode::LogViewer { .. } => None,
+            | Mode::LogViewer { .. }
+            | Mode::ModelPicking { .. } => None,
         }
     }
 
@@ -564,7 +659,8 @@ impl App {
             | Mode::ConfirmDelete
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
-            | Mode::LogViewer { .. } => self.input.lines().len(),
+            | Mode::LogViewer { .. }
+            | Mode::ModelPicking { .. } => self.input.lines().len(),
         };
         buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
     }
@@ -585,7 +681,8 @@ impl App {
             | Mode::ConfirmDelete
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
-            | Mode::LogViewer { .. } => return false,
+            | Mode::LogViewer { .. }
+            | Mode::ModelPicking { .. } => return false,
         };
         self.mode = Mode::Normal;
         // feat_focus_panes: a closed modal returns keyboard ownership to
@@ -992,6 +1089,199 @@ impl App {
         true
     }
 
+    // ---- model picker (feat_model_picker_lite) ----------------------------
+
+    /// Open the model-picker popup for the ACTIVE chat (`^M`).
+    ///
+    /// The popup opens immediately in [`ModelPickerPhase::Loading`] and the
+    /// bare `/model` listing request travels the NORMAL pipeline as a hidden
+    /// exchange: it reuses the chat's own request lifecycle (spinner, busy
+    /// rules, cancel, queue drain) but appends NO transcript bubbles, and
+    /// its result resolves into the picker state instead of a message.
+    ///
+    /// Per-thread busy rules apply exactly like any prompt: when the chat is
+    /// busy the fetch is NOT sent — it is parked in the hidden FIFO and
+    /// dispatched by the event loop on the next idle drain
+    /// ([`App::take_deferred_hidden_request`]). The picker stays `Loading`
+    /// until then. Returns nothing: the bundle (when the chat is idle) is
+    /// staged in [`App::picker_submission`] for the event loop, keeping this
+    /// method synchronous and testable.
+    ///
+    /// No-op when another modal owns the keyboard or there is no chat.
+    pub fn begin_model_picker(&mut self) {
+        if !self.mode.is_normal() || self.active_thread_id().is_none() {
+            return;
+        }
+        let thread_id = self.active_thread_id().unwrap().to_owned();
+        self.mode = Mode::ModelPicking {
+            state: ModelPickerState {
+                phase: ModelPickerPhase::Loading,
+                entries: Vec::new(),
+                selected: 0,
+            },
+        };
+        let chat_index = self.chats.iter().position(|c| c.id == thread_id).unwrap();
+        let chat = &mut self.chats[chat_index];
+        if chat.lifecycle.is_busy() {
+            // Busy chat: obey the same wait-for-idle rule as a visible
+            // prompt, but park it invisibly (plumbing must not queue
+            // transcript bubbles).
+            self.hidden_queue
+                .push_back((thread_id, MODEL_LISTING_PROMPT.to_owned()));
+            return;
+        }
+        let submitted = Submitted {
+            request_id: crate::history::new_request_id(),
+            thread_id,
+            prompt: MODEL_LISTING_PROMPT.to_owned(),
+        };
+        chat.lifecycle = ChatLifecycle::Awaiting {
+            request_id: submitted.request_id.clone(),
+        };
+        self.hidden_requests
+            .insert(submitted.request_id.clone(), HiddenPurpose::FetchListing);
+        self.picker_submission = Some(submitted);
+    }
+
+    /// Drain the staged hidden bundle staged by the key handlers
+    /// (`^M` open or Enter selection). The event loop hands it to the
+    /// backend source via the normal `send_submitted` path.
+    pub fn take_picker_submission(&mut self) -> Option<Submitted> {
+        self.picker_submission.take()
+    }
+
+    /// Close the picker without acting (Esc). Pending bare-listing fetches
+    /// parked in the hidden FIFO are dropped — nobody is waiting for them
+    /// anymore — while an already-confirmed `/model <n>` selection stays
+    /// queued: that choice was made deliberately and must survive.
+    /// Returns whether a picker was actually closed.
+    pub fn close_model_picker(&mut self) -> bool {
+        if !matches!(self.mode, Mode::ModelPicking { .. }) {
+            return false;
+        }
+        self.hidden_queue
+            .retain(|(_, prompt)| prompt != MODEL_LISTING_PROMPT);
+        self.mode = Mode::Normal;
+        // feat_focus_panes: modal closed → editor pane.
+        self.focus = Focus::Chat;
+        true
+    }
+
+    /// Navigate the picker selection (clamped at the list edges).
+    pub fn model_picker_select_next(&mut self) {
+        if let Mode::ModelPicking { state } = &mut self.mode {
+            if state.selected + 1 < state.entries.len() {
+                state.selected += 1;
+            }
+        }
+    }
+
+    pub fn model_picker_select_prev(&mut self) {
+        if let Mode::ModelPicking { state } = &mut self.mode {
+            state.selected = state.selected.saturating_sub(1);
+        }
+    }
+
+    /// Parsed rows of the open picker (empty while loading/closed).
+    pub fn model_picker_entries(&self) -> &[ModelEntry] {
+        match &self.mode {
+            Mode::ModelPicking { state } => &state.entries,
+            _ => &[],
+        }
+    }
+
+    /// Index of the highlighted row (0 when nothing is selectable yet).
+    pub fn model_picker_selected(&self) -> usize {
+        match &self.mode {
+            Mode::ModelPicking { state } => state.selected,
+            _ => 0,
+        }
+    }
+
+    /// Enter in the picker: close the popup and stage a hidden
+    /// `/model <n>` request for the highlighted row's OWN listing number
+    /// (the backend validates against the listing numbering, not the
+    /// popup's scroll position). Same busy/queue rules as the fetch: an
+    /// idle chat gets the bundle staged for immediate send; a busy chat
+    /// parks the selection in the hidden FIFO until an idle drain. The
+    /// popup always closes — the confirmation arrives later as a status
+    /// toast, never as a bubble.
+    ///
+    /// No-op while the listing is still loading or the list is empty.
+    pub fn confirm_model_picker(&mut self) {
+        let Mode::ModelPicking { state } = &self.mode else {
+            return;
+        };
+        if state.phase != ModelPickerPhase::Ready || state.entries.is_empty() {
+            return;
+        }
+        let entry = &state.entries[state.selected];
+        let prompt = format!("/model {}", entry.number);
+        let Some(thread_id) = self.active_thread_id().map(str::to_owned) else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        // feat_focus_panes: modal closed → editor pane.
+        self.focus = Focus::Chat;
+
+        let Some(chat) = self.chats.iter_mut().find(|c| c.id == thread_id) else {
+            return;
+        };
+        if chat.lifecycle.is_busy() {
+            self.hidden_queue.push_back((thread_id, prompt));
+            return;
+        }
+        let submitted = Submitted {
+            request_id: crate::history::new_request_id(),
+            thread_id,
+            prompt,
+        };
+        chat.lifecycle = ChatLifecycle::Awaiting {
+            request_id: submitted.request_id.clone(),
+        };
+        self.hidden_requests
+            .insert(submitted.request_id.clone(), HiddenPurpose::SelectModel);
+        self.picker_submission = Some(submitted);
+    }
+
+    /// Event-loop drain hook (per-thread async): after a chat's visible FIFO
+    /// was given the chance to send its next prompt, hand out the NEXT parked
+    /// hidden request for the SAME thread — but only when the chat ended up
+    /// Idle (a just-started visible prompt keeps the hidden request parked
+    /// for the next drain). Occupies the chat lifecycle without bubbles.
+    pub fn take_deferred_hidden_request(&mut self, thread_id: &str) -> Option<Submitted> {
+        let (queue_thread, _prompt) = self.hidden_queue.front()?;
+        if queue_thread != thread_id {
+            return None;
+        }
+        let chat = self.chats.iter().find(|c| c.id == thread_id)?;
+        if chat.lifecycle.is_busy() {
+            return None;
+        }
+        let (_, prompt) = self.hidden_queue.pop_front()?;
+        let submitted = Submitted {
+            request_id: crate::history::new_request_id(),
+            thread_id: thread_id.to_owned(),
+            prompt,
+        };
+        let chat = self
+            .chats
+            .iter_mut()
+            .find(|c| c.id == thread_id)
+            .expect("chat existed a line ago");
+        chat.lifecycle = ChatLifecycle::Awaiting {
+            request_id: submitted.request_id.clone(),
+        };
+        let purpose = if submitted.prompt == MODEL_LISTING_PROMPT {
+            HiddenPurpose::FetchListing
+        } else {
+            HiddenPurpose::SelectModel
+        };
+        self.hidden_requests
+            .insert(submitted.request_id.clone(), purpose);
+        Some(submitted)
+    }
+
     // ---- lifecycle delegation (active chat) ------------------------------
 
     /// Lifecycle of the active chat (drives the spinner line). Empty chats
@@ -1365,23 +1655,54 @@ impl App {
                 ..
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
-                    let chat = &mut self.chats[chat_index];
-                    if is_invisible_result(&markdown) {
-                        // fix_ack_silent_absorb: an empty or pure-ACK answer is
-                        // a protocol-level acknowledgement, not a user-facing
-                        // reply — absorb it invisibly. The pending placeholder
-                        // is dropped (no empty bubble), the lifecycle resolves
-                        // to Idle so the active-chat spinner stops cleanly and
-                        // re-arms on the next prompt, and NO error/toast fires.
-                        // The per-thread queue drain is unaffected: the live
-                        // glue emits QueueDrain after every terminal event
-                        // regardless of content, so queued prompts still send.
-                        drop_live_pending_placeholder(chat);
-                    } else {
-                        resolve_live_placeholder(chat, markdown, model);
+                    // feat_model_picker_lite: a terminal result whose tracked
+                    // id is a hidden exchange is suppressed from the
+                    // transcript and resolved into the picker/toast state
+                    // instead. The lifecycle still returns to Idle so the
+                    // busy rules (and the FIFO drain) keep working.
+                    let purpose = self.hidden_requests.remove(&tracked_request_id);
+                    self.chats[chat_index].lifecycle = ChatLifecycle::Idle;
+                    match purpose {
+                        Some(HiddenPurpose::FetchListing) => {
+                            self.resolve_hidden_listing(&markdown, chat_index);
+                        }
+                        Some(HiddenPurpose::SelectModel) => {
+                            self.resolve_hidden_selection(&markdown, model.as_deref(), chat_index);
+                        }
+                        None => {
+                            // feat_model_picker_lite: a visible reply that
+                            // stamps its OWN model label retires any
+                            // hidden-switch override — the message-derived
+                            // label is the fresher truth again. Fieldless /
+                            // ACK resolutions keep the override (no signal
+                            // that the model reverted).
+                            let stamped = model
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|m| !m.is_empty())
+                                .map(str::to_owned);
+                            let thread_id = self.chats[chat_index].id.clone();
+                            let chat = &mut self.chats[chat_index];
+                            if is_invisible_result(&markdown) {
+                                // fix_ack_silent_absorb: an empty or pure-ACK answer is
+                                // a protocol-level acknowledgement, not a user-facing
+                                // reply — absorb it invisibly. The pending placeholder
+                                // is dropped (no empty bubble), the lifecycle resolves
+                                // to Idle so the active-chat spinner stops cleanly and
+                                // re-arms on the next prompt, and NO error/toast fires.
+                                // The per-thread queue drain is unaffected: the live
+                                // glue emits QueueDrain after every terminal event
+                                // regardless of content, so queued prompts still send.
+                                drop_live_pending_placeholder(chat);
+                            } else {
+                                resolve_live_placeholder(chat, markdown, model);
+                            }
+                            if stamped.is_some() {
+                                self.picker_model_labels.remove(&thread_id);
+                            }
+                            self.scroll = 0;
+                        }
                     }
-                    chat.lifecycle = ChatLifecycle::Idle;
-                    self.scroll = 0;
                 }
             }
             BackendEvent::Error {
@@ -1390,9 +1711,28 @@ impl App {
                 ..
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
+                    // feat_model_picker_lite: hidden exchanges respect
+                    // cancel/errors through the error-popup path — there is
+                    // no pending placeholder to resolve inline, so the modal
+                    // popup (with its `R` reconnect escape) IS the honest
+                    // surface. The picker, if still open, closes with it.
+                    let purpose = self.hidden_requests.remove(&tracked_request_id);
+                    self.chats[chat_index].lifecycle = ChatLifecycle::Idle;
+                    if purpose.is_some() {
+                        if is_transport_failure(&message) {
+                            self.connection = Connection::Disconnected;
+                        }
+                        if matches!(self.mode, Mode::ModelPicking { .. }) {
+                            self.mode = Mode::Normal;
+                            self.focus = Focus::Chat;
+                        }
+                        self.show_error(message);
+                        self.scroll = 0;
+                        return;
+                    }
+
                     let chat = &mut self.chats[chat_index];
                     resolve_live_placeholder(chat, format!("**Error:** {message}"), None);
-                    chat.lifecycle = ChatLifecycle::Idle;
 
                     // Transport-level failures (broken pipe, lost backend,
                     // failed cancel of a dead link) escalate to the modal
@@ -1409,6 +1749,92 @@ impl App {
             // Handled by the early returns above; arms kept for exhaustiveness.
             BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => {}
         }
+    }
+
+    /// feat_model_picker_lite: resolve a hidden bare-`/model` result.
+    ///
+    /// * parseable, non-empty listing → the OPEN picker flips to `Ready`
+    ///   with best-effort preselection of the chat's last-known model
+    ///   (ambiguous or unknown → first row). A result arriving with the
+    ///   picker already closed is absorbed silently (plumbing nobody
+    ///   awaits).
+    /// * unparsable/empty listing → honest degradation while the picker is
+    ///   open: info toast + the raw exchange becomes a NORMAL visible chat
+    ///   exchange (user bubble `/model` + the backend's raw answer), so the
+    ///   user sees reality instead of a silently dead popup. With the
+    ///   picker closed the garbage is absorbed silently too.
+    fn resolve_hidden_listing(&mut self, markdown: &str, chat_index: usize) {
+        let entries = parse_model_listing(markdown);
+        if entries.is_empty() {
+            if matches!(self.mode, Mode::ModelPicking { .. }) {
+                self.mode = Mode::Normal;
+                self.focus = Focus::Chat;
+                self.show_status(MODEL_LIST_UNAVAILABLE);
+                // The fallback is honest, not silent: surface the raw
+                // exchange the user actually caused with ^M.
+                let chat = &mut self.chats[chat_index];
+                chat.messages.push(Message::user(MODEL_LISTING_PROMPT));
+                chat.messages.push(Message::assistant(markdown));
+                self.scroll = 0;
+            }
+            return;
+        }
+        // Best-effort preselection against the active chat's last-known
+        // model label (hidden-switch override first, then the
+        // feat_agent_model_label message metadata); ambiguity → none.
+        // Computed BEFORE the mutable borrow of the picker state below.
+        let label = self.last_known_model_label(chat_index);
+        let Mode::ModelPicking { state } = &mut self.mode else {
+            return; // picker closed meanwhile: absorb silently
+        };
+        state.phase = ModelPickerPhase::Ready;
+        state.entries = entries;
+        state.selected = preselect_model_index(&state.entries, label.as_deref()).unwrap_or(0);
+    }
+
+    /// feat_model_picker_lite: resolve a hidden `/model <n>` confirmation
+    /// into the compact status toast (never a bubble; same suppression as
+    /// the fetch). Unrecognized bodies fall back to the raw text so a
+    /// backend wording change degrades visibly instead of lying.
+    ///
+    /// Task interplay: the switch ALSO updates the chat's last-known model
+    /// metadata (a session-scoped override — see
+    /// [`App::picker_model_labels`]) so the status strip reflects it with
+    /// zero coupling. The wire `model` field wins when the backend stamps
+    /// it (same source visible replies use); the confirmation text tail is
+    /// the honest fallback when it does not.
+    fn resolve_hidden_selection(&mut self, markdown: &str, model: Option<&str>, chat_index: usize) {
+        let label =
+            parse_selection_confirmation(markdown).unwrap_or_else(|| markdown.trim().to_owned());
+        if label.is_empty() {
+            self.show_status("model switched");
+        } else {
+            self.show_status(format!("model: {label}"));
+        }
+        let stamped = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned)
+            .or(if label.is_empty() { None } else { Some(label) });
+        if let Some(label) = stamped {
+            let thread_id = self.chats[chat_index].id.clone();
+            self.picker_model_labels.insert(thread_id, label);
+        }
+    }
+
+    /// feat_model_picker_lite: the chat's best-effort last-known model label
+    /// for picker preselection — the hidden-switch override first (a
+    /// just-made `/model <n>` switch leaves no transcript bubble to derive
+    /// from), then the feat_agent_model_label message metadata.
+    fn last_known_model_label(&self, chat_index: usize) -> Option<String> {
+        let chat = &self.chats[chat_index];
+        self.picker_model_labels.get(&chat.id).cloned().or_else(|| {
+            chat.messages
+                .iter()
+                .rev()
+                .find_map(|m| m.model_label())
+                .map(str::to_owned)
+        })
     }
 
     pub fn tick_spinner(&mut self) {
@@ -1583,6 +2009,28 @@ fn drop_live_pending_placeholder(chat: &mut Chat) {
 /// (see [`crate::live::submitted_event_id`]).
 fn event_matches_request(event_id: u64, tracked_request_id: &str) -> bool {
     event_id == crate::live::wire_thread_id(tracked_request_id) as u64
+}
+
+/// feat_model_picker_lite: best-effort preselection index — the single parsed
+/// row whose name equals (case-insensitively) the chat's last-known model
+/// label. Ambiguous (duplicate names across providers are common in real
+/// listings) or unknown labels yield `None` → the picker starts at row 0.
+fn preselect_model_index(entries: &[ModelEntry], label: Option<&str>) -> Option<usize> {
+    let label = label?.trim().to_lowercase();
+    if label.is_empty() {
+        return None;
+    }
+    let hits: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.name.trim().to_lowercase() == label)
+        .map(|(i, _)| i)
+        .collect();
+    if hits.len() == 1 {
+        hits.into_iter().next()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -4142,5 +4590,423 @@ mod tests {
         assert_eq!(chats_after, chats_before, "viewer is read-only on chats");
         assert_eq!(app.input.lines().join(""), "precious draft");
         assert_eq!(app.scroll, 12, "chat scroll untouched by the modal");
+    }
+
+    // ---- feat_model_picker_lite --------------------------------------------
+
+    /// The REAL captured `/model` listing — the parser's and the picker's
+    /// ground truth (see `model_picker.rs` for provenance).
+    const CAPTURED_LISTING: &str = include_str!("../tests/fixtures/model_listing_captured.txt");
+
+    /// Open the picker as ^M does and consume the staged hidden fetch the
+    /// way the event loop does, so the test controls delivery timing.
+    fn open_picker(app: &mut App) {
+        app.begin_model_picker();
+        assert!(matches!(app.mode, Mode::ModelPicking { .. }));
+        let bundle = app.take_picker_submission().expect("hidden fetch staged");
+        assert_eq!(bundle.prompt, "/model");
+        assert_eq!(bundle.thread_id, app.chats[app.active].id);
+    }
+
+    /// Deliver a terminal Result for the chat's current tracked request the
+    /// way the backend source would (same mock-event shape as
+    /// [`finish_chat_with_model`]).
+    fn deliver_hidden_result(app: &mut App, markdown: &str, model: Option<&str>) {
+        let request_id = app.chats[app.active]
+            .lifecycle
+            .request_id()
+            .unwrap()
+            .to_owned();
+        let thread_id = app.chats[app.active].id.clone();
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&request_id),
+            markdown: markdown.to_owned(),
+            thread_id,
+            model: model.map(str::to_owned),
+        });
+    }
+
+    /// Stamp a last-known model label onto the chat WITHOUT a live request
+    /// (what a finished reply leaves behind — session metadata is stripped
+    /// from storage but lives in memory).
+    fn seed_model_label(app: &mut App, label: &str) {
+        let mut message = Message::assistant("seeded");
+        message.model = Some(label.to_owned());
+        app.chats[0].messages.push(message);
+    }
+
+    #[test]
+    fn opening_the_picker_stages_a_hidden_fetch_without_bubbles() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        assert!(
+            matches!(
+                &app.mode,
+                Mode::ModelPicking {
+                    state: ModelPickerState {
+                        phase: ModelPickerPhase::Loading,
+                        entries,
+                        ..
+                    }
+                } if entries.is_empty()
+            ),
+            "popup opens immediately in Loading"
+        );
+        assert_eq!(
+            app.chats[0].lifecycle,
+            ChatLifecycle::Awaiting {
+                request_id: app.chats[0].lifecycle.request_id().unwrap().to_owned()
+            },
+            "the fetch occupies the normal request lifecycle"
+        );
+        assert!(app.chats[0].messages.is_empty(), "no transcript bubbles");
+        assert_eq!(
+            app.hidden_requests.values().next(),
+            Some(&HiddenPurpose::FetchListing)
+        );
+    }
+
+    #[test]
+    fn hidden_listing_resolves_into_the_picker_without_bubbles() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        let Mode::ModelPicking { state } = &app.mode else {
+            panic!("picker still open");
+        };
+        assert_eq!(state.phase, ModelPickerPhase::Ready);
+        assert_eq!(state.entries.len(), 104, "every captured row is listed");
+        assert_eq!(state.selected, 0, "fresh chat has no label to preselect");
+        assert!(app.chats[0].messages.is_empty(), "no transcript bubbles");
+        assert_eq!(app.chats[0].lifecycle, ChatLifecycle::Idle);
+        assert!(app.hidden_requests.is_empty(), "purpose consumed");
+    }
+
+    #[test]
+    fn preselection_lands_on_a_unique_label() {
+        let mut app = app_with_chats(1);
+        // `4. Qwen Plus (Alibaba)` is the ONLY "Qwen Plus" row in the
+        // captured listing — a clean unambiguous preselection target.
+        seed_model_label(&mut app, "Qwen Plus");
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        let Mode::ModelPicking { state } = &app.mode else {
+            panic!("picker open");
+        };
+        assert_eq!(state.selected, 3, "0-based index of listing row 4");
+    }
+
+    #[test]
+    fn ambiguous_labels_disable_preselection() {
+        let mut app = app_with_chats(1);
+        seed_model_label(&mut app, "Glm 5.2");
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        let Mode::ModelPicking { state } = &app.mode else {
+            panic!("picker open");
+        };
+        // "Glm 5.2" appears under Cheaper Inference (row 16) AND Melious
+        // (row 41) — ambiguous ⇒ best-effort gives up, first row selected.
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn preselection_survives_case_and_whitespace() {
+        assert_eq!(
+            super::preselect_model_index(
+                &parse_model_listing("1. Alpha (A)\n2. beta (B)\n"),
+                Some("  BETA ")
+            ),
+            Some(1)
+        );
+        assert_eq!(super::preselect_model_index(&[], Some("Alpha")), None);
+        assert_eq!(
+            super::preselect_model_index(&parse_model_listing("1. Alpha (A)\n"), Some("unknown")),
+            None
+        );
+    }
+
+    #[test]
+    fn navigation_clamps_at_both_list_edges() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        app.model_picker_select_prev();
+        assert_eq!(app.model_picker_selected(), 0, "clamped at the top");
+        for _ in 0..200 {
+            app.model_picker_select_next();
+        }
+        assert_eq!(
+            app.model_picker_selected(),
+            103,
+            "clamped at the last of 104 rows"
+        );
+        assert_eq!(app.model_picker_entries().len(), 104);
+    }
+
+    #[test]
+    fn confirm_stages_a_hidden_selection_and_toasts_the_confirmation() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        for _ in 0..2 {
+            app.model_picker_select_next();
+        }
+        app.confirm_model_picker();
+        assert_eq!(app.mode, Mode::Normal, "selection closes the popup");
+        assert_eq!(app.focus, Focus::Chat);
+        let bundle = app.take_picker_submission().expect("selection staged");
+        assert_eq!(bundle.prompt, "/model 3", "the row's OWN listing number");
+        assert!(matches!(
+            app.chats[0].lifecycle,
+            ChatLifecycle::Awaiting { .. }
+        ));
+        assert!(app.chats[0].messages.is_empty(), "no transcript bubbles");
+        assert_eq!(
+            app.hidden_requests.values().next(),
+            Some(&HiddenPurpose::SelectModel)
+        );
+
+        deliver_hidden_result(&mut app, "Selected model: Qwen3.5 Flash (Alibaba)", None);
+        let (msg, _) = app.status_message.as_ref().expect("toast shown");
+        assert_eq!(msg, "model: Qwen3.5 Flash (Alibaba)");
+        assert!(app.chats[0].messages.is_empty(), "still no bubbles");
+        assert_eq!(app.chats[0].lifecycle, ChatLifecycle::Idle);
+    }
+
+    #[test]
+    fn unrecognizable_confirmation_degrades_to_the_raw_text() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        app.confirm_model_picker();
+        deliver_hidden_result(&mut app, "totally unexpected body", None);
+        let (msg, _) = app.status_message.as_ref().expect("toast shown");
+        assert_eq!(msg, "model: totally unexpected body");
+    }
+
+    #[test]
+    fn hidden_switch_updates_last_known_model_metadata() {
+        let mut app = app_with_chats(1);
+        seed_model_label(&mut app, "old-model");
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        app.confirm_model_picker();
+        deliver_hidden_result(&mut app, "Selected model: GLM 5.2 (ZhipuAI)", None);
+        assert_eq!(
+            app.active_model_label(),
+            Some("GLM 5.2 (ZhipuAI)"),
+            "the hidden switch is visible to the status strip via the override"
+        );
+
+        // The chat's NEXT visible reply stamps its own label and retires the
+        // override (DoD: switch confirmed by the next reply's label).
+        type_in(&mut app, "next prompt");
+        let submitted = app.take_input().expect("prompt taken");
+        app.begin_request(&submitted);
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "**done**".into(),
+            thread_id: submitted.thread_id,
+            model: Some("glm-5.2".into()),
+        });
+        assert_eq!(
+            app.active_model_label(),
+            Some("glm-5.2"),
+            "message-derived label is the fresher truth again"
+        );
+        assert!(app.picker_model_labels.is_empty(), "override retired");
+    }
+
+    #[test]
+    fn fieldless_visible_replies_keep_the_hidden_switch_override() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        app.confirm_model_picker();
+        deliver_hidden_result(
+            &mut app,
+            "Selected model: GLM 5.2 (ZhipuAI)",
+            Some("glm-5.2"),
+        );
+        assert_eq!(app.active_model_label(), Some("glm-5.2"), "wire field wins");
+
+        type_in(&mut app, "next prompt");
+        let submitted = app.take_input().expect("prompt taken");
+        app.begin_request(&submitted);
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "**fieldless**".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        assert_eq!(
+            app.active_model_label(),
+            Some("glm-5.2"),
+            "a fieldless reply is no signal the model reverted"
+        );
+    }
+
+    #[test]
+    fn unparsable_listing_degrades_to_toast_plus_visible_exchange() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, "No models available.", None);
+        assert_eq!(app.mode, Mode::Normal, "the dead popup closes");
+        let (msg, _) = app.status_message.as_ref().expect("info toast");
+        assert_eq!(msg, "model list unavailable");
+        let messages = &app.chats[0].messages;
+        assert_eq!(messages.len(), 2, "the raw exchange becomes visible");
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].markdown, "/model");
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].markdown, "No models available.");
+        assert_eq!(app.chats[0].lifecycle, ChatLifecycle::Idle);
+    }
+
+    #[test]
+    fn a_listing_arriving_after_the_picker_closed_is_absorbed_silently() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        assert!(app.close_model_picker());
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.chats[0].messages.is_empty(), "plumbing nobody awaits");
+        assert!(app.status_message.is_none(), "no spurious toast");
+        assert!(app.picker_model_labels.is_empty());
+    }
+
+    #[test]
+    fn esc_closes_without_acting_and_drops_a_parked_fetch() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "long running prompt");
+        let submitted = app.take_input().expect("prompt taken");
+        app.begin_request(&submitted); // chat is busy now
+
+        app.begin_model_picker(); // fetch is PARKED (busy rules)
+        assert!(app.take_picker_submission().is_none(), "busy ⇒ not staged");
+        assert_eq!(
+            app.hidden_queue.len(),
+            1,
+            "the fetch waits in the hidden FIFO"
+        );
+        assert!(matches!(app.mode, Mode::ModelPicking { .. }));
+
+        assert!(app.close_model_picker());
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.hidden_queue.is_empty(),
+            "nobody awaits the parked fetch anymore"
+        );
+        // The chat's own visible request is untouched.
+        assert!(matches!(
+            app.chats[0].lifecycle,
+            ChatLifecycle::Awaiting { .. }
+        ));
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "**done**".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        assert!(app.status_message.is_none(), "no leak from dropped fetch");
+    }
+
+    #[test]
+    fn busy_chat_parks_fetch_and_the_idle_drain_dispatches_it() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "long running prompt");
+        let submitted = app.take_input().expect("prompt taken");
+        app.begin_request(&submitted);
+
+        app.begin_model_picker();
+        let thread_id = app.chats[0].id.clone();
+        assert!(
+            app.take_deferred_hidden_request(&thread_id).is_none(),
+            "busy chat: the hidden fetch stays parked"
+        );
+
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "**done**".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        let deferred = app
+            .take_deferred_hidden_request(&thread_id)
+            .expect("idle drain dispatches the parked fetch");
+        assert_eq!(deferred.prompt, "/model");
+        assert!(matches!(
+            app.chats[0].lifecycle,
+            ChatLifecycle::Awaiting { .. }
+        ));
+        assert_eq!(
+            app.chats[0]
+                .messages
+                .iter()
+                .filter(|m| !m.pending && m.role == Role::Assistant)
+                .count(),
+            1,
+            "only the visible prompt's own bubble; the hidden fetch adds none"
+        );
+        assert_eq!(
+            app.hidden_requests.values().next(),
+            Some(&HiddenPurpose::FetchListing)
+        );
+    }
+
+    #[test]
+    fn a_confirmed_selection_survives_busy_and_the_drain_sends_it() {
+        let mut app = app_with_chats(1);
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        // Force the busy state underneath the open popup (what a queued
+        // drain or another chat's activity would produce).
+        app.chats[0].lifecycle = ChatLifecycle::Awaiting {
+            request_id: "busy-marker".to_owned(),
+        };
+        app.model_picker_select_next();
+        app.confirm_model_picker(); // parks the selection, closes the popup
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.hidden_queue.len(), 1, "selection parked while busy");
+        assert!(app.take_picker_submission().is_none());
+
+        // The drain fires after the chat's terminal event resolves it to
+        // Idle (white-box: the same state a real Result leaves behind).
+        app.chats[0].lifecycle = ChatLifecycle::Idle;
+        let thread_id = app.chats[0].id.clone();
+        let deferred = app
+            .take_deferred_hidden_request(&thread_id)
+            .expect("Esc-drop must NOT touch a confirmed selection");
+        assert_eq!(deferred.prompt, "/model 2");
+    }
+
+    #[test]
+    fn end_to_end_picker_flow_with_mock_events_leaves_no_bubbles() {
+        let mut app = app_with_chats(1);
+        // ^M: hidden fetch.
+        open_picker(&mut app);
+        // Backend answers the bare `/model` with the REAL captured listing.
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        // Enter: hidden `/model <n>`.
+        app.confirm_model_picker();
+        let bundle = app.take_picker_submission().expect("selection staged");
+        assert_eq!(bundle.prompt, "/model 1");
+        // Backend confirms.
+        deliver_hidden_result(&mut app, "Selected model: Qwen3.8 Max (Alibaba)", None);
+        // The whole exchange was plumbing: transcript untouched, feedback
+        // arrived as a toast + last-known-model metadata.
+        assert!(app.chats[0].messages.is_empty());
+        let (msg, _) = app.status_message.as_ref().expect("toast");
+        assert_eq!(msg, "model: Qwen3.8 Max (Alibaba)");
+        assert_eq!(app.active_model_label(), Some("Qwen3.8 Max (Alibaba)"));
+        // Reopening the picker preselects the just-switched model
+        // (best-effort: the display tail matches listing row 1 uniquely).
+        open_picker(&mut app);
+        deliver_hidden_result(&mut app, CAPTURED_LISTING, None);
+        let Mode::ModelPicking { state } = &app.mode else {
+            panic!("picker open");
+        };
+        assert_eq!(state.selected, 0, "preselected via the staged override");
     }
 }

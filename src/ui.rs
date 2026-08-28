@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Connection, Focus};
+use crate::app::{App, Connection, Focus, ModelPickerPhase};
 use crate::markdown;
 use crate::model::{ChatLifecycle, Role};
 use crate::popup::ErrorPopup;
@@ -81,7 +81,8 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         | Mode::ConfirmDelete
         | Mode::Searching { .. }
         | Mode::SearchingAll { .. }
-        | Mode::LogViewer { .. } => render_input(f, app, theme, chat_column),
+        | Mode::LogViewer { .. }
+        | Mode::ModelPicking { .. } => render_input(f, app, theme, chat_column),
     }
     render_status(f, app, theme, root[3]);
 
@@ -104,6 +105,10 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // feat_stderr_log_modal: diagnostics log viewer (rendered last).
     if matches!(app.mode, Mode::LogViewer { .. }) {
         render_log_viewer(f, app, theme);
+    }
+    // feat_model_picker_lite: model picker popup (rendered last).
+    if matches!(app.mode, Mode::ModelPicking { .. }) {
+        render_model_picker(f, app, theme);
     }
 }
 
@@ -847,6 +852,146 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
             footer,
         );
     }
+}
+
+/// Centered modal model-picker popup (feat_model_picker_lite). Same popup
+/// family as the search modals — theme-driven, centered, hint row last —
+/// with a stateful [`List`] body: the selection is ratatui-selection-aware,
+/// so a listing longer than the viewport scrolls and the highlighted row
+/// auto-scrolls into view. `Loading` shows a quiet placeholder row while
+/// the hidden `/model` request is in flight. Purely visual — all key
+/// handling lives in `main.rs`.
+fn render_model_picker(f: &mut Frame, app: &mut App, theme: &Theme) {
+    use ratatui::widgets::{Clear, List, ListItem, ListState, Padding};
+
+    let Mode::ModelPicking { state } = &app.mode else {
+        return;
+    };
+    let loading = state.phase == ModelPickerPhase::Loading;
+    let entries = state.entries.clone();
+    let selected = state.selected;
+    let count = entries.len();
+
+    let hint =
+        "\u{2191}\u{2193} navigate \u{00b7} Enter switch \u{00b7} Esc close \u{00b7} Ctrl+C quit";
+
+    // Max model rows shown before the stateful list scrolls internally
+    // (the highlighted row auto-scrolls into view).
+    const MAX_LIST_ROWS: usize = 12;
+
+    let title = if loading {
+        " Model picker ".to_owned()
+    } else {
+        format!(" Model picker \u{00b7} {count} models ")
+    };
+
+    // Size to content with sane caps; centered on the full frame (same
+    // sizing pattern as the search popups; floors keep tiny terminals safe).
+    let max_w = f.area().width.saturating_sub(4).max(20);
+    let widest_row = entries
+        .iter()
+        .map(|e| crate::model_picker::listing_row_label(e).width())
+        .max()
+        .unwrap_or(16)
+        + 2; // selection marker + breathing room
+    let width = (hint.width() as u16 + 12)
+        .max(40)
+        .max(widest_row.min(60) as u16)
+        .clamp(20, max_w);
+    let body_rows = if loading {
+        1
+    } else {
+        count.clamp(1, MAX_LIST_ROWS)
+    };
+    let height = (body_rows as u16 + 1 + 2) // + hint row + borders
+        .min(f.area().height.saturating_sub(2))
+        .max(3);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.blue))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            title,
+            Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Body rows above, decision hint on the last row (same family shape).
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let footer = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+
+    if loading {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "loading models\u{2026}",
+                Style::new().fg(theme.dim),
+            ))),
+            body,
+        );
+    } else {
+        let rows: Vec<ListItem<'static>> = entries
+            .iter()
+            .map(|e| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                if e.active {
+                    // The backend's own 🟢 active-model marker, re-styled.
+                    spans.push(Span::styled(
+                        "\u{25cf} ".to_owned(),
+                        Style::new().fg(theme.green),
+                    ));
+                } else {
+                    spans.push(Span::styled("  ".to_owned(), Style::new()));
+                }
+                spans.push(Span::styled(
+                    crate::model_picker::listing_row_label(e),
+                    Style::new().fg(theme.fg),
+                ));
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let list = List::new(rows)
+            .style(Style::new().bg(theme.bg))
+            .highlight_style(
+                Style::new()
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("\u{25b8} ");
+        let mut list_state = ListState::default();
+        list_state.select(Some(selected));
+        f.render_stateful_widget(list, body, &mut list_state);
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::new().fg(theme.yellow),
+        ))),
+        footer,
+    );
 }
 
 /// Centered modal error popup over a dimmed backdrop. Purely visual — all
@@ -3972,6 +4117,93 @@ mod tests {
             "hints row too wide: {} cols — {:?}",
             last.trim_end().width(),
             last
+        );
+    }
+
+    // ---- feat_model_picker_lite: popup rendering -----------------------------
+
+    use crate::app::{ModelPickerPhase, ModelPickerState};
+
+    /// A Ready picker over the REAL captured listing (104 rows) with the
+    /// selection parked on `selected` (0-based).
+    fn picker_app_at(selected: usize) -> App {
+        let mut app = App::new(mock::initial_chats());
+        let entries = crate::model_picker::parse_model_listing(include_str!(
+            "../tests/fixtures/model_listing_captured.txt"
+        ));
+        assert_eq!(entries.len(), 104);
+        app.mode = Mode::ModelPicking {
+            state: ModelPickerState {
+                phase: ModelPickerPhase::Ready,
+                entries,
+                selected,
+            },
+        };
+        app
+    }
+
+    #[test]
+    fn model_picker_popup_renders_rows_hint_and_selection_marker() {
+        let mut app = picker_app_at(0);
+        let rows = render_grid(&mut app);
+        let text: String = rows.join("\n");
+        assert!(text.contains("Model picker"), "popup title");
+        assert!(text.contains("104 models"), "row count in the title");
+        assert!(
+            text.contains("1. Qwen3.8 Max (Alibaba)"),
+            "first parsed row rendered: {text}"
+        );
+        assert!(
+            text.contains("↑↓ navigate · Enter switch · Esc close · Ctrl+C quit"),
+            "decision hint on the footer row"
+        );
+        // The highlighted row carries the ▸ marker.
+        let marked = rows
+            .iter()
+            .any(|r| r.contains('▸') && r.contains("1. Qwen3.8 Max"));
+        assert!(marked, "selection marker on the highlighted row");
+    }
+
+    #[test]
+    fn model_picker_list_scrolls_and_the_selection_stays_on_screen() {
+        // Selection on the LAST of 104 rows while the body shows only
+        // ~12 rows: the ratatui selection-aware list must auto-scroll the
+        // highlighted row into view.
+        let mut app = picker_app_at(103);
+        let rows = render_grid_at_with_buffer(&mut app, 120, 34).0;
+        let text: String = rows.join("\n");
+        assert!(
+            text.contains("104. GLM 4.7 FlashX (ZhipuAI)"),
+            "the selected last row auto-scrolled into view"
+        );
+        assert!(
+            !text.contains("1. Qwen3.8 Max (Alibaba)"),
+            "early rows scrolled out of the viewport"
+        );
+
+        // And back to the top.
+        let mut app = picker_app_at(0);
+        let rows = render_grid_at_with_buffer(&mut app, 120, 34).0;
+        let text: String = rows.join("\n");
+        assert!(text.contains("1. Qwen3.8 Max (Alibaba)"));
+        assert!(!text.contains("104. GLM 4.7 FlashX (ZhipuAI)"));
+    }
+
+    #[test]
+    fn model_picker_loading_phase_renders_a_quiet_placeholder() {
+        let mut app = App::new(mock::initial_chats());
+        app.begin_model_picker();
+        assert!(matches!(app.mode, Mode::ModelPicking { .. }));
+        let rows = render_grid(&mut app);
+        let text: String = rows.join("\n");
+        assert!(text.contains("loading models…"), "in-flight placeholder");
+        assert!(
+            text.contains("Model picker"),
+            "the popup family title renders during the fetch too"
+        );
+        assert!(
+            !text.contains("1. Qwen3.8 Max"),
+            "no rows exist before the hidden listing resolves"
         );
     }
 }

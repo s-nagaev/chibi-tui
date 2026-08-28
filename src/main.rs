@@ -280,8 +280,22 @@ async fn run_loop(
                             // flips focus back) — it must never also submit
                             // the message draft the editor still holds.
                             let was_sidebar_focused = app.focus == Focus::Sidebar;
+                            // feat_model_picker_lite: the picker's Enter
+                            // confirms the selected model — it belongs to
+                            // the popup, never to message submission.
+                            let was_model_picking =
+                                matches!(app.mode, Mode::ModelPicking { .. });
 
                             handle_key(&mut app, key);
+
+                            // feat_model_picker_lite: a hidden exchange
+                            // staged by the key handlers (`^M` open or
+                            // Enter selection) is sent through the SAME
+                            // `send_submitted` path as any prompt — it just
+                            // carries its own ids and adds no bubbles.
+                            if let Some(hidden) = app.take_picker_submission() {
+                                send_submitted(source, &hidden, event_tx.clone());
+                            }
 
                             // A rename commit happened iff Enter closed an
                             // open session and the active chat's name changed.
@@ -317,6 +331,10 @@ async fn run_loop(
                             // pane and never submits.
                             let enter_consumed_by_sidebar =
                                 was_sidebar_focused && key.code == KeyCode::Enter;
+                            // feat_model_picker_lite: the picker's Enter is
+                            // consumed by the popup (model switch staged).
+                            let enter_consumed_by_picker =
+                                was_model_picking && key.code == KeyCode::Enter;
 
                             // A confirmed thread deletion removes the persisted
                             // history file (idempotent: a missing file is
@@ -394,6 +412,7 @@ async fn run_loop(
                                 && !enter_consumed_by_search
                                 && !enter_consumed_by_search_all
                                 && !enter_consumed_by_sidebar
+                                && !enter_consumed_by_picker
                             {
                                 let submitted = app.take_input();
                                 if let Some(submitted) = submitted {
@@ -445,6 +464,14 @@ async fn run_loop(
                 if let Some(thread_id) = drain_thread_id {
                     if let Some(next) = app.dequeue_next_for(&thread_id) {
                         send_submitted(source, &next, event_tx.clone());
+                    }
+                    // feat_model_picker_lite: after the visible FIFO had its
+                    // chance, hand out the next parked HIDDEN request for
+                    // the same thread — only when the chat stayed Idle (a
+                    // just-started visible prompt keeps it parked for the
+                    // next drain).
+                    if let Some(hidden) = app.take_deferred_hidden_request(&thread_id) {
+                        send_submitted(source, &hidden, event_tx.clone());
                     }
                     if let Some(chat) = app.chats.iter().find(|c| c.id == thread_id) {
                         persist_chat(chat, history_dir);
@@ -616,6 +643,34 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Down => app.log_scroll_down(1),
             KeyCode::Esc => {
                 app.close_log_viewer();
+            }
+            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            _ => {}
+        }
+        return;
+    }
+
+    // ---- feat_model_picker_lite: model-picker modal captures everything ----
+    //
+    // While the ^M picker is open, ONLY picker keys work: ↑/↓ move the
+    // selection (clamped at the list edges), Enter confirms the highlighted
+    // row (stages the hidden `/model <n>` request — a no-op until the
+    // listing arrives), Esc closes without acting (a parked fetch is
+    // dropped; an already-confirmed selection stays queued), Ctrl+C quits
+    // (same class as the other popups). Everything else — typing, global
+    // chords (^N/^R/^D/^T/^L/^F/^G/^O), thread switching — is swallowed so
+    // no keystroke leaks into the textarea and no global binding fires.
+    // There is no text input here: the listing is short enough to navigate
+    // directly (task scope). The picker's Enter is additionally gated in the
+    // event loop (`enter_consumed_by_picker`) so it can never ALSO submit
+    // the message draft.
+    if matches!(app.mode, Mode::ModelPicking { .. }) {
+        match key.code {
+            KeyCode::Up => app.model_picker_select_prev(),
+            KeyCode::Down => app.model_picker_select_next(),
+            KeyCode::Enter => app.confirm_model_picker(),
+            KeyCode::Esc => {
+                app.close_model_picker();
             }
             KeyCode::Char('c') if ctrl => app.should_quit = true,
             _ => {}
@@ -826,6 +881,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // feat_status_line: same Normal-mode ^O semantics under sidebar
             // focus (parity contract with the chord match below).
             KeyCode::Char('o') if ctrl => app.toggle_status_strip(),
+            // feat_model_picker_lite: same Normal-mode ^M semantics under
+            // sidebar focus (parity contract with the chord match below).
+            KeyCode::Char('m') if ctrl => app.begin_model_picker(),
             KeyCode::Char('l') if ctrl => {
                 // Same pair as the global ^L arm below (clear + wipe intent).
                 app.clear_input();
@@ -925,6 +983,30 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // the kitty keyboard protocol. Mnemonic: infO.
         (KeyCode::Char('o'), true) => {
             app.toggle_status_strip();
+            return;
+        }
+        // Ctrl+M: OPEN THE MODEL PICKER (feat_model_picker_lite) — the
+        // centered popup that fetches the bare `/model` listing as a hidden
+        // exchange (no transcript bubbles) and switches models by sending
+        // `/model <n>` the same hidden way.
+        //
+        // Chord verification (feat task discipline, see the executor report
+        // for the full audit): tui-textarea 0.7 maps Ctrl+M to
+        // insert_newline() (textarea.rs:274-286 — the same arm as Enter),
+        // which this binding deliberately OVERRIDES exactly like the
+        // existing ^U undo override: the global match claims the chord and
+        // returns before the textarea ever sees it, and no app flow relies
+        // on a ^M newline (bare Enter already inserts one). The kitty
+        // keyboard protocol pushed at startup (DISAMBIGUATE_ESCAPE_CODES)
+        // makes capable terminals deliver ^M as an event distinct from
+        // Enter; on legacy terminals ^M degrades to bare Enter — with a
+        // non-empty draft that SUBMITS it (README-documented caveat, same
+        // class as the Shift+Enter degradation). No macOS system hijack
+        // (Mission Control only takes ^arrows); GNU readline's C-M
+        // accept-line is a shell-side binding that never fires inside the
+        // TUI (same argument as the ^O audit). Mnemonic: Model.
+        (KeyCode::Char('m'), true) => {
+            app.begin_model_picker();
             return;
         }
         // Ctrl+Shift+F: GLOBAL search across ALL threads
@@ -3059,5 +3141,204 @@ mod tests {
         assert!(app.status_strip_visible);
         press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
         assert!(!app.status_strip_visible);
+    }
+
+    // ---- feat_model_picker_lite: ^M chord + modal isolation -----------------
+
+    use chibi_tui::app::{ModelPickerPhase, ModelPickerState};
+    use chibi_tui::model_picker::ModelEntry;
+
+    /// A Ready picker injected directly (the listing resolution itself is
+    /// covered by the app-level tests; here only KEY ROUTING matters).
+    fn inject_ready_picker(app: &mut chibi_tui::app::App, rows: usize) {
+        let entries = (1..=rows)
+            .map(|n| ModelEntry {
+                number: n,
+                name: format!("model-{n}"),
+                provider: Some("prov".to_owned()),
+                active: false,
+            })
+            .collect();
+        app.mode = chibi_tui::app::Mode::ModelPicking {
+            state: ModelPickerState {
+                phase: ModelPickerPhase::Ready,
+                entries,
+                selected: 0,
+            },
+        };
+    }
+
+    #[test]
+    fn ctrl_m_opens_the_model_picker_in_normal_mode() {
+        let mut app = app_with_chats(1);
+        assert!(app.mode.is_normal());
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ModelPicking { .. }
+        ));
+        // The event loop drains the staged hidden fetch on the same tick.
+        let bundle = app.take_picker_submission().expect("fetch staged");
+        assert_eq!(bundle.prompt, "/model");
+        // Esc hands the keyboard back.
+        press(&mut app, KeyCode::Esc, KeyModifiers::empty());
+        assert!(app.mode.is_normal());
+    }
+
+    #[test]
+    fn ctrl_m_works_from_sidebar_focus_and_returns_focus_on_close() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ModelPicking { .. }
+        ));
+        press(&mut app, KeyCode::Esc, KeyModifiers::empty());
+        assert!(app.mode.is_normal());
+        assert_eq!(
+            app.focus,
+            chibi_tui::app::Focus::Chat,
+            "modal closed → editor"
+        );
+    }
+
+    #[test]
+    fn the_picker_modal_swallows_everything_but_nav_confirm_cancel() {
+        let mut app = app_with_chats(1);
+        for ch in "precious draft".chars() {
+            app.input.input(tui_textarea::Input {
+                key: tui_textarea::Key::Char(ch),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+        }
+        inject_ready_picker(&mut app, 3);
+
+        // Typing leaks nowhere; global chords and thread switching are
+        // swallowed; the mode never moves.
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::empty());
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::PageUp, KeyModifiers::empty());
+        press(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ModelPicking { .. }
+        ));
+        assert_eq!(app.chats.len(), 1, "no new chat from swallowed ^N");
+        assert!(app.error_popup.is_none());
+        assert!(!app.status_strip_visible);
+        assert_eq!(
+            app.input.lines().join(""),
+            "precious draft",
+            "no keystroke leaked into the textarea"
+        );
+        assert_eq!(app.scroll, 0, "PgUp did not scroll the chat pane");
+
+        // The ONLY working keys: ↑/↓ navigate, Enter confirms, Esc cancels,
+        // Ctrl+C quits.
+        press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        press(&mut app, KeyCode::Up, KeyModifiers::empty());
+        assert_eq!(app.model_picker_selected(), 1);
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(app.mode.is_normal(), "Enter confirmed and closed the popup");
+        let bundle = app.take_picker_submission().expect("selection staged");
+        assert_eq!(bundle.prompt, "/model 2");
+    }
+
+    #[test]
+    fn the_picker_enters_confirm_never_touch_the_message_draft() {
+        let mut app = app_with_chats(1);
+        for ch in "half typed prompt".chars() {
+            app.input.input(tui_textarea::Input {
+                key: tui_textarea::Key::Char(ch),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+        }
+        inject_ready_picker(&mut app, 1);
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            app.take_picker_submission().is_some(),
+            "the picker consumed the Enter"
+        );
+        assert_eq!(
+            app.input.lines().join(""),
+            "half typed prompt",
+            "the draft must not be submitted or altered"
+        );
+        assert!(app.chats[0].messages.is_empty());
+    }
+
+    #[test]
+    fn the_picker_enter_is_a_noop_while_the_listing_is_loading() {
+        let mut app = app_with_chats(1);
+        app.begin_model_picker();
+        // The event loop would drain the staged fetch on the same tick.
+        assert!(app.take_picker_submission().is_some(), "precondition");
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ModelPicking { .. }
+        ));
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::ModelPicking { .. }),
+            "nothing to confirm while Loading — the popup stays open"
+        );
+        assert!(app.take_picker_submission().is_none());
+    }
+
+    #[test]
+    fn the_picker_esc_closes_without_staging_anything() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 2);
+        press(&mut app, KeyCode::Esc, KeyModifiers::empty());
+        assert!(app.mode.is_normal());
+        assert!(app.take_picker_submission().is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn the_picker_ctrl_c_quits_like_the_other_popups() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 2);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_m_is_swallowed_while_other_modals_own_the_keyboard() {
+        // ^G log viewer open: ^M must NOT open the picker on top.
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::LogViewer { .. }));
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::LogViewer { .. }),
+            "the viewer keeps the keyboard"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::empty());
+
+        // ^D confirm popup open: ^M swallowed as well.
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+        press(&mut app, KeyCode::Esc, KeyModifiers::empty());
+        assert!(app.mode.is_normal());
+        assert!(
+            app.take_picker_submission().is_none(),
+            "no picker fetch ever staged through the modals"
+        );
     }
 }

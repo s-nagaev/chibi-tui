@@ -97,6 +97,7 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+Shift+F` | Find in ALL threads (global search; same popup family with thread-title labels and total counts; `Enter` switches to the match's thread and jumps; requires the kitty keyboard protocol) |
 | `Ctrl+G` | Open the diagnostics log viewer (backend stderr + TUI lifecycle events; `PgUp`/`PgDn` or `↑`/`↓` scroll, `Esc` close — see the Diagnostics section) |
 | `Ctrl+O` | Toggle the status strip — a dim one-row `cwd: <workspace> · <model>` readout on the chat header's top border (hidden by default; see the Status strip section) |
+| `Ctrl+M` | Open the model picker popup (`↑`/`↓` navigate · `Enter` switch · `Esc` close — see the Model picker section; requires the kitty keyboard protocol) |
 | `Enter` | Send message (or queue it while this chat is busy) |
 | `⇧↵` / `⌥↵` | Insert a newline into the input (multi-line prompts) |
 | `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
@@ -173,8 +174,8 @@ While the **Sidebar** holds focus:
   which pane holds focus.
 - global service chords stay live: `^N` (new chat — then focus lands on
   Chat), `^R` rename, `^D` delete (still refused while busy), `^F` /
-  `Ctrl+Shift+F` search popups, `^G` log viewer, `^O` status strip, `^L`
-  clear screen, `^C` cancel/quit.
+  `Ctrl+Shift+F` search popups, `^G` log viewer, `^O` status strip, `^M`
+  model picker, `^L` clear screen, `^C` cancel/quit.
 
 The focused sidebar signals itself through the theme only: its divider and
 `Chats` title lift to a brighter accent and the idle dot column brightens;
@@ -306,7 +307,9 @@ open/close and never captures keys.
   - `model` is the **last known model of the active chat**, reusing the same
     per-message metadata as the `● Chibi (model)` answer headers: it updates
     on every result resolution, an error resolution keeps the last known
-    label, and switching chats re-labels from that chat's own history. Both
+    label, and switching chats re-labels from that chat's own history. A
+    model switch made in the picker updates it too — without a transcript
+    bubble (see the Model picker section). Both
     segments render a `—` placeholder when unknown. Model labels are
     session-scoped — restored history shows `—` again.
 - **Placement** — the strip rides the SAME top-border row as the chat title
@@ -317,6 +320,46 @@ open/close and never captures keys.
 - **Extensible** — the planned context-size segment (once the protocol
   reports real usage) will extend the same readout; a local approximation
   was rejected as dishonest.
+
+### Model picker
+
+A centered modal popup opened with **`Ctrl+M`** (also works while the Sidebar
+pane holds focus) that switches the backend's model WITHOUT any protocol
+support — it reuses the plain chat pipeline:
+
+1. Opening sends a bare `/model` request and renders the popup with a
+   `loading models…` placeholder while the answer travels.
+2. The textual listing (`N. name (provider)` rows) is parsed from the
+   answer; the popup lists every row with the backend's 🟢 active-model
+   marker re-styled, and best-effort preselects the chat's last known model
+   (ambiguous or unknown labels start at the first row). The list scrolls
+   when it exceeds the viewport; the selection auto-scrolls into view.
+3. `Enter` sends `/model <n>` for the highlighted row's own listing number;
+   the backend's confirmation arrives as a compact status toast
+   (`model: <name> (provider)`), not as a chat bubble. The switch also
+   updates the chat's last-known model — the status strip (`Ctrl+O`) picks
+   it up on the next frame.
+
+**Disclosure — hidden exchanges:** both the `/model` fetch and the
+`/model <n>` selection are *suppressed from the transcript* (they are
+plumbing, not conversation): no user/assistant bubbles are ever added.
+Feedback comes as toasts. A failed or unparsable listing degrades honestly:
+an info toast (`model list unavailable`) appears AND the raw `/model`
+exchange is added to the transcript as a normal visible chat exchange, so
+you always see what actually happened. Errors follow the standard error
+popup path (with the `R` reconnect escape).
+
+**Busy rules:** the picker popup can open anytime, but the hidden requests
+obey the same per-thread busy/queue rules as any prompt — while the chat is
+busy the fetch (or a confirmed selection) waits invisibly and is sent on the
+next idle drain. `Esc` drops a not-yet-sent fetch; a confirmed selection
+survives closing the popup.
+
+**Chord caveat:** the kitty keyboard protocol (pushed at startup) makes
+`Ctrl+M` a distinct event from `Enter`. On legacy terminals without it,
+`Ctrl+M` arrives as bare `Enter` — with a non-empty draft that submits the
+draft (same degradation class as `⇧↵`); the picker chord requires a
+kitty-capable terminal (as noted in the keybinding table).
 
 ## Configuration & Data
 
