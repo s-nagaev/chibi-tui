@@ -143,6 +143,12 @@ async fn main() -> io::Result<()> {
         }
     };
 
+    // feat_status_line: wire the strip's cwd source for BOTH backends (the
+    // CLI flag defaults to the process cwd, so mock mode has it too). Read
+    // reactively by the renderer each frame; the workspace is CLI-only
+    // today, so the value never changes at runtime.
+    app.workspace_root = Some(cli.workspace.to_string_lossy().into_owned());
+
     // Single channel: backend tasks push progress events, UI consumes.
     let (event_tx, mut event_rx) = mpsc::channel::<BackendEvent>(64);
 
@@ -817,6 +823,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // feat_stderr_log_modal: read-only viewer = service chord; same
             // Normal-mode ^G semantics under sidebar focus (parity contract).
             KeyCode::Char('g') if ctrl => app.begin_log_viewer(),
+            // feat_status_line: same Normal-mode ^O semantics under sidebar
+            // focus (parity contract with the chord match below).
+            KeyCode::Char('o') if ctrl => app.toggle_status_strip(),
             KeyCode::Char('l') if ctrl => {
                 // Same pair as the global ^L arm below (clear + wipe intent).
                 app.clear_input();
@@ -896,6 +905,26 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // meaning (abort) has no function in this TUI. Mnemonic: loG.
         (KeyCode::Char('g'), true) => {
             app.begin_log_viewer();
+            return;
+        }
+        // Ctrl+O: TOGGLE THE STATUS STRIP (feat_status_line) — the dim
+        // one-row `cwd: <workspace> · <model>` readout on the chat pane's
+        // top border. Hidden by default; pure view state (like ^T's Focus),
+        // modals swallow the chord like every other one.
+        //
+        // Chord verification (feat task discipline, see the executor report
+        // for the full audit): ^G was already taken by the log viewer, so
+        // the other task candidate ^O was verified FREE — no app binding
+        // anywhere in src/ (only `Char('o')` hits are plain typing), no
+        // tui-textarea 0.7 shortcut (its Ctrl table covers a/b/d/e/f/h/j/k/
+        // n/p/r/u/v/w/x/y/<>/[] — no 'o'), not part of this app's readline
+        // family (^A/^E/^U/^K/^W/^Y/^L — GNU readline's operate-and-get-
+        // next is a shell-side binding that never fires inside the TUI), no
+        // macOS system hijack (Mission Control only takes ^arrows), and the
+        // legacy tty VDISCARD semantics of ^O are inert under raw mode plus
+        // the kitty keyboard protocol. Mnemonic: infO.
+        (KeyCode::Char('o'), true) => {
+            app.toggle_status_strip();
             return;
         }
         // Ctrl+Shift+F: GLOBAL search across ALL threads
@@ -2974,5 +3003,61 @@ mod tests {
         press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert!(matches!(app.mode, chibi_tui::app::Mode::Renaming { .. }));
         assert_eq!(app.rename_buf(), Some("chat-0g"));
+    }
+
+    // ---- feat_status_line: ^O toggle ---------------------------------------
+
+    /// ^O toggles the status strip, default hidden, round-trip.
+    #[test]
+    fn ctrl_o_toggles_status_strip_round_trip() {
+        let mut app = app_with_chats(1);
+        assert!(
+            !app.status_strip_visible,
+            "strip must start hidden (task contract)"
+        );
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.status_strip_visible);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(!app.status_strip_visible);
+    }
+
+    /// View state like Focus: the strip survives modal open/close, and the
+    /// modal branch swallows ^O while a popup is open (no toggle leaks).
+    #[test]
+    fn ctrl_o_survives_modals_and_is_swallowed_while_one_is_open() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.status_strip_visible);
+
+        // Open the search popup: strip stays visible underneath it.
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        assert!(app.status_strip_visible);
+
+        // ^O inside the popup is swallowed — mode and visibility unchanged.
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        assert!(
+            app.status_strip_visible,
+            "swallowed ^O must not toggle the strip"
+        );
+
+        // Closing the modal keeps the visibility flag (no reset on close).
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.mode.is_normal());
+        assert!(app.status_strip_visible);
+    }
+
+    /// Sidebar-focus parity contract: service chords behave identically
+    /// under both panes — ^O toggles the strip from the sidebar too.
+    #[test]
+    fn ctrl_o_toggles_strip_under_sidebar_focus() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.status_strip_visible);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(!app.status_strip_visible);
     }
 }

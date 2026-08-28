@@ -1,12 +1,13 @@
 //! Ratatui layout: sidebar (chat list) + chat view + spinner line + input +
 //! hotkey status line.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::block::Title;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Connection, Focus};
 use crate::markdown;
@@ -293,18 +294,31 @@ fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::
 
 fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_line: Rect) {
     let title = app.chat_title().replace('\n', " ");
-    let block = Block::default()
+    let left_title = format!(
+        " #{}/{} \u{00b7} {} ",
+        app.active + 1,
+        app.chats.len(),
+        title
+    );
+    let mut block = Block::default()
         .title(Span::styled(
-            format!(
-                " #{}/{} \u{00b7} {} ",
-                app.active + 1,
-                app.chats.len(),
-                title
-            ),
+            left_title.clone(),
             Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::TOP)
         .border_style(Style::new().fg(theme.selection));
+
+    // feat_status_line: when the strip is visible its `cwd: <basename> ·
+    // <model>` readout rides the SAME top-border row as a right-aligned
+    // block title — zero extra rows (the dedicated-strip fallback was not
+    // needed; rationale in the task report). Truncated with an ellipsis to
+    // the width left of the left-aligned header title, so long workspace
+    // paths can never collide with it or overflow the pane.
+    if app.status_strip_visible {
+        if let Some(strip) = status_strip_title(app, theme, area.width, &left_title) {
+            block = block.title(strip);
+        }
+    }
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -411,6 +425,69 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     if overflowed {
         render_scroll_hint(f, app.at_bottom(), theme, spinner_line);
     }
+}
+
+/// feat_status_line: the strip's text — `cwd: <basename> · <model>` with
+/// `—` placeholders for an unwired workspace root / a chat without a known
+/// model yet. Deliberately a plain formatting seam: the planned v11_02
+/// segment (context size, once the protocol reports real usage) extends
+/// THIS string only — no layout or widget changes.
+fn status_strip_text(app: &App) -> String {
+    format!(
+        "cwd: {} \u{00b7} {}",
+        app.status_cwd().unwrap_or("\u{2014}"),
+        app.active_model_label().unwrap_or("\u{2014}")
+    )
+}
+
+/// feat_status_line: the strip as a right-aligned top-border [`Title`] for
+/// the chat pane, dim-styled. Squeezed into the columns LEFT of the
+/// left-aligned header title (1-column gutter): too-narrow panes yield
+/// `None` and the strip simply does not render this frame.
+fn status_strip_title<'a>(
+    app: &'a App,
+    theme: &Theme,
+    area_width: u16,
+    left_title: &str,
+) -> Option<Title<'a>> {
+    let gutter = 1u16;
+    let available = area_width.saturating_sub(left_title.width() as u16 + gutter) as usize;
+    if available == 0 {
+        return None;
+    }
+    let text = truncate_ellipsis(&status_strip_text(app), available);
+    // Alignment rides on the Line itself (ratatui groups top titles by the
+    // line's own alignment; `Title::alignment` is deprecated in 0.29).
+    Some(Title::from(
+        Line::from(Span::styled(text, Style::new().fg(theme.dim))).alignment(Alignment::Right),
+    ))
+}
+
+/// feat_status_line: right-truncate to at most `max` display columns,
+/// replacing the dropped tail with a single-column ellipsis. Display width
+/// (unicode-width) throughout: wide glyphs (CJK/emoji) are dropped whole
+/// instead of straddling the boundary.
+fn truncate_ellipsis(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text.width() <= max {
+        return text.to_owned();
+    }
+    // Reserve one column for the ellipsis; fill the rest greedily.
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// `↑ more ↓` hint tucked into the right end of the spinner/status line
@@ -627,6 +704,18 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // to `^R` (the action is README-documented and the popup itself is
     // self-explanatory) keeps the +1-col cost inside 120 cols with the
     // longest status label. ^C cancel is never dropped.
+    // feat_status_line: `^O info` joined the hints (the toggle for the dim
+    // `cwd · model` strip on the chat header border). The strip is HIDDEN
+    // by default, so a hint-shown-only-while-visible scheme would leave the
+    // feature undiscoverable — the toggle hint is PERMANENT (decision
+    // documented in the README + task report). To pay the +10 cols the
+    // self-evident `^D del` compacted to `^D` (the confirm popup is
+    // self-explanatory, same precedent as `^R`) and `^T panel` compacted to
+    // `^T` (the focus flip is instantly visible feedback; both actions stay
+    // README-documented). Net width change: ZERO — the row stays at 87
+    // cols, so the `log*` worst case (87 hints + 7 marker + 2 separator +
+    // 24 longest label = 120 ≤ 120) holds verbatim. ^C cancel is never
+    // dropped.
     let spans = if let Some((message, _)) = &app.status_message {
         // Transient status toast (busy-delete refusal): replaces the hint
         // block while visible. Short message + connection label always fit
@@ -638,7 +727,7 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ]
     } else {
         let mut spans = vec![Span::styled(
-            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D del \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T panel",
+            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T \u{00b7} ^O info",
             Style::new().fg(theme.selection),
         )];
         // feat_stderr_log_modal: subtle dim `log*` token when unseen
@@ -2442,10 +2531,12 @@ mod tests {
     /// `^C cancel` stays readable next to the longest connection label.
     /// feat_ctrl_arrows_nav: `^↑↓ chats` documents Ctrl-arrow thread
     /// switching and `↑↓ caret` documents plain-arrow caret movement.
-    /// feat_thread_delete: `^D del` documents thread deletion.
-    /// feat_focus_panes: `^T panel` documents the pane-focus toggle; the
-    /// rename token compacted to bare `^R` (compact `^N`/`⇧↵`/`^R` tokens
-    /// per the fit budget; README documents the full names).
+    /// feat_thread_delete: `^D del` joined, later compacted to bare `^D`
+    /// (feat_status_line: the confirm popup is self-explanatory).
+    /// feat_focus_panes: `^T panel` documents the pane-focus toggle, later
+    /// compacted to bare `^T` (same reason); the rename token compacted to
+    /// bare `^R` (compact `^N`/`⇧↵`/`^R` tokens per the fit budget; README
+    /// documents the full names).
     #[test]
     fn status_line_lists_rename_and_newline_hints() {
         let mut app = App::new(mock::initial_chats());
@@ -2458,9 +2549,10 @@ mod tests {
             "^C cancel",
             "^/\u{2325}\u{2191}\u{2193} chats",
             "\u{2191}\u{2193} caret",
-            "^D del",
+            "^D",
             "^F",
-            "^T panel",
+            "^T",
+            "^O info",
         ] {
             assert!(last.contains(needle), "{needle} missing from {last:?}");
         }
@@ -3252,20 +3344,18 @@ mod tests {
         );
     }
 
-    /// feat_focus_panes: the hints line carries `^T panel` (focus toggle —
+    /// feat_focus_panes: the hints line carries `^T` (focus toggle —
     /// wrap-cycling was removed) and still fits 120 cols with the longest
-    /// status label — `^R rename` compacted to `^R` to absorb the +1 col.
-    /// ^C cancel is never dropped.
+    /// status label — `^R rename` compacted to `^R` to absorb the +1 col;
+    /// feat_status_line later compacted `^T panel` to bare `^T` to pay for
+    /// the `^O info` token. ^C cancel is never dropped.
     #[test]
     fn status_hints_still_fit_with_ctrl_t_panel_hint() {
         let mut app = App::new(mock::initial_chats());
         app.connection = Connection::Disconnected;
         let last = render_grid(&mut app).last().unwrap().clone();
 
-        assert!(
-            last.contains("^T panel"),
-            "^T panel missing from hints: {last:?}"
-        );
+        assert!(last.contains("^T"), "^T missing from hints: {last:?}");
         assert!(
             !last.contains("next"),
             "stale ^T next hint must be gone: {last:?}"
@@ -3724,6 +3814,164 @@ mod tests {
         assert!(
             !flat.contains(&"x".repeat(150)),
             "long line must be truncated, never wrapped: {flat}"
+        );
+    }
+
+    // ---- feat_status_line: cwd + model strip -------------------------------
+
+    /// Default contract: the strip is HIDDEN — the chat header border
+    /// carries no `cwd:` readout until ^O toggles it on.
+    #[test]
+    fn status_strip_is_hidden_by_default() {
+        let mut app = App::new(mock::initial_chats());
+        let rows = render_grid(&mut app);
+        assert!(
+            !rows[0].contains("cwd:"),
+            "strip must be hidden by default: {:?}",
+            rows[0]
+        );
+    }
+
+    /// Toggled on: the readout rides the SAME top-border row as the chat
+    /// header title — right-aligned into the pane's last columns and
+    /// dim-styled (theme-driven). Mock chats carry no model labels and the
+    /// workspace root is unwired here, so both segments show `—`.
+    #[test]
+    fn status_strip_renders_right_aligned_and_dim_on_the_header_border() {
+        let mut app = App::new(mock::initial_chats());
+        let theme = Theme::tokyo_night();
+        // Zero vertical cost: render with the strip hidden, then visible —
+        // ONLY the header border row (row 0) may change; every other row is
+        // untouched, proving the strip never steals a content row.
+        let (before, _) = render_grid_with_buffer(&mut app);
+        app.toggle_status_strip();
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+        for (y, (b, a)) in before.iter().zip(rows.iter()).enumerate().skip(1) {
+            assert_eq!(b, a, "row {y} must be untouched by the strip");
+        }
+
+        let header = &rows[0];
+        let text = "cwd: \u{2014} \u{00b7} \u{2014}";
+        assert!(header.contains(text), "strip text missing: {header:?}");
+        // Right-aligned: the readout's last column is the chat pane's last
+        // column (119 @120), i.e. it starts at 120 - 10 = 110.
+        let start = col_of_sub(header, text).expect("strip column");
+        assert_eq!(start, 110, "strip not right-aligned: {header:?}");
+        // Dim styling: every cell of the readout uses theme.dim (not the
+        // bold header blue, not the border selection color).
+        for (i, _) in text.chars().enumerate() {
+            assert_eq!(
+                buf[((start + i) as u16, 0)].fg,
+                theme.dim,
+                "strip cell {i} not dim"
+            );
+        }
+    }
+
+    /// Model segment reuses feat_agent_model_label metadata: the active
+    /// chat's LAST KNOWN label is shown; a chat without any label shows the
+    /// `—` placeholder (live switching re-labels per chat).
+    #[test]
+    fn status_strip_shows_active_chats_last_model() {
+        let mut app = App::new(mock::initial_chats());
+        app.chats[0]
+            .messages
+            .push(Message::assistant_with_model("labelled answer", "glm-5.2"));
+        app.toggle_status_strip();
+
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains("cwd: \u{2014} \u{00b7} glm-5.2"),
+            "model label missing: {:?}",
+            rows[0]
+        );
+
+        // Switch to a chat with no labels: placeholder returns.
+        app.select_next();
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains("\u{00b7} \u{2014}"),
+            "unlabelled chat must show the placeholder: {:?}",
+            rows[0]
+        );
+    }
+
+    /// Long workspace path: the readout is truncated to the space left of
+    /// the header title with a single-column ellipsis — no overflow, left
+    /// title intact, no collision.
+    #[test]
+    fn status_strip_truncates_long_paths_with_ellipsis() {
+        let mut app = App::new(mock::initial_chats());
+        app.workspace_root = Some(format!("/tmp/{}", "w".repeat(120)));
+        app.toggle_status_strip();
+
+        let rows = render_grid(&mut app);
+        let header = &rows[0];
+        assert!(
+            header.contains("#1/4"),
+            "left header title must survive: {header:?}"
+        );
+        assert!(
+            header.contains('\u{2026}'),
+            "ellipsis missing from truncated strip: {header:?}"
+        );
+        assert!(
+            !header.contains(&"w".repeat(120)),
+            "untruncated path leaked into the row: {header:?}"
+        );
+        assert!(
+            header.trim_end().width() <= 120,
+            "header row overflowed: {} cols",
+            header.trim_end().width()
+        );
+    }
+
+    /// Too-narrow chat pane: the strip yields entirely instead of colliding
+    /// with the header title (no panic, no readout, no overflow).
+    #[test]
+    fn status_strip_skips_when_the_chat_pane_cannot_host_it() {
+        let mut app = App::new(mock::initial_chats());
+        app.toggle_status_strip();
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 40, 20);
+        assert!(
+            !rows[0].contains("cwd:"),
+            "strip must not render in a too-narrow pane: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[0].trim_end().width() <= 40,
+            "narrow frame overflowed: {} cols",
+            rows[0].trim_end().width()
+        );
+    }
+
+    /// feat_status_line: the hints line carries `^O info` and — after
+    /// compacting `^D del`/`^T panel` to bare tokens (net-zero width
+    /// change, base row still 87 cols) — still fits 120 cols with the
+    /// longest status label. ^C cancel is never dropped.
+    #[test]
+    fn status_hints_still_fit_with_status_strip_hint() {
+        let mut app = App::new(mock::initial_chats());
+        app.connection = Connection::Disconnected;
+        let last = render_grid(&mut app).last().unwrap().clone();
+
+        assert!(
+            last.contains("^O info"),
+            "^O info missing from hints: {last:?}"
+        );
+        assert!(
+            last.contains("^C cancel"),
+            "^C cancel must never be dropped"
+        );
+        assert!(
+            last.contains("disconnected (press R)"),
+            "status label clipped — hints overflowed 120 cols: {last:?}"
+        );
+        assert!(
+            last.trim_end().width() <= 120,
+            "hints row too wide: {} cols — {:?}",
+            last.trim_end().width(),
+            last
         );
     }
 }

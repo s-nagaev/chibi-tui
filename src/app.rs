@@ -320,6 +320,19 @@ pub struct App {
     /// Tracking unseen state on the consumer side of a monotonic producer
     /// total is race-free by construction — no counter resets to coordinate.
     pub log_seen_total: u64,
+    /// feat_status_line: visibility of the one-row status strip (workspace
+    /// cwd · active chat's model), toggled with ^O. Default HIDDEN. Pure
+    /// VIEW state like [`Focus`] — deliberately NOT a [`Mode`]: it never
+    /// captures keys and survives every modal open/close untouched.
+    pub status_strip_visible: bool,
+    /// feat_status_line: workspace root backing the strip's cwd segment
+    /// (shown as its basename). Wired once at startup from the CLI
+    /// `--workspace` value (which itself defaults to the process cwd) for
+    /// BOTH backends, mock included. The renderer reads it reactively every
+    /// frame, so if the root ever changes at runtime the next frame shows
+    /// the new basename — today it is CLI-only and never changes.
+    /// `None` renders as the `—` placeholder.
+    pub workspace_root: Option<String>,
 }
 
 const SPINNER: [&str; 10] = [
@@ -388,6 +401,8 @@ impl App {
             pending_global_search_jump: None,
             log_visible_rows: 20,
             log_seen_total: 0,
+            status_strip_visible: false,
+            workspace_root: None,
         }
     }
 
@@ -428,6 +443,54 @@ impl App {
             Focus::Chat => Focus::Sidebar,
             Focus::Sidebar => Focus::Chat,
         };
+    }
+
+    // ---- feat_status_line: cwd + model status strip ------------------------
+
+    /// feat_status_line: toggle the one-row status strip (workspace cwd ·
+    /// active chat's model) with ^O. Pure VIEW state like [`Focus`] —
+    /// deliberately not a [`Mode`]: it never captures keys, survives every
+    /// modal open/close untouched, and the renderer just reads the flag
+    /// each frame. Default: hidden.
+    pub fn toggle_status_strip(&mut self) {
+        self.status_strip_visible = !self.status_strip_visible;
+    }
+
+    /// feat_status_line: the strip's cwd segment — the BASENAME of the
+    /// workspace root ([`App::workspace_root`], wired from the CLI at
+    /// startup; the TUI knows the root from the request frames / CLI and
+    /// today it never changes at runtime, but the value is read reactively
+    /// here so a future runtime change shows up on the next frame). A
+    /// pathless root (`/`, `.`) or a non-UTF-8 tail degrades to the raw
+    /// string; `None` (only before startup wiring) yields `None` and the
+    /// renderer shows the `—` placeholder.
+    pub fn status_cwd(&self) -> Option<&str> {
+        let root = self.workspace_root.as_deref()?;
+        let path = std::path::Path::new(root);
+        Some(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(root),
+        )
+    }
+
+    /// feat_status_line: the strip's model segment — the LAST KNOWN model
+    /// label of the ACTIVE chat, reusing the feat_agent_model_label
+    /// per-message metadata: the most recent assistant message carrying a
+    /// non-empty label. Deriving it per frame gives the required update
+    /// semantics for free: a result resolution stamps the label onto the
+    /// new message (visible next frame), an error/fieldless resolution
+    /// stamps `None` (the previous label remains "last known"), and
+    /// switching chats re-labels from that chat's own message history.
+    /// Session-scoped exactly like the header labels — never persisted.
+    /// `None` renders as the `—` placeholder.
+    pub fn active_model_label(&self) -> Option<&str> {
+        self.chats
+            .get(self.active)?
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| m.model_label())
     }
 
     /// Create a chat with a fresh UUID thread_id, select it. feat_focus_panes:
@@ -2034,6 +2097,141 @@ mod tests {
         assert!(!msgs[1].pending);
         assert_eq!(msgs[1].markdown, "**done**");
         assert_eq!(msgs[1].model_label(), None);
+    }
+
+    // ---- feat_status_line: strip state + segments --------------------------
+
+    /// Default hidden; ^O flips visibility round-trip.
+    #[test]
+    fn status_strip_starts_hidden_and_toggles_round_trip() {
+        let mut app = app_with_chats(1);
+        assert!(
+            !app.status_strip_visible,
+            "strip must start hidden (task contract)"
+        );
+        app.toggle_status_strip();
+        assert!(app.status_strip_visible);
+        app.toggle_status_strip();
+        assert!(!app.status_strip_visible);
+    }
+
+    /// View state like Focus: opening and closing every modal family must
+    /// leave the visibility flag untouched.
+    #[test]
+    fn status_strip_visibility_survives_modal_open_close() {
+        let mut app = app_with_chats(1);
+        app.toggle_status_strip();
+
+        app.begin_search();
+        assert!(matches!(app.mode, Mode::Searching { .. }));
+        assert!(
+            app.status_strip_visible,
+            "opening the search popup must not hide the strip"
+        );
+        assert!(app.cancel_search());
+        assert!(app.mode.is_normal());
+        assert!(
+            app.status_strip_visible,
+            "closing a modal must not reset it"
+        );
+
+        app.begin_delete_confirm();
+        assert!(matches!(app.mode, Mode::ConfirmDelete));
+        assert!(app.status_strip_visible);
+        assert!(app.cancel_delete());
+        assert!(app.status_strip_visible);
+
+        app.begin_log_viewer();
+        assert!(matches!(app.mode, Mode::LogViewer { .. }));
+        assert!(app.status_strip_visible);
+        assert!(app.close_log_viewer());
+        assert!(app.status_strip_visible, "log viewer close must keep it");
+    }
+
+    /// The cwd segment is the workspace root's BASENAME (long paths must not
+    /// leak into the strip); pathless roots degrade to the raw string.
+    #[test]
+    fn status_cwd_is_the_workspace_basename() {
+        let mut app = app_with_chats(1);
+        assert_eq!(app.status_cwd(), None, "unwired root yields None");
+
+        app.workspace_root = Some("/Users/sergio/Develop/personal/chibi-tui".into());
+        assert_eq!(app.status_cwd(), Some("chibi-tui"));
+
+        app.workspace_root = Some("/Users/sergio/Develop/".into());
+        assert_eq!(
+            app.status_cwd(),
+            Some("Develop"),
+            "trailing slash tolerated"
+        );
+
+        app.workspace_root = Some("/".into());
+        assert_eq!(app.status_cwd(), Some("/"), "pathless root degrades to raw");
+
+        app.workspace_root = Some(".".into());
+        assert_eq!(app.status_cwd(), Some("."));
+    }
+
+    /// Model segment: `None` until a labelled result resolves, then the
+    /// newest label wins (per-message metadata reused, not a cached field).
+    #[test]
+    fn active_model_label_appears_on_result_resolution_and_updates() {
+        let mut app = app_with_chats(1);
+        assert_eq!(app.active_model_label(), None, "no label before any result");
+
+        submit_text(&mut app, "first");
+        finish_chat_with_model(&mut app, 0, Some("glm-5.2"));
+        assert_eq!(app.active_model_label(), Some("glm-5.2"));
+
+        submit_text(&mut app, "second");
+        finish_chat_with_model(&mut app, 0, Some("kimi-k2.7"));
+        assert_eq!(
+            app.active_model_label(),
+            Some("kimi-k2.7"),
+            "each result resolution updates the label"
+        );
+    }
+
+    /// An error resolution carries no model — the LAST KNOWN label of the
+    /// chat must survive it (rendered as the strip's model afterwards).
+    #[test]
+    fn error_resolution_keeps_last_known_model_label() {
+        let mut app = app_with_chats(1);
+        submit_text(&mut app, "good");
+        finish_chat_with_model(&mut app, 0, Some("glm-5.2"));
+
+        let submitted = submit_text(&mut app, "boom");
+        app.apply_backend_event(BackendEvent::Error {
+            request_id: event_id_of(&submitted.request_id),
+            message: "backend exploded".into(),
+            thread_id: Some(app.chats[0].id.clone()),
+        });
+        assert_eq!(
+            app.active_model_label(),
+            Some("glm-5.2"),
+            "error resolution must not clear the last known label"
+        );
+    }
+
+    /// Switching chats re-labels from THAT chat's last-known model — both
+    /// chats' labels stay independent.
+    #[test]
+    fn switching_chats_relabels_from_that_chats_last_model() {
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "chat0");
+        finish_chat_with_model(&mut app, 0, Some("glm-5.2"));
+
+        app.select_next();
+        submit_text(&mut app, "chat1");
+        finish_chat_with_model(&mut app, 1, Some("kimi-k2.7"));
+
+        assert_eq!(app.active_model_label(), Some("kimi-k2.7"));
+        app.select_prev();
+        assert_eq!(
+            app.active_model_label(),
+            Some("glm-5.2"),
+            "switching back must re-label from chat 0's own last model"
+        );
     }
 
     // ---- fix_ack_silent_absorb: invisible ACK / blank answers --------------

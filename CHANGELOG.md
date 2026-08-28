@@ -7,6 +7,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Status strip (`Ctrl+O`): a hideable dim one-row `cwd: <workspace> · <model>`
+  readout on the chat header's top border — right-aligned, zero vertical cost,
+  truncated with an ellipsis on narrow terminals, hidden by default. The model
+  segment reuses the per-message model metadata (updates on result resolution,
+  per-chat across switches, `—` placeholder when unknown); the workspace cwd is
+  the `--workspace` basename. Hints bar gained the permanent `^O info` token at
+  a net-zero width change (`^D del`/`^T panel` compacted to bare `^D`/`^T`), so
+  the 120-column contract with the longest status label still holds. Designed
+  to extend with a context-size segment once the protocol reports real usage.
 - Model label in the assistant header: when the backend's `result` frame
   carries the optional `model`/`provider` fields, the answer's header renders
   as `● Chibi (model)` with a dim parenthetical (model preferred, provider as

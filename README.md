@@ -96,6 +96,7 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+F` | Find in the current thread (type to filter, `↑`/`↓` navigate matches, `Enter` jump to match, `Esc` close) |
 | `Ctrl+Shift+F` | Find in ALL threads (global search; same popup family with thread-title labels and total counts; `Enter` switches to the match's thread and jumps; requires the kitty keyboard protocol) |
 | `Ctrl+G` | Open the diagnostics log viewer (backend stderr + TUI lifecycle events; `PgUp`/`PgDn` or `↑`/`↓` scroll, `Esc` close — see the Diagnostics section) |
+| `Ctrl+O` | Toggle the status strip — a dim one-row `cwd: <workspace> · <model>` readout on the chat header's top border (hidden by default; see the Status strip section) |
 | `Enter` | Send message (or queue it while this chat is busy) |
 | `⇧↵` / `⌥↵` | Insert a newline into the input (multi-line prompts) |
 | `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
@@ -172,7 +173,8 @@ While the **Sidebar** holds focus:
   which pane holds focus.
 - global service chords stay live: `^N` (new chat — then focus lands on
   Chat), `^R` rename, `^D` delete (still refused while busy), `^F` /
-  `Ctrl+Shift+F` search popups, `^L` clear screen, `^C` cancel/quit.
+  `Ctrl+Shift+F` search popups, `^G` log viewer, `^O` status strip, `^L`
+  clear screen, `^C` cancel/quit.
 
 The focused sidebar signals itself through the theme only: its divider and
 `Chats` title lift to a brighter accent and the idle dot column brightens;
@@ -289,6 +291,32 @@ holds focus):
   The backend's loguru logging currently writes to its **stdout** (the
   protocol channel), so backend log lines do not appear here; the
   backend-side log sink fix is a separate backend task.
+
+### Status strip
+
+A hideable one-row readout on the **chat header's top border**, toggled with
+**`Ctrl+O`** (also works while the Sidebar pane holds focus). **Hidden by
+default**; the toggle state is plain view state — it survives every modal
+open/close and never captures keys.
+
+- **Content** — `cwd: <workspace> · <model>`:
+  - `cwd` is the **basename of the workspace root** (the `--workspace` value
+    the TUI passes to the backend; CLI-only today, read reactively so a
+    future runtime change would show up on the next frame).
+  - `model` is the **last known model of the active chat**, reusing the same
+    per-message metadata as the `● Chibi (model)` answer headers: it updates
+    on every result resolution, an error resolution keeps the last known
+    label, and switching chats re-labels from that chat's own history. Both
+    segments render a `—` placeholder when unknown. Model labels are
+    session-scoped — restored history shows `—` again.
+- **Placement** — the strip rides the SAME top-border row as the chat title
+  (`#1/4 · JSONL protocol`), right-aligned: it costs **zero vertical space**.
+  On narrow terminals it is truncated with an ellipsis to the space left of
+  the title, and in a too-narrow chat pane it simply does not render.
+- **Styling** — dim (theme-driven), deliberately quiet: context, not content.
+- **Extensible** — the planned context-size segment (once the protocol
+  reports real usage) will extend the same readout; a local approximation
+  was rejected as dishonest.
 
 ## Configuration & Data
 
