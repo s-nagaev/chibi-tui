@@ -1,0 +1,143 @@
+name: Release
+
+# Release binaries: build per-platform archives, attach them (+ SHA256SUMS.txt)
+# to the published GitHub Release. workflow_dispatch acts as a smoke path —
+# artifacts are produced and summarized, but nothing is attached to a release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: "Release: ${{ matrix.leg }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 for broader glibc compatibility of the produced binary.
+          - leg: linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            checksum_cmd: sha256sum
+          - leg: macos-arm
+            os: macos-latest
+            target: aarch64-apple-darwin
+            # macOS has no GNU sha256sum binary.
+            checksum_cmd: shasum -a 256
+          # Intel macOS binary is cross-compiled on the ARM runner:
+          # the Xcode/Apple SDK toolchain links both architectures.
+          - leg: macos-intel
+            os: macos-latest
+            target: x86_64-apple-darwin
+            checksum_cmd: shasum -a 256
+          - leg: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          RAW_TAG="${{ github.event.release.tag_name || github.ref_name }}"
+          VERSION="${RAW_TAG#v}"
+          # Sane fallback for non-tag refs (e.g. workflow_dispatch on a branch).
+          if [[ -z "$VERSION" || "$VERSION" == */* ]]; then
+            VERSION="0.0.0-dev-${GITHUB_SHA:0:7}"
+          fi
+          ARCHIVE="chibi-tui-${VERSION}-${{ matrix.target }}.tar.gz"
+          STAGE="pkg/chibi-tui-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/chibi-tui" "$STAGE/chibi-tui"
+          cp README.md LICENSE "$STAGE/"
+          tar -C "$STAGE" -czf "$ARCHIVE" chibi-tui README.md LICENSE
+          ${{ matrix.checksum_cmd }} "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rawTag = "${{ github.event.release.tag_name || github.ref_name }}"
+          $version = $rawTag -replace '^v', ''
+          # Sane fallback for non-tag refs (e.g. workflow_dispatch on a branch).
+          if ([string]::IsNullOrEmpty($version) -or $version -match '/') {
+            $version = "0.0.0-dev-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          $archive = "chibi-tui-$version-${{ matrix.target }}.zip"
+          $stage = "pkg/chibi-tui-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/chibi-tui.exe" -Destination "$stage/chibi-tui.exe"
+          Copy-Item README.md -Destination $stage
+          Copy-Item LICENSE -Destination $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$hash  $archive" | Set-Content -Path "$archive.sha256"
+
+      - name: Upload per-leg artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: chibi-tui-*
+          if-no-files-found: error
+
+  finalize:
+    name: "Release: Finalize"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download per-leg artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS.txt
+        run: |
+          cd dist
+          # Per-leg .sha256 files already contain "<sha256>  <archive-filename>".
+          # sed strips a trailing CR (Windows pwsh writes CRLF) so every line is
+          # strictly "<sha256>  <archive-filename>".
+          sed 's/\r$//' ./*.sha256 > SHA256SUMS.txt
+          {
+            echo "### SHA256SUMS.txt"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+
+      - name: Dispatch smoke summary (no attach)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "workflow_dispatch run — artifacts built, nothing attached to a release."
+          ls -la dist
