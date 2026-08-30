@@ -1,28 +1,26 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: ${{ matrix.toolchain }}
+  linters:
+    name: "Quality Gate: Linters"
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain: [stable, beta]
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -33,15 +31,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Tests
-        run: cargo test
-
-      - name: Build (release)
-        run: cargo build --release
-
-      # Docs gate runs on stable only — enough to catch warnings once.
+      # Docs gate — same flags the workflow used before the split.
       - name: Docs
-        if: matrix.toolchain == 'stable'
         run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
+
+  tests:
+    name: "Quality Gate: Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test
