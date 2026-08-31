@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 
 use chibi_tui::app::{Connection, Focus, Mode, ReconnectRequest};
 use chibi_tui::backend::{Backend, BackendEvent};
-use chibi_tui::{history, mock, splash, theme, ui};
+use chibi_tui::{history, mock, setup_screen, splash, theme, ui};
 
 /// Command-line interface.
 #[derive(Debug, Parser)]
@@ -115,7 +115,9 @@ async fn main() -> io::Result<()> {
     // Mock mode keeps its canned demo chats. Live mode restores persisted
     // history (or starts a single fresh chat on first run). A failed initial
     // connect no longer aborts the app: it starts disconnected with an error
-    // popup and can be recovered with `R`.
+    // popup and can be recovered with `R`. A missing backend binary on a
+    // clean machine instead gets the dedicated setup screen, with install
+    // commands and a retry key.
     let restore_dir = cli.history_dir.clone();
     let mut app;
     let mut source = if cli.mock {
@@ -130,15 +132,35 @@ async fn main() -> io::Result<()> {
             }
             chats
         });
-        match chibi_tui::LiveBackend::connect(&cli.workspace).await {
-            Ok(live) => {
-                app.connection = Connection::Connected;
-                Source::Live(live)
-            }
-            Err(e) => {
-                app.connection = Connection::Disconnected;
-                app.show_error(format!("{e}\n(hint: use --mock for the offline demo mode)"));
-                Source::LivePlaceholder
+        // Missing-backend setup screen loop: it runs before the main event
+        // loop exists, so a retry (`r` on the screen) is just another
+        // connect attempt. A quit from the screen leaves the app cleanly.
+        loop {
+            match chibi_tui::LiveBackend::connect(&cli.workspace).await {
+                Ok(live) => {
+                    app.connection = Connection::Connected;
+                    break Source::Live(live);
+                }
+                Err(e) => {
+                    // Spawn failure with no explicit binary override means
+                    // the default `chibi` is simply absent: show the
+                    // dedicated setup screen instead of the generic popup.
+                    // Everything else (a broken custom binary, handshake
+                    // problems) keeps the old path below.
+                    let override_set = std::env::var_os("CHIBI_BACKEND_BIN");
+                    if setup_screen::applies(&e, override_set.as_deref()) {
+                        let mut reader = EventStream::new();
+                        let flow = setup_screen::run(&mut terminal, &mut reader, &theme).await?;
+                        drop(reader);
+                        if flow == setup_screen::Flow::Quit {
+                            return Ok(()); // user quit from the setup screen
+                        }
+                        continue; // r: re-attempt the spawn
+                    }
+                    app.connection = Connection::Disconnected;
+                    app.show_error(format!("{e}\n(hint: use --mock for the offline demo mode)"));
+                    break Source::LivePlaceholder;
+                }
             }
         }
     };

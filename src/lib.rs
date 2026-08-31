@@ -23,6 +23,7 @@ pub mod model_picker;
 pub mod popup;
 pub mod protocol;
 pub mod request_pipeline;
+pub mod setup_screen;
 pub mod splash;
 pub mod theme;
 pub mod ui;

@@ -601,6 +601,22 @@ mod tests {
         assert!(matches!(err, BackendError::Spawn { .. }), "got: {err:?}");
     }
 
+    #[tokio::test]
+    async fn existing_but_failing_binary_is_not_a_spawn_error() {
+        // A shell that exits 1 right away execs fine: the failure surfaces
+        // as an exit status, never as `Spawn`. The setup screen keys off
+        // `Spawn` only, so it stays away from this case.
+        let mut client = match BackendClient::spawn_script("exit 1").await {
+            Ok(c) => c,
+            Err(e) => panic!("`sh -c 'exit 1'` must spawn, got: {e:?}"),
+        };
+        let err = match client.handshake().await {
+            Err(e) => e,
+            Ok(_) => panic!("`sh -c 'exit 1'` must fail the handshake"),
+        };
+        assert!(!matches!(err, BackendError::Spawn { .. }), "got: {err:?}");
+    }
+
     // --- handshake -----------------------------------------------------------
 
     #[tokio::test]
