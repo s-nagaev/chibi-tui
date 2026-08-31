@@ -578,9 +578,9 @@ impl App {
     pub fn active_model_label(&self) -> Option<&str> {
         let chat = self.chats.get(self.active)?;
         // feat_model_picker_lite: a hidden `/model <n>` switch updates the
-        // last-known model WITHOUT a transcript bubble — the staged override
-        // shadows the message-derived label until the chat's next visible
-        // reply stamps its own (and retires the override).
+        // last-known model WITHOUT a transcript bubble. The staged override
+        // shadows the message-derived label until the next visible reply of
+        // the chat stamps its own label (and retires the override).
         if let Some(label) = self.picker_model_labels.get(&chat.id) {
             return Some(label);
         }
@@ -629,9 +629,9 @@ impl App {
     pub fn rename_buf(&self) -> Option<&str> {
         match &self.mode {
             Mode::Renaming { buf } => Some(buf.as_str()),
-            // The delete-confirm popup, the search popups and the log
-            // viewer have no draft of their own (search queries live in
-            // their own state).
+            // The delete-confirm popup, the search popups and the log viewer
+            // have no draft of their own (search queries live in
+            // a seperate state).
             Mode::Normal
             | Mode::ConfirmDelete
             | Mode::Searching { .. }
@@ -675,7 +675,7 @@ impl App {
     pub fn commit_rename(&mut self) -> bool {
         let trimmed = match &self.mode {
             Mode::Renaming { buf } => buf.trim().to_owned(),
-            // Not renaming (Normal, any popup — delete-confirm, search, log
+            // Not renaming (Normal, any popup: delete-confirm, search, log
             // viewer): no-op.
             Mode::Normal
             | Mode::ConfirmDelete
@@ -983,7 +983,7 @@ impl App {
             Some((chat_index, message_index, line_index, col)) if chat_index < self.chats.len() => {
                 // Activate the target thread exactly like Ctrl+↑/↓: index
                 // set + scroll reset to follow-bottom (the jump math in
-                // render_chat then overrides scroll with the match's row).
+                // render_chat then overrides the scroll with the match's row).
                 self.active = chat_index;
                 self.scroll = 0;
                 self.pending_global_search_jump =
@@ -1532,7 +1532,7 @@ impl App {
         }
         self.mode = Mode::Normal;
         // feat_focus_panes: modal closed → editor pane (even into the
-        // clean empty state — focus is pane-level state, not selection).
+        // clean empty state; focus is pane-level state, not selection).
         self.focus = Focus::Chat;
         let chat = self.chats.get(self.active)?;
         let removed_id = chat.id.clone();
@@ -1544,8 +1544,8 @@ impl App {
             // Removed the LAST chat: the previous one slides into focus.
             self.active = self.chats.len() - 1;
         }
-        // Removed a first/middle chat: `active` already points at the chat
-        // that shifted into the slot (the old NEXT neighbour).
+        // Removed a first/middle chat: `active` already points at
+        // the chat, that shifted into the slot (the old NEXT neighbour).
         self.scroll = 0; // follow-bottom for the newly selected chat
         self.pending_delete = Some(removed_id.clone());
         Some(removed_id)
@@ -1672,7 +1672,7 @@ impl App {
                         None => {
                             // feat_model_picker_lite: a visible reply that
                             // stamps its OWN model label retires any
-                            // hidden-switch override — the message-derived
+                            // hidden-switch override: the message-derived
                             // label is the fresher truth again. Fieldless /
                             // ACK resolutions keep the override (no signal
                             // that the model reverted).
@@ -1686,7 +1686,7 @@ impl App {
                             if is_invisible_result(&markdown) {
                                 // fix_ack_silent_absorb: an empty or pure-ACK answer is
                                 // a protocol-level acknowledgement, not a user-facing
-                                // reply — absorb it invisibly. The pending placeholder
+                                // reply; absorb it invisibly. The pending placeholder
                                 // is dropped (no empty bubble), the lifecycle resolves
                                 // to Idle so the active-chat spinner stops cleanly and
                                 // re-arms on the next prompt, and NO error/toast fires.
@@ -1712,7 +1712,7 @@ impl App {
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
                     // feat_model_picker_lite: hidden exchanges respect
-                    // cancel/errors through the error-popup path — there is
+                    // cancel/errors through the error-popup path: there is
                     // no pending placeholder to resolve inline, so the modal
                     // popup (with its `R` reconnect escape) IS the honest
                     // surface. The picker, if still open, closes with it.

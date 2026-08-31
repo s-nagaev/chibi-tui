@@ -1,8 +1,9 @@
 name: Release
 
-# Release binaries: build per-platform archives, attach them (+ SHA256SUMS.txt)
-# to the published GitHub Release. workflow_dispatch acts as a smoke path —
-# artifacts are produced and summarized, but nothing is attached to a release.
+# Release: build per-platform binary archives and attach them (+ SHA256SUMS.txt)
+# to the published GitHub Release, then publish the crate to crates.io.
+# workflow_dispatch acts as a smoke path — artifacts are produced and
+# summarized, but nothing is attached to a release and nothing is published.
 
 on:
   release:
@@ -141,3 +142,77 @@ jobs:
         run: |
           echo "workflow_dispatch run — artifacts built, nothing attached to a release."
           ls -la dist
+
+  publish:
+    name: "Release: Publish to crates.io"
+    # Publish only on a real release; a manual workflow_dispatch run is a smoke
+    # path and never touches crates.io.
+    if: github.event_name == 'release'
+    # All 4 build legs (the `build` matrix) plus the finalize job must have
+    # succeeded: publish only when the whole release pipeline is green.
+    needs: [build, finalize]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ci.yml gates may never have run for the tagged commit (tags skip
+      # branch-push/PR triggers) — re-verify before anything touches crates.io.
+      # First guard the tag/manifest version match, then the crates.io
+      # idempotency check (a plain rerun of cargo publish hard-fails with
+      # "already uploaded").
+      - name: Version + idempotency guards
+        id: guard
+        run: |
+          RAW_TAG="${{ github.event.release.tag_name }}"
+          VERSION="${RAW_TAG#v}"
+          MANIFEST_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "chibi-tui") | .version')"
+          if [[ -z "$MANIFEST_VERSION" ]]; then
+            echo "::error::Could not read the chibi-tui version from Cargo.toml (cargo metadata failed)."
+            exit 1
+          fi
+          if [[ "$VERSION" != "$MANIFEST_VERSION" ]]; then
+            echo "::error::Tag/manifest version drift: release tag '${RAW_TAG}' implies version '${VERSION}', but Cargo.toml declares '${MANIFEST_VERSION}'. Align them and re-create the release."
+            exit 1
+          fi
+
+          # Skip publishing when this exact version is already on crates.io.
+          CRATE_JSON="$(curl -fsSL \
+            -H 'User-Agent: chibi-tui-release-ci (github.com/s-nagaev/chibi-tui)' \
+            https://crates.io/api/v1/crates/chibi-tui)" || CRATE_JSON=""
+          if [[ -z "$CRATE_JSON" ]]; then
+            echo "No existing chibi-tui crate on crates.io (or the API was unreachable) — will publish ${VERSION}."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          MAX_VERSION="$(printf '%s' "$CRATE_JSON" | jq -r '.crate.max_version // ""')"
+          MAX_STABLE="$(printf '%s' "$CRATE_JSON" | jq -r '.crate.max_stable_version // ""')"
+          # Membership check covers re-runs where the tag version is no longer
+          # the crate's max (a newer version shipped in between — cargo publish
+          # would still hard-fail with "already uploaded").
+          EXISTS="$(printf '%s' "$CRATE_JSON" | jq -r --arg v "$VERSION" 'any(.versions[]?; .num == $v)')"
+          if [[ "$MAX_VERSION" == "$VERSION" || "$MAX_STABLE" == "$VERSION" || "$EXISTS" == "true" ]]; then
+            echo "already published, skipping (crates.io max_version=${MAX_VERSION}, max_stable_version=${MAX_STABLE}; tag implies ${VERSION})"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "crates.io max_version=${MAX_VERSION} != tag version ${VERSION} — will publish."
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Tests (quality re-verification)
+        if: steps.guard.outputs.skip != 'true'
+        run: cargo test --locked
+
+      - name: Package
+        if: steps.guard.outputs.skip != 'true'
+        run: cargo package --locked
+
+      - name: Publish
+        if: steps.guard.outputs.skip != 'true'
+        # Token reaches cargo via the environment only — never argv, never logs.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

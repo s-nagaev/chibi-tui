@@ -241,7 +241,7 @@ async fn run_loop(
     loop {
         // Resize events force a full repaint of the next frame anyway; the
         // layout (sidebar width, code panels) adapts purely from the new
-        // frame size — no cached geometry anywhere in the render path.
+        // frame size. There is no cached geometry anywhere in the render path.
         terminal.draw(|f| ui::draw(f, &mut app, theme))?;
 
         tokio::select! {
@@ -253,8 +253,8 @@ async fn run_loop(
                             // feat_rename_thread: snapshot BEFORE the key
                             // lands so the loop can tell a rename commit
                             // (Renaming --Enter--> Normal) apart from a plain
-                            // message submission. NOTE: rename detection uses
-                            // `matches!(.. Renaming)` — NOT `!is_normal()` —
+                            // message submission. Rename detection uses
+                            // `matches!(.. Renaming)`, NOT `!is_normal()`,
                             // because the delete-confirm popup (feat_thread_
                             // delete) also leaves Normal mode, and its Enter
                             // is a deletion, never a rename.
@@ -263,13 +263,13 @@ async fn run_loop(
                             let was_confirming_delete =
                                 matches!(app.mode, Mode::ConfirmDelete);
                             // feat_search_thread: snapshot BEFORE the key
-                            // lands too — the search popup's Enter jumps and
+                            // lands too. The search popup's Enter jumps and
                             // closes, so by the time the loop runs the mode
                             // is already Normal again; only the snapshot can
                             // tell that Enter apart from a plain submit.
                             let was_searching = matches!(app.mode, Mode::Searching { .. });
                             // feat_search_all_threads: same snapshot for the
-                            // GLOBAL search popup — its Enter activates the
+                            // GLOBAL search popup: its Enter activates the
                             // match's thread AND closes the popup, so the
                             // loop must know that Enter belonged to it.
                             let was_searching_all =
@@ -277,11 +277,11 @@ async fn run_loop(
                             // feat_focus_panes: snapshot of the SIDEBAR-focus
                             // flag. Bare Enter while the sidebar holds focus
                             // means "apply & return to the editor" (handle_key
-                            // flips focus back) — it must never also submit
+                            // flips focus back), so it must never also submit
                             // the message draft the editor still holds.
                             let was_sidebar_focused = app.focus == Focus::Sidebar;
                             // feat_model_picker_lite: the picker's Enter
-                            // confirms the selected model — it belongs to
+                            // confirms the selected model: it belongs to
                             // the popup, never to message submission.
                             let was_model_picking =
                                 matches!(app.mode, Mode::ModelPicking { .. });
@@ -291,7 +291,7 @@ async fn run_loop(
                             // feat_model_picker_lite: a hidden exchange
                             // staged by the key handlers (`^M` open or
                             // Enter selection) is sent through the SAME
-                            // `send_submitted` path as any prompt — it just
+                            // `send_submitted` path as any prompt; it just
                             // carries its own ids and adds no bubbles.
                             if let Some(hidden) = app.take_picker_submission() {
                                 send_submitted(source, &hidden, event_tx.clone());
@@ -306,28 +306,28 @@ async fn run_loop(
                                 && app.mode.is_normal()
                                 && app.chat_title() != name_before;
                             // ANY Enter pressed inside rename mode belongs to
-                            // the rename editor — never to message submission
+                            // the rename editor, never to message submission
                             // (a rejected save must not leak into the prompt).
                             let enter_consumed_by_rename =
                                 was_renaming && key.code == KeyCode::Enter;
                             // feat_thread_delete: the Enter that confirmed the
-                            // delete popup belongs to the popup too — it must
+                            // delete popup belongs to the popup too, so it must
                             // never submit the message draft to the neighbour.
                             let enter_consumed_by_delete =
                                 was_confirming_delete && key.code == KeyCode::Enter;
                             // feat_search_thread: the Enter that jumped to the
-                            // selected match belongs to the popup too — it
+                            // selected match belongs to the popup too, so it
                             // must never submit the message draft.
                             let enter_consumed_by_search =
                                 was_searching && key.code == KeyCode::Enter;
                             // feat_search_all_threads: same gate for the
-                            // global search popup's Enter — it activates the
+                            // global search popup's Enter: it activates the
                             // target thread and must never submit the draft
                             // to that (or any) chat.
                             let enter_consumed_by_search_all =
                                 was_searching_all && key.code == KeyCode::Enter;
                             // feat_focus_panes: the sidebar's bare Enter is
-                            // consumed too — it returns focus to the editor
+                            // consumed too: it returns focus to the editor
                             // pane and never submits.
                             let enter_consumed_by_sidebar =
                                 was_sidebar_focused && key.code == KeyCode::Enter;
@@ -391,20 +391,20 @@ async fn run_loop(
                             // and returned None). Other chats are never blocked.
                             //
                             // feat_rename_thread: a rename commit takes priority
-                            // over submission — its Enter was consumed by the
+                            // over submission: its Enter was consumed by the
                             // editor, and the renamed chat is persisted here so
                             // the new title survives restarts.
                             if renamed {
                                 // The chat exists by construction here (a
                                 // rename commit cannot delete it), but guard
-                                // anyway — `active` may point nowhere after a
+                                // anyway, because `active` may point nowhere after a
                                 // delete-into-empty-state.
                                 if let Some(chat) = app.chats.get(app.active) {
                                     persist_chat(chat, history_dir);
                                 }
                             } else if enter_consumed_by_rename {
                                 // Rejected rename save (empty draft): nothing
-                                // to do — old name kept, nothing persisted.
+                                // to do: old name kept, nothing persisted.
                             } else if app.error_popup.is_none()
                                 && source.accepts_submissions()
                                 && should_submit(&key)
@@ -428,7 +428,7 @@ async fn run_loop(
                             }
 
                             // bugfix_ctrl_l_screen_clear: ^L wipes the VISIBLE
-                            // screen. Crossterm's Clear(All) is emitted HERE —
+                            // screen. Crossterm's Clear(All) is emitted HERE,
                             // outside ratatui's diff-based draw; Terminal::
                             // clear() also resets ratatui's cached back buffer,
                             // so the immediately-following draw repaints every
@@ -456,7 +456,7 @@ async fn run_loop(
             // ---- backend events ----
             Some(evt) = event_rx.recv() => {
                 // Per-thread async: after a chat's terminal event, start its
-                // next queued prompt (FIFO) — including for background chats.
+                // next queued prompt (FIFO), including for background chats.
                 let drain_thread_id = match &evt {
                     BackendEvent::QueueDrain { thread_id } => Some(thread_id.clone()),
                     _ => None,
@@ -467,7 +467,7 @@ async fn run_loop(
                     }
                     // feat_model_picker_lite: after the visible FIFO had its
                     // chance, hand out the next parked HIDDEN request for
-                    // the same thread — only when the chat stayed Idle (a
+                    // the same thread: only when the chat stayed Idle (a
                     // just-started visible prompt keeps it parked for the
                     // next drain).
                     if let Some(hidden) = app.take_deferred_hidden_request(&thread_id) {
@@ -526,7 +526,7 @@ fn send_submitted(
         Source::Mock(mock_backend) => mock_backend.submit(submitted.prompt.clone(), tx),
         Source::LivePlaceholder => {
             // Guarded by `accepts_submissions()` upstream; a drain racing a
-            // disconnect must not panic — surface it as a chat error instead.
+            // disconnect must not panic; surface it as a chat error instead.
             let _ = tx.try_send(BackendEvent::Error {
                 request_id: 0,
                 message: "backend is offline; prompt not sent".to_owned(),
@@ -611,7 +611,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // the popup branch returns before any mode handling.)
     if app.error_popup.is_some() {
         match key.code {
-            // Reconnect request — executed by the event loop.
+            // Reconnect request: executed by the event loop.
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 app.reconnect_requested = Some(ReconnectRequest {});
             }
@@ -627,10 +627,10 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // ---- feat_stderr_log_modal: diagnostics log viewer modal ----
     //
     // While the ^G log viewer is open, ONLY viewer keys work: PgUp/PgDn (and
-    // ↑/↓) scroll — PgUp/↑ detach from the live tail, PgDn/↓ return towards
-    // it (reaching the bottom re-arms live-tail) —, Esc closes, Ctrl+C quits
-    // (same class as the other popups). Everything else — typing, global
-    // chords (^N/^R/^D/^T/^L/^F), thread switching — is swallowed so no
+    // ↑/↓) scroll. PgUp/↑ detach from the live tail, PgDn/↓ return towards
+    // it (reaching the bottom re-arms live-tail), Esc closes, Ctrl+C quits
+    // (same class as the other popups). Everything else (typing, global
+    // chords (^N/^R/^D/^T/^L/^F), thread switching) is swallowed so no
     // keystroke leaks into the textarea and no global binding fires. There
     // is no Enter action: the viewer is strictly read-only, so Enter is
     // swallowed and the loop's submit gates need no extra snapshot flag.
@@ -654,11 +654,11 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     //
     // While the ^M picker is open, ONLY picker keys work: ↑/↓ move the
     // selection (clamped at the list edges), Enter confirms the highlighted
-    // row (stages the hidden `/model <n>` request — a no-op until the
+    // row (stages the hidden `/model <n>` request, a no-op until the
     // listing arrives), Esc closes without acting (a parked fetch is
     // dropped; an already-confirmed selection stays queued), Ctrl+C quits
-    // (same class as the other popups). Everything else — typing, global
-    // chords (^N/^R/^D/^T/^L/^F/^G/^O), thread switching — is swallowed so
+    // (same class as the other popups). Everything else (typing, global
+    // chords (^N/^R/^D/^T/^L/^F/^G/^O), thread switching) is swallowed so
     // no keystroke leaks into the textarea and no global binding fires.
     // There is no text input here: the listing is short enough to navigate
     // directly (task scope). The picker's Enter is additionally gated in the
@@ -682,8 +682,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     //
     // While the Ctrl+D confirmation is open, ONLY the destructive decision
     // keys work: Enter/`y` confirm, Esc/`n` cancel, Ctrl+C quits (same
-    // class as the error popup's Ctrl+C). Everything else — typing, arrows,
-    // Ctrl+N/R/L/F — is swallowed so no keystroke leaks into the textarea
+    // class as the error popup's Ctrl+C). Everything else (typing, arrows,
+    // Ctrl+N/R/L/F) is swallowed so no keystroke leaks into the textarea
     // and no global binding fires. `q` is deliberately left UNBOUND here
     // (unlike the error popup): a stray `q` must never quit while a
     // destructive confirmation is on screen.
@@ -699,7 +699,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Esc => {
                 app.cancel_delete();
             }
-            // Plain n/N cancel (Ctrl+N stays suspended — new-chat must not
+            // Plain n/N cancel (Ctrl+N stays suspended: new-chat must not
             // fire and must not cancel the popup either).
             KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
                 app.cancel_delete();
@@ -716,7 +716,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // chars edit the query (live recompute), Backspace edits backwards,
     // ↑/↓ navigate matches, Enter jumps to the selected match and closes,
     // Esc closes without jumping, Ctrl+C quits (same class as the other
-    // popups). Everything else — PgUp/PgDn, arrows, Ctrl+N/R/L/D, q — is
+    // popups). Everything else (PgUp/PgDn, arrows, Ctrl+N/R/L/D, q) is
     // swallowed so no keystroke leaks into the textarea and no global
     // binding fires. Chat scroll is driven ONLY by the jump, never by
     // PgUp/PgDn while the popup is open.
@@ -743,9 +743,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     //
     // Same modal-ish isolation as the in-thread search popup: while the
     // Ctrl+Shift+F popup is open, ONLY search keys work. The one behavioral
-    // difference is Enter — it ACTIVATES the match's thread (switching the
+    // difference is Enter: it ACTIVATES the match's thread (switching the
     // active chat, same mechanics as Ctrl+↑/↓) before recording the jump.
-    // Everything else — PgUp/PgDn, arrows, Ctrl+N/R/L/D/F — is swallowed so
+    // Everything else (PgUp/PgDn, arrows, Ctrl+N/R/L/D/F) is swallowed so
     // no keystroke leaks into the textarea and no global binding fires.
     if matches!(app.mode, Mode::SearchingAll { .. }) {
         match key.code {
@@ -767,7 +767,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
 
     // ---- global quit / cancel semantics ----
     //
-    // Ctrl+C cancels the in-flight request when one exists, otherwise quits —
+    // Ctrl+C cancels the in-flight request when one exists, otherwise quits,
     // in EVERY mode (an open rename session does not trap Ctrl+C; it cancels
     // the draft implicitly via the normal quit/cancel path).
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
@@ -816,7 +816,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             }
             KeyCode::Backspace => app.rename_backspace(),
             KeyCode::Up | KeyCode::Down => {
-                // Thread navigation stays blocked mid-rename — in ALL
+                // Thread navigation stays blocked mid-rename, in ALL
                 // modifier flavors (feat_ctrl_arrows_nav + feat_alt_arrows_
                 // nav: Ctrl+↑/↓ AND Alt+↑/↓ switch threads in Normal mode,
                 // but never under an open editor; plain ↑/↓ are consumed by
@@ -844,17 +844,17 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // While the sidebar holds focus ONLY navigation + service keys work;
     // everything else is swallowed so no keystroke can ever leak into the
     // prompt textarea (Shift+Enter / Alt+Enter newlines, readline edits,
-    // paste — all included). This branch sits AFTER the modal popup and
+    // paste, all included). This branch sits AFTER the modal popup and
     // rename branches (those always capture first) and BEFORE the editor
     // fall-through:
     //
-    // * ↑/↓ move the selection with LIVE active-chat switching — the same
+    // * ↑/↓ move the selection with LIVE active-chat switching: the same
     //   clamp + follow-bottom mechanics as Ctrl+↑/↓ in Normal mode; every
     //   arrow flavor routes here identically.
     // * bare Enter applies and returns focus to Chat (active chat stays
     //   highlighted; the event loop suppresses submission for it via
     //   `enter_consumed_by_sidebar`); Esc returns WITHOUT touching the
-    //   draft — deliberately different from Normal-mode Esc (clears input).
+    //   draft, deliberately different from Normal-mode Esc (clears input).
     // * PgUp/PgDn STILL scroll the CHAT pane: reading works regardless of
     //   focus (documented choice).
     // * Global service chords stay live with their exact Normal-mode
@@ -897,7 +897,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // modifier flavors behave identically here).
             KeyCode::Up => app.select_prev(),
             KeyCode::Down => app.select_next(),
-            // Apply & return to the editor — no submit side effect.
+            // Apply & return to the editor, with no submit side effect.
             KeyCode::Enter if key.modifiers.is_empty() => app.focus = Focus::Chat,
             // Return without touching the draft (never clears input).
             KeyCode::Esc => app.focus = Focus::Chat,
@@ -923,7 +923,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // Readline `^L` kept clearing the input, but in a chat TUI the
             // hint bar's `^L clear` reads as "wipe the visible screen"
             // (bugfix_ctrl_l_screen_clear). Both now: input is still cleared,
-            // and a one-shot wipe intent is recorded for the event loop —
+            // and a one-shot wipe intent is recorded for the event loop:
             // the real crossterm Clear(All) + full repaint is emitted there,
             // outside ratatui's diff-based draw.
             app.clear_input();
@@ -932,7 +932,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         }
         (KeyCode::Char('u'), true) => {
             // Delete from cursor to start of line. tui-textarea maps Ctrl+U
-            // to undo, which surprises readline users — override it here.
+            // to undo, which surprises readline users. Override it here.
             app.input.delete_line_by_head();
             return;
         }
@@ -943,7 +943,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         }
         // Ctrl+D: delete the active thread (idle only) via the confirm
         // popup. Busy/queued chats are refused with a status toast inside
-        // App::begin_delete_confirm — the popup never opens there.
+        // App::begin_delete_confirm: the popup never opens there.
         (KeyCode::Char('d'), true) => {
             app.begin_delete_confirm();
             return;
@@ -951,7 +951,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // Ctrl+G: open the diagnostics log viewer (feat_stderr_log_modal).
         //
         // Chord verification (feat task discipline, see the executor report
-        // for the full audit): the first-choice ^Y candidate was REJECTED —
+        // for the full audit): the first-choice ^Y candidate was REJECTED:
         // tui-textarea 0.7 maps Ctrl+Y to paste-from-internal-yank (src/
         // textarea.rs:589), and the yank buffer IS populated in this app:
         // our own ^U override calls delete_line_by_head() → delete_piece()
@@ -965,18 +965,18 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             app.begin_log_viewer();
             return;
         }
-        // Ctrl+O: TOGGLE THE STATUS STRIP (feat_status_line) — the dim
+        // Ctrl+O: TOGGLE THE STATUS STRIP (feat_status_line), the dim
         // one-row `cwd: <workspace> · <model>` readout on the chat pane's
         // top border. Hidden by default; pure view state (like ^T's Focus),
         // modals swallow the chord like every other one.
         //
         // Chord verification (feat task discipline, see the executor report
         // for the full audit): ^G was already taken by the log viewer, so
-        // the other task candidate ^O was verified FREE — no app binding
+        // the other task candidate ^O was verified FREE: no app binding
         // anywhere in src/ (only `Char('o')` hits are plain typing), no
         // tui-textarea 0.7 shortcut (its Ctrl table covers a/b/d/e/f/h/j/k/
-        // n/p/r/u/v/w/x/y/<>/[] — no 'o'), not part of this app's readline
-        // family (^A/^E/^U/^K/^W/^Y/^L — GNU readline's operate-and-get-
+        // n/p/r/u/v/w/x/y/<>/[], no 'o'), not part of this app's readline
+        // family (^A/^E/^U/^K/^W/^Y/^L; GNU readline's operate-and-get-
         // next is a shell-side binding that never fires inside the TUI), no
         // macOS system hijack (Mission Control only takes ^arrows), and the
         // legacy tty VDISCARD semantics of ^O are inert under raw mode plus
@@ -985,21 +985,21 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             app.toggle_status_strip();
             return;
         }
-        // Ctrl+M: OPEN THE MODEL PICKER (feat_model_picker_lite) — the
+        // Ctrl+M: OPEN THE MODEL PICKER (feat_model_picker_lite), the
         // centered popup that fetches the bare `/model` listing as a hidden
         // exchange (no transcript bubbles) and switches models by sending
         // `/model <n>` the same hidden way.
         //
         // Chord verification (feat task discipline, see the executor report
         // for the full audit): tui-textarea 0.7 maps Ctrl+M to
-        // insert_newline() (textarea.rs:274-286 — the same arm as Enter),
+        // insert_newline() (textarea.rs:274-286, the same arm as Enter),
         // which this binding deliberately OVERRIDES exactly like the
         // existing ^U undo override: the global match claims the chord and
         // returns before the textarea ever sees it, and no app flow relies
         // on a ^M newline (bare Enter already inserts one). The kitty
         // keyboard protocol pushed at startup (DISAMBIGUATE_ESCAPE_CODES)
         // makes capable terminals deliver ^M as an event distinct from
-        // Enter; on legacy terminals ^M degrades to bare Enter — with a
+        // Enter; on legacy terminals ^M degrades to bare Enter, with a
         // non-empty draft that SUBMITS it (README-documented caveat, same
         // class as the Shift+Enter degradation). No macOS system hijack
         // (Mission Control only takes ^arrows); GNU readline's C-M
@@ -1013,28 +1013,28 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // (feat_search_all_threads). With the kitty keyboard protocol
         // (pushed at startup) Ctrl+Shift+F arrives as Char('f') +
         // CONTROL|SHIFT; on terminals WITHOUT it the Shift modifier is
-        // lost and the chord degrades to plain Ctrl+F (in-thread search) —
+        // lost and the chord degrades to plain Ctrl+F (in-thread search),
         // documented in the README. Guarded inside App::begin_search_all
         // (Normal mode only), so it can never fire over the confirm/rename/
-        // search popups — those branches return before this match runs.
+        // search popups: those branches return before this match runs.
         (KeyCode::Char('f'), true) if key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.begin_search_all();
             return;
         }
         // Ctrl+F: open the in-thread search popup (feat_search_thread).
         // Guarded inside App::begin_search (Normal mode + active chat
-        // only), so this can never fire over the confirm/rename popups —
+        // only), so this can never fire over the confirm/rename popups;
         // those branches return before this match runs.
         (KeyCode::Char('f'), true) => {
             app.begin_search();
             return;
         }
-        // Ctrl+T: TOGGLE PANE FOCUS (feat_focus_panes) — flips the keyboard
+        // Ctrl+T: TOGGLE PANE FOCUS (feat_focus_panes), which flips the keyboard
         // between Chat (editor) and Sidebar. Replaces the old wrap-cycling
         // thread switcher, which live-check feedback rejected ("just moves
         // the selection down"). Deliberately a plain Ctrl+letter chord so it
         // works in ANY terminal. Modal modes swallow this like every other
-        // chord — the error/confirm/search branches and the rename branch
+        // chord: the error/confirm/search branches and the rename branch
         // return before this match runs.
         (KeyCode::Char('t'), true) => {
             app.toggle_focus();
@@ -1053,7 +1053,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     //   App::select_prev/next bounds-clamp the index and reset the chat
     //   scroll to 0; sidebar focus/dot refresh derives from `active` at draw
     //   time, so it follows for free. Alt is a FULL SYNONYM (not a fallback):
-    //   both flavors route to the identical select_prev/select_next call —
+    //   both flavors route to the identical select_prev/select_next call:
     //   zero behavior divergence. Alt exists because macOS Mission Control
     //   hijacks Ctrl+arrows system-wide before they reach the terminal.
     // * Plain ↑ / ↓ move the TEXT CURSOR vertically inside the editor via
@@ -1067,12 +1067,12 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         (KeyCode::Up, true) => app.select_prev(),
         (KeyCode::Down, true) => app.select_next(),
         // Alt+↑/↓ (ctrl unset): same select_prev/next mechanics as the ctrl
-        // flavor above. When BOTH modifiers ride along, the ctrl arm wins —
+        // flavor above. When BOTH modifiers ride along, the ctrl arm wins:
         // identical to pre-alt behavior.
         (KeyCode::Up, false) if alt => app.select_prev(),
         (KeyCode::Down, false) if alt => app.select_next(),
         // Plain (and Shift-decorated) vertical arrows go straight into the
-        // textarea's readline-compatible handler — caret movement only.
+        // textarea's readline-compatible handler: caret movement only.
         // Alt+↑/↓ never reach this arm (the synonym arms above take them).
         (KeyCode::Up | KeyCode::Down, _) => {
             let converted: tui_textarea::Input = key.into();
@@ -1084,13 +1084,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // Non-empty input: clear it.
             app.clear_input();
         }
-        // Esc is ignored when input is empty — it never quits.
+        // Esc is ignored when input is empty; it never quits.
         // Only Ctrl+C quits (idle) or cancels (busy).
         // BARE Enter is swallowed here and submitted by the loop's
         // should_submit() gate; Shift+Enter / Alt+Enter fall through to the
         // textarea as newline inserts. On terminals WITHOUT the kitty
         // keyboard protocol, Shift+Enter arrives as bare Enter bytes and
-        // degrades to submit — documented in the README.
+        // degrades to submit, as documented in the README.
         (KeyCode::Enter, _)
             if key
                 .modifiers

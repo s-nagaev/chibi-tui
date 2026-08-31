@@ -5,7 +5,6 @@ use syntect::highlighting::Theme as SynTheme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // palette fields are consumed incrementally by the UI layer
 pub struct Theme {
     pub bg: Color,
     pub panel: Color,
@@ -63,9 +62,6 @@ pub struct Highlighter {
 impl Highlighter {
     fn new() -> Self {
         let syntaxes = SyntaxSet::load_defaults_nonewlines();
-        // "base16-eighties.dark" ships with syntect's default themes; it is a
-        // well-established dark palette that sits naturally next to the Tokyo
-        // Night accents used everywhere else in this app.
         let defaults = syntect::highlighting::ThemeSet::load_defaults();
         let theme = defaults
             .themes

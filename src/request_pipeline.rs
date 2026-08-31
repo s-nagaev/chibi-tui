@@ -275,7 +275,7 @@ impl RequestPipeline {
             std::env::var("CHIBI_FAKE_BACKEND").unwrap_or_else(|_| "chibi".to_owned());
 
         let mut argv: Vec<std::ffi::OsString> = if script_path == "chibi" {
-            // Real backend: chibi ide --stdio (no extra CLI flags — workspace_root
+            // Real backend: chibi ide --stdio (no extra CLI flags: workspace_root
             // travels inside request frames, not on the command line).
             vec!["chibi".into(), "ide".into(), "--stdio".into()]
         } else {
@@ -439,13 +439,14 @@ async fn actor_loop(
                     dispatch_frame(&mut state, &status_tx, msg).await;
                 }
                 Some(ActorEvent::Died(reason)) => {
-                    // feat_stderr_log_modal: pipe death is a diagnostic
-                    // lifecycle event too — one unified stream with stderr.
+                    // feat_stderr_log_modal: pipe death is a diagnostic lifecycle event too:
+                    // one unified stream with stderr.
                     diag::append_tui(format!("pipe closed: {reason}"));
                     state.broken_pipe(reason);
                 }
-                // The reader is the only event sender: None means it is gone
-                // (child death after shutdown). Nothing to do.
+                // The reader is the only event sender: the task that recieves frames
+                // from the child. None means it is gone (child death after shutdown):
+                // nothing to do.
                 None => {}
             },
         }
@@ -515,7 +516,7 @@ async fn handle_cancel(state: &mut ActorState, request_id: String) -> Result<(),
 /// `Command::Shutdown`: best-effort `shutdown` frame, then reap within
 /// [`SHUTDOWN_BUDGET`]; kill on timeout.
 async fn handle_shutdown(state: &mut ActorState) -> Result<(), BackendError> {
-    // Best effort — the real verdict comes from the exit status below.
+    // Best effort only: the real verdict comes from the exit status below.
     let _ = state.send_frame(&ClientMessage::Shutdown {}).await;
     match state.reaper.take() {
         Some(mut reaper) => match reaper.graceful_reap(SHUTDOWN_BUDGET).await {
@@ -593,7 +594,7 @@ async fn dispatch_frame(
             request_id,
             state: st,
         } => {
-            // BroadcastError just means nobody is subscribed — fine.
+            // BroadcastError just means nobody is subscribed, that is fine.
             let _ = status_tx.send(StatusUpdate {
                 request_id: StatusRequestId(request_id),
                 state: st,

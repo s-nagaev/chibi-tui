@@ -164,7 +164,7 @@ impl BackendClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Never leave orphans behind if we are dropped mid-protocol.
+            // Never leave orphan processes behind if we are dropped in the middle of the protocol.
             .kill_on_drop(true);
 
         let mut child = command.spawn().map_err(|source| BackendError::Spawn {
@@ -181,11 +181,11 @@ impl BackendClient {
             source: std::io::Error::other("child stdout not captured"),
         })?;
 
-        // feat_stderr_log_modal: pump stderr into the diagnostics ring buffer
-        // (verbatim lines + optional CHIBI_TUI_LOG file mirror) instead of
-        // discarding it. Still a fire-and-forget background task: a chatty
-        // backend can never deadlock on a full stderr pipe, and the append
-        // only holds the diag mutex for the instant of one push.
+        // feat_stderr_log_modal: stderr is pumped into the diagnostics ring buffer
+        // (verbatim lines + optional CHIBI_TUI_LOG file mirror) instead of being
+        // discarded. Still a fire-and-forget background task: a chatty backend
+        // can never deadlock on a full stderr pipe, and the append only
+        // holds the diag mutex for the instant of one push.
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(capture_stderr(stderr));
         }
@@ -268,7 +268,7 @@ impl BackendClient {
             None => {
                 // Stdout closed: distinguish "died with a refusal"
                 // (non-zero exit) from a clean premature close. The child may
-                // not be reaped at EOF yet, so give it a short grace period.
+                // not be reaped at EOF yet, so we give it a short grace period.
                 match time::timeout(SPAWN_DEATH_GRACE, self.child.wait()).await {
                     Ok(Ok(status)) if !status.success() => {
                         return Err(BackendError::UnexpectedExit {
@@ -283,7 +283,7 @@ impl BackendClient {
             }
         };
 
-        // Stdout carries protocol frames only once --stdio mode is up;
+        // Stdout carries protocol frames only when --stdio mode is up;
         // anything else is a handshake failure by definition.
         let msg: ServerMessage = serde_json::from_str(&raw).map_err(|e| {
             BackendError::Handshake(format!("malformed frame during handshake: {e}"))
@@ -329,7 +329,7 @@ impl BackendClient {
     /// protocol frames are one object per line). A closed stdin surfaces as
     /// [`BackendError::Io`] (`BrokenPipe`).
     pub async fn send_raw(&mut self, line: &str) -> Result<(), BackendError> {
-        debug_assert!(!line.contains('\n'), "protocol frames are single-line");
+        assert!(!line.contains('\n'), "protocol frames are single-line");
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
@@ -366,7 +366,7 @@ impl BackendClient {
         let shutdown_line = serde_json::to_string(&ClientMessage::Shutdown {})
             .map_err(|e| BackendError::Io(std::io::Error::other(e)))?;
 
-        // Best effort — the real verdict comes from the exit status below.
+        // Best effort only: the real verdict comes from the exit status below.
         if let Err(err) = self.send_raw(&shutdown_line).await {
             let broken = matches!(&err,
                 BackendError::Io(e) if e.kind() == std::io::ErrorKind::BrokenPipe);
@@ -377,7 +377,7 @@ impl BackendClient {
 
         match time::timeout(timeout, self.child.wait()).await {
             Err(_elapsed) => {
-                // Timed out: escalate to kill so nothing ever hangs forever.
+                // Timed out: escalate to kill so that nothing can hang forever.
                 let _ = self.child.start_kill();
                 let _ = self.child.wait().await;
                 Err(BackendError::UnexpectedExit {
@@ -414,9 +414,9 @@ impl BackendClient {
     ) {
         // IMPORTANT: `stdin`/`stdout` were already moved OUT of `child` in
         // `spawn_command`; `child.stdin.take()` here would silently yield
-        // `None`. Hand over the REAL pipes. The `BufReader` moves intact, so
+        // `None`. Hand over the REAL pipes here. The `BufReader` moves intact, so
         // bytes buffered during the handshake (e.g. an early garbage line)
-        // are preserved for the pipeline's reader.
+        // are preserved for the reader of the pipeline.
         let Self {
             child,
             stdin,
@@ -468,7 +468,7 @@ where
         }
     }
     // EOF: a partial line without its newline is still a line (flush as the
-    // final entry, matching AsyncBufReadExt::read_line semantics).
+    // final entry, matching the AsyncBufReadExt::read_line semantics).
     if !pending.is_empty() {
         diag::append(clean_line(&pending));
     }
@@ -568,9 +568,6 @@ fn backend_program() -> String {
     std::env::var("CHIBI_BACKEND_BIN").unwrap_or_else(|_| "chibi".to_owned())
 }
 
-/// One caveat for the mock-based tests below: `/bin/sh` line-buffers its own
-/// stdout when writing to a pipe only if we say so — `echo` flushes per line,
-/// which is enough for JSONL framing here.
 #[cfg(test)]
 mod tests {
     use super::*;

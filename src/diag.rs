@@ -44,10 +44,6 @@ pub const FILE_SINK_ENV: &str = "CHIBI_TUI_LOG";
 /// Prefix stamped on TUI-side lifecycle events (vs. verbatim backend stderr).
 pub const TUI_EVENT_PREFIX: &str = "[tui]";
 
-// ---------------------------------------------------------------------------
-// Core (testable) implementation — a plain struct, no globals
-// ---------------------------------------------------------------------------
-
 /// Optional append-mode mirror of the log stream.
 enum Sink {
     /// No file mirror (default).

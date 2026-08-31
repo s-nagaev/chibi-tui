@@ -1,9 +1,4 @@
-//! System clipboard access for pasting into the input field.
-//!
-//! `arboard` is used lazily: the clipboard handle is opened on demand and
-//! dropped right away, because on some platforms (notably macOS) a long-lived
-//! handle can interfere with other applications' pasteboards. Failures are
-//! non-fatal — a missing/locked clipboard must never take down the TUI.
+//! Lazy `arboard` clipboard read for pasting; failures are non-fatal by design.
 
 /// Read text from the system clipboard. Returns `None` when the clipboard is
 /// unavailable, empty, or holds non-text content.

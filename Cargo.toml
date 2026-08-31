@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Terminal UI client for Chibi — an AI assistant (IDE protocol v1 over stdio)"
 license = "MIT"
+repository = "https://github.com/s-nagaev/chibi-tui"
 readme = "README.md"
 keywords = ["terminal", "tui", "ai", "chat", "chibi"]
 categories = ["command-line-utilities", "development-tools"]

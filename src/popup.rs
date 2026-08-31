@@ -1,10 +1,5 @@
-//! Modal error popup state and rendering-independent logic.
-//!
-//! A single global popup slot: when set, it overlays the whole UI, captures
-//! the `R` / `Esc` / `q` / `Ctrl+C` keys (reconnect / dismiss / quit) and blocks normal input
-//! handling until dismissed. Backend failures (spawn failure, broken pipe,
-//! lost handshake) surface here instead of crashing or being silently
-//! dropped.
+//! Modal error popup state: one global slot that overlays the UI and captures
+//! the recovery keys (`R` / `Esc` / `q` / `Ctrl+C`) until dismissed.
 
 /// One shown error: the message plus the recovery hint line.
 #[derive(Clone, Debug)]

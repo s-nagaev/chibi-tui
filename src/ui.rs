@@ -39,7 +39,7 @@ pub fn scroll_skip(scroll: u16, at_bottom: bool, total: usize, visible: u16) -> 
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // feat_input_grow: the editor block grows per frame from 1 row up to
     // MAX_INPUT_LINES rows with the multiline draft (chat pane shrinks
-    // correspondingly — Min(0) absorbs the rest). On tiny terminals the
+    // correspondingly: Min(0) absorbs the rest). On tiny terminals the
     // block is additionally clamped so spinner + hints + a sliver of chat
     // always survive; saturating math everywhere keeps ≤4-row frames safe.
     let max_block_height = f.area().height.saturating_sub(4).max(1);
@@ -245,9 +245,9 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let mut state = ListState::default().with_selected(Some(app.active));
     f.render_stateful_widget(list, area, &mut state);
 
-    // Extend the sidebar's vertical border down through EVERY bottom row —
+    // Extend the sidebar's vertical border down through EVERY bottom row:
     // spinner + the grown editor block (feat_input_grow, 1..=20 rows) +
-    // hotkey hints — so the divider runs unbroken from the top edge to the
+    // hotkey hints, so the divider runs unbroken from the top edge to the
     // status line at any editor height.
     let below = Rect {
         x: area.right().saturating_sub(1),
@@ -315,7 +315,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
 
     // feat_status_line: when the strip is visible its `cwd: <basename> ·
     // <model>` readout rides the SAME top-border row as a right-aligned
-    // block title — zero extra rows (the dedicated-strip fallback was not
+    // block title: zero extra rows (the dedicated-strip fallback was not
     // needed; rationale in the task report). Truncated with an ellipsis to
     // the width left of the left-aligned header title, so long workspace
     // paths can never collide with it or overflow the pane.
@@ -363,7 +363,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     // bugfix_bottom_reply_hidden (restores bugfix_chat_scroll contract):
     // Paragraph used to wrap internally while `total` counted LOGICAL
     // markdown lines, so scroll_skip undercounted whenever any message
-    // wrapped to multiple display rows — follow-bottom then hid the tail of
+    // wrapped to multiple display rows, so follow-bottom then hid the tail of
     // the newest reply behind the input block. Materialize the DISPLAY rows
     // here instead, count them, and render WITHOUT an internal wrap: the
     // scrolled view and the row total are the same thing by construction.
@@ -375,7 +375,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     // feat_search_all_threads: consume a pending GLOBAL search jump (Enter
     // in the all-threads search popup). `jump_to_selected_all` already
     // activated the target thread in the state layer (same mechanics as
-    // Ctrl+↑/↓) — this only verifies the target is STILL the active chat
+    // Ctrl+↑/↓); this only verifies the target is STILL the active chat
     // (defensive against a chat vanishing between the state transition and
     // the next frame; the match list is recomputed on every keystroke, so
     // this is belt-and-braces) and maps the hit onto its wrapped row with
@@ -399,8 +399,8 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     }
 
     // feat_search_thread: consume a pending jump (Enter in the search
-    // popup). The jump math reuses the EXACT wrapped-row totals above —
-    // the same helper, the same width — so a hit inside a visually-wrapped
+    // popup). The jump math reuses the EXACT wrapped-row totals above:
+    // the same helper, the same width, so a hit inside a visually-wrapped
     // paragraph lands on the correct display row (via its char offset).
     // 1-row padding keeps the match a sliver below the top edge instead of
     // glued to it.
@@ -535,7 +535,7 @@ fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) 
     let has_visible_text = app.input.lines().iter().any(|l| !l.is_empty());
 
     // feat_focus_panes: while the SIDEBAR owns focus the prompt's `❯`
-    // marker dims from cyan to theme.dim — a subtle theme-driven cue that
+    // marker dims from cyan to theme.dim, a subtle theme-driven cue that
     // typing goes nowhere until focus returns. Rename editor keeps its
     // own marker untouched.
     let marker_color = if app.focus == Focus::Sidebar {
@@ -548,7 +548,7 @@ fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) 
         // Blank draft: placeholder + `⏎ send` chip composed in ONE line on
         // the block's FIRST row so they share the same baseline. Width math
         // measures DISPLAY columns (not byte lengths): `❯`/`⏎` are
-        // multi-byte UTF-8 but single-column glyphs — measuring bytes drifts
+        // multi-byte UTF-8 but single-column glyphs; measuring bytes drifts
         // the chip left.
         let marker_w = PROMPT_MARKER_WIDTH;
         let placeholder_len = "Type a message\u{2026}".width() as u16;
@@ -596,7 +596,7 @@ fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) 
         f.render_widget(&app.input, rest);
     }
     // Grown block repeats feat_input_visual's chip on the FIRST row (never
-    // the last), flush right; a first-line tail under it clips — same
+    // the last), flush right; a first-line tail under it clips: same
     // graceful-degradation rule as the rename hint.
     if chat_column.height > 1 {
         let chip_w = send_label.width() as u16;
@@ -666,7 +666,7 @@ fn render_rename_line(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
 fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let (status_label, status_color) = connection_status(app);
-    // feat_rename_thread: `^R rename` joined the hints. `/jk` was dropped —
+    // feat_rename_thread: `^R rename` joined the hints. `/jk` was dropped:
     // single-letter navigation was removed earlier, so the old label was
     // stale; dropping it keeps the line within one row even with the longest
     // status label (`● disconnected (press R)`).
@@ -688,22 +688,22 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // longest status label (`● disconnected (press R)`).
     // feat_search_all_threads: `^⇧F all` joined the hints; the self-evident
     // `^L` and `^V` hints retired (both actions are README-documented and
-    // universal enough — clear-screen and paste) so the line stays within
+    // universal enough (clear-screen and paste) so the line stays within
     // 120 cols with the longest status label. ^C cancel is never dropped.
     // feat_alt_arrows_nav: `^↑↓ chats` grew to `^/⌥↑↓ chats` (Alt is a
-    // full synonym for thread switching — macOS Mission Control hijacks
+    // full synonym for thread switching, because macOS Mission Control hijacks
     // Ctrl+arrows). To fit the +2-col token, the self-evident `^F find`
     // compacted to `^F` (Ctrl+F is THE universal find convention, same
     // precedent as `^V`; README documents it), keeping the row within 120
     // cols with the longest status label. ^C cancel is never dropped.
     // feat_ctrl_t_cycle: `^T next` joined the hints (universal terminal-proof
-    // thread switching that WRAPS around — the browser Ctrl+Tab convention).
+    // thread switching that WRAPS around, the browser Ctrl+Tab convention).
     // To fit the +7-col token, the self-evident `^N new` compacted to `^N`
     // (Ctrl+N is THE universal new-chat convention, same precedent as `^F`/
     // `^V`) and `⇧↵ nl` compacted to `⇧↵` (Shift+Enter newline is a universal
     // chat-app convention; README documents both), keeping the row within 120
     // cols with the longest status label. ^C cancel is never dropped.
-    // feat_focus_panes: `^T next` became `^T panel` — Ctrl+T now TOGGLES
+    // feat_focus_panes: `^T next` became `^T panel`. Ctrl+T now TOGGLES
     // pane focus (Chat ↔ Sidebar) instead of wrap-cycling threads (the
     // cycling semantics were rejected in live-check). `^R rename` compacted
     // to `^R` (the action is README-documented and the popup itself is
@@ -712,12 +712,12 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // feat_status_line: `^O info` joined the hints (the toggle for the dim
     // `cwd · model` strip on the chat header border). The strip is HIDDEN
     // by default, so a hint-shown-only-while-visible scheme would leave the
-    // feature undiscoverable — the toggle hint is PERMANENT (decision
+    // feature undiscoverable, so the toggle hint is PERMANENT (decision
     // documented in the README + task report). To pay the +10 cols the
     // self-evident `^D del` compacted to `^D` (the confirm popup is
     // self-explanatory, same precedent as `^R`) and `^T panel` compacted to
     // `^T` (the focus flip is instantly visible feedback; both actions stay
-    // README-documented). Net width change: ZERO — the row stays at 87
+    // README-documented). Net width change: ZERO; the row stays at 87
     // cols, so the `log*` worst case (87 hints + 7 marker + 2 separator +
     // 24 longest label = 120 ≤ 120) holds verbatim. ^C cancel is never
     // dropped.
@@ -737,10 +737,10 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         )];
         // feat_stderr_log_modal: subtle dim `log*` token when unseen
         // diagnostic lines arrived since the last viewer visit (consumer-side
-        // watermark over the monotonic producer total — race-free). Placement
+        // watermark over the monotonic producer total, race-free). Placement
         // check (documented in the task report): hints (87 cols) + ` · log*`
         // (7) + separator (2) + the longest status label
-        // `● disconnected (press R)` (24) = 120 ≤ 120 — it FITS the status
+        // `● disconnected (press R)` (24) = 120 ≤ 120, so it FITS the status
         // line, so the chat-header fallback was not needed. Hidden while a
         // modal is open (transient states) and under toasts.
         if app.mode.is_normal() && crate::diag::total_appended() > app.log_seen_total {
@@ -1338,7 +1338,7 @@ fn render_search_all_popup(f: &mut Frame, app: &mut App, theme: &Theme) {
     // Match rows: `▸ thread · role · …snippet…` with the selected row
     // highlighted. The window is centered on the selection so ↑/↓
     // navigation stays visible in the fixed-height list. Every match
-    // carries its own chat_index — matches may belong to ANY thread.
+    // carries its own chat_index, and matches may belong to ANY thread.
     if count == 0 {
         if !query.is_empty() {
             rows.push(Line::from(Span::styled(

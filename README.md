@@ -1,5 +1,8 @@
 # chibi-tui
 
+[![CI](https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A terminal UI client for [Chibi](https://github.com/s-nagaev/chibi) — an AI
 assistant — built with Rust + ratatui + crossterm + tokio. Chats with the
 assistant over IDE protocol v1 (JSONL over stdio), renders markdown answers
@@ -20,16 +23,52 @@ More screenshots: [spinner](docs/02_spinner.png) ·
 
 ## Installation
 
-Once published to crates.io:
+### Prebuilt binaries
+
+Grab an archive from the
+[GitHub Releases](https://github.com/s-nagaev/chibi-tui/releases) page — every
+release ships a binary per platform plus a `SHA256SUMS.txt` with the
+checksums of all archives:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 | `chibi-tui-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `chibi-tui-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `chibi-tui-<version>-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `chibi-tui-<version>-x86_64-pc-windows-msvc.zip` |
+
+Download the archive matching your platform and `SHA256SUMS.txt`, verify the
+checksum (`sha256sum -c` on Linux / `shasum -a 256 -c` on macOS / `Get-FileHash`
+in PowerShell), extract the archive (`tar -xzf` / `unzip`) and put the
+`chibi-tui` binary somewhere on your `PATH`.
+
+### From crates.io
 
 ```bash
 cargo install chibi-tui
 ```
 
-Or build from source:
+(available on crates.io after the first release — until then, use a prebuilt
+binary or build from source).
+
+### Backend
+
+The TUI is a client: it spawns the [`chibi`](https://pypi.org/project/chibi/)
+backend (Python, installable from PyPI) and talks IDE protocol v1 over stdio:
 
 ```bash
-git clone <repo-url> chibi-tui && cd chibi-tui
+pip install chibi
+```
+
+The default transport spawns `chibi ide --stdio --workspace <root>` (root =
+your `--workspace` value, the current directory by default). To point the TUI
+at a custom backend executable instead of the `chibi` found on `PATH`, set
+`CHIBI_BACKEND_BIN=/path/to/backend`.
+
+### Build from source
+
+```bash
+git clone https://github.com/s-nagaev/chibi-tui chibi-tui && cd chibi-tui
 cargo build --release
 # binary at target/release/chibi-tui
 ```
@@ -418,6 +457,40 @@ cargo doc --no-deps                            # API docs
 ```
 
 CI runs fmt, clippy (-D warnings), tests and a release build on stable and beta.
+
+## Release process
+
+Releases are tag-driven: bump the version, tag it, create a GitHub Release —
+[.github/workflows/release.yml](.github/workflows/release.yml) does the rest
+(per-platform binary archives + `SHA256SUMS.txt` attached to the release, then
+the crate published to crates.io).
+
+1. Bump `version` in `Cargo.toml` and commit. The tag and the manifest version
+   must match exactly — the publish job hard-fails on tag/manifest drift.
+2. Tag the commit and push it: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Create a GitHub Release from that tag. The `release: published` event
+   triggers the workflow: the four binary legs build and attach their archives,
+   and the `publish` job runs once they all succeed.
+
+Prerequisites:
+
+- `CARGO_REGISTRY_TOKEN` present in the repository's Actions secrets (the
+  publish job only ever passes it to cargo via the environment — never argv,
+  never logs).
+- `main` CI green is the norm, but the publish job re-runs `cargo test
+  --locked` on the tagged commit anyway — the quality gates in `ci.yml` may
+  not have run for that exact commit.
+
+The publish job is idempotent: if the tag's version is already on crates.io
+it prints `already published, skipping` and exits 0 instead of failing on the
+re-upload. A manual `workflow_dispatch` run builds artifacts only — it never
+publishes.
+
+Emergency local publish (rarely needed; prefer CI):
+
+```bash
+CARGO_REGISTRY_TOKEN=<token> cargo publish --locked
+```
 
 ## License
 
