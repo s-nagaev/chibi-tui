@@ -721,6 +721,14 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // cols, so the `log*` worst case (87 hints + 7 marker + 2 separator +
     // 24 longest label = 120 ≤ 120) holds verbatim. ^C cancel is never
     // dropped.
+    // feat_thread_clone: `^P` joins the hints, but ONLY when the backend
+    // listed the clone command at handshake (detection, never assumption):
+    // an older backend must never promise a dead key. To pay the +5 cols
+    // `^O info` compacted to bare `^O` (the toggle itself stays permanent,
+    // same precedent as ^N/^R/^D/^F/^T; README documents the full names).
+    // Base row: 82 cols, 87 with the clone token, so the `log*` worst case
+    // (87 + 7 marker + 2 separator + 24 longest label = 120 ≤ 120) still
+    // holds verbatim. ^C cancel is never dropped.
     let spans = if let Some((message, _)) = &app.status_message {
         // Transient status toast (busy-delete refusal): replaces the hint
         // block while visible. Short message + connection label always fit
@@ -732,13 +740,23 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ]
     } else {
         let mut spans = vec![Span::styled(
-            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T \u{00b7} ^O info",
+            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T \u{00b7} ^O",
             Style::new().fg(theme.selection),
         )];
+        // feat_thread_clone: the clone chord is advertised only when the
+        // handshake capabilities listed the command (see the width math in
+        // the comment block above).
+        if app.supports_thread_clone() {
+            spans.push(Span::styled(
+                " \u{00b7} ^P",
+                Style::new().fg(theme.selection),
+            ));
+        }
         // feat_stderr_log_modal: subtle dim `log*` token when unseen
         // diagnostic lines arrived since the last viewer visit (consumer-side
         // watermark over the monotonic producer total, race-free). Placement
-        // check (documented in the task report): hints (87 cols) + ` · log*`
+        // check (documented in the task report): hints (87 cols worst case,
+        // 82 base + 5 when the clone token shows) + ` · log*`
         // (7) + separator (2) + the longest status label
         // `● disconnected (press R)` (24) = 120 ≤ 120, so it FITS the status
         // line, so the chat-header fallback was not needed. Hidden while a
@@ -2697,7 +2715,7 @@ mod tests {
             "^D",
             "^F",
             "^T",
-            "^O info",
+            "^O",
         ] {
             assert!(last.contains(needle), "{needle} missing from {last:?}");
         }
@@ -4090,20 +4108,16 @@ mod tests {
         );
     }
 
-    /// feat_status_line: the hints line carries `^O info` and — after
-    /// compacting `^D del`/`^T panel` to bare tokens (net-zero width
-    /// change, base row still 87 cols) — still fits 120 cols with the
-    /// longest status label. ^C cancel is never dropped.
+    /// feat_status_line: the hints line carries `^O` and, after
+    /// compacting `^D del`/`^T panel` to bare tokens, still fits 120 cols
+    /// with the longest status label. ^C cancel is never dropped.
     #[test]
     fn status_hints_still_fit_with_status_strip_hint() {
         let mut app = App::new(mock::initial_chats());
         app.connection = Connection::Disconnected;
         let last = render_grid(&mut app).last().unwrap().clone();
 
-        assert!(
-            last.contains("^O info"),
-            "^O info missing from hints: {last:?}"
-        );
+        assert!(last.contains("^O"), "^O missing from hints: {last:?}");
         assert!(
             last.contains("^C cancel"),
             "^C cancel must never be dropped"
@@ -4112,6 +4126,33 @@ mod tests {
             last.contains("disconnected (press R)"),
             "status label clipped — hints overflowed 120 cols: {last:?}"
         );
+        assert!(
+            last.trim_end().width() <= 120,
+            "hints row too wide: {} cols — {:?}",
+            last.trim_end().width(),
+            last
+        );
+    }
+
+    /// feat_thread_clone: the `^P` hint is advertised only when the backend
+    /// listed the clone command at handshake, and the row still fits 120
+    /// cols with the longest status label once it shows.
+    #[test]
+    fn clone_hint_advertised_only_when_backend_supports_it() {
+        let mut app = App::new(mock::initial_chats());
+        app.connection = Connection::Disconnected;
+        let last = render_grid(&mut app).last().unwrap().clone();
+        assert!(
+            !last.contains("^P"),
+            "clone hint must stay hidden without the capability: {last:?}"
+        );
+
+        app.set_backend_commands(vec![
+            "/reset".to_owned(),
+            "/new_thread_with_current_context".to_owned(),
+        ]);
+        let last = render_grid(&mut app).last().unwrap().clone();
+        assert!(last.contains("^P"), "clone hint missing: {last:?}");
         assert!(
             last.trim_end().width() <= 120,
             "hints row too wide: {} cols — {:?}",

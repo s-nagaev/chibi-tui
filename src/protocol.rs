@@ -205,7 +205,12 @@ pub enum ServerMessage {
     },
 }
 
-/// Machine-readable error codes defined by protocol v1.
+/// Machine-readable error codes defined by protocol v1, plus the
+/// frontend-facing codes the real backend emits for slash-command failures
+/// (`invalid_request`, `backend_error`, `rate_limited`). Those three are not
+/// in the frozen v1 set, but the backend already sends them on the wire, so
+/// they must parse: an unparseable frame is dropped by the reader and the
+/// request would never reach a terminal event.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -216,4 +221,55 @@ pub enum ErrorCode {
     UnknownRequest,
     Cancelled,
     RequestFailed,
+    /// Backend command or validation failure (frontend-facing form of the
+    /// internal `invalid_argument`).
+    InvalidRequest,
+    /// Provider-side failure surfaced by the shared exception handler.
+    BackendError,
+    /// Provider rate limiting (the frame may carry a retry hint).
+    RateLimited,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// feat_thread_clone: the frontend-facing codes the real backend emits
+    /// for slash-command failures must parse, or the reader drops the frame
+    /// and the request never terminates.
+    #[test]
+    fn frontend_facing_error_codes_parse() {
+        let frame =
+            r#"{"type":"error","request_id":"r1","code":"invalid_request","message":"bad args"}"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("invalid_request parses") {
+            ServerMessage::Error { code, message, .. } => {
+                assert_eq!(code, ErrorCode::InvalidRequest);
+                assert_eq!(message, "bad args");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        for (wire, expected) in [
+            ("backend_error", ErrorCode::BackendError),
+            ("rate_limited", ErrorCode::RateLimited),
+        ] {
+            let frame =
+                format!(r#"{{"type":"error","request_id":"r1","code":"{wire}","message":"m"}}"#);
+            match serde_json::from_str::<ServerMessage>(&frame).expect("code parses") {
+                ServerMessage::Error { code, .. } => assert_eq!(code, expected),
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+    }
+
+    /// The frozen v1 codes keep parsing exactly as before.
+    #[test]
+    fn protocol_v1_error_codes_still_parse() {
+        let frame =
+            r#"{"type":"error","request_id":"r1","code":"request_failed","message":"boom"}"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("request_failed parses") {
+            ServerMessage::Error { code, .. } => assert_eq!(code, ErrorCode::RequestFailed),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 }

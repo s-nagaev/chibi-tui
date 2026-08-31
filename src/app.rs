@@ -395,6 +395,26 @@ pub struct App {
     /// coupling. Session-scoped exactly like the per-message labels; never
     /// persisted.
     picker_model_labels: HashMap<String, String>,
+    /// feat_thread_clone: slash commands the backend advertised at handshake.
+    /// Empty for mocks/offline; gates the ^P clone shortcut via detection.
+    pub(crate) backend_commands: Vec<String>,
+    /// feat_thread_clone: clone request staged by `begin_clone_thread` for
+    /// the event loop to send (same seam as `picker_submission`). Carries
+    /// the NEW chat's UUID as `thread_id`, so the command arrives on the
+    /// thread it creates, exactly like /reset.
+    clone_submission: Option<Submitted>,
+    /// feat_thread_clone: the not-yet-listed clone chat plus its request
+    /// correlation, held between staging and the backend ack. An error
+    /// resolution drops it, so a failed clone leaves no orphan thread.
+    pending_clone: Option<PendingClone>,
+}
+
+/// feat_thread_clone: a clone request in flight. The `chat` waits here until
+/// the backend acks; `source_id` anchors the insert-after-source placement.
+struct PendingClone {
+    chat: Chat,
+    request_id: String,
+    source_id: String,
 }
 
 /// feat_model_picker_lite: what a hidden (transcript-suppressed) request is
@@ -488,6 +508,9 @@ impl App {
             hidden_requests: HashMap::new(),
             hidden_queue: VecDeque::new(),
             picker_model_labels: HashMap::new(),
+            backend_commands: Vec::new(),
+            clone_submission: None,
+            pending_clone: None,
         }
     }
 
@@ -1551,6 +1574,168 @@ impl App {
         Some(removed_id)
     }
 
+    // ---- thread clone (feat_thread_clone) ----------------------------------
+
+    /// Slash command the backend lists in `capabilities.commands` when it can
+    /// clone a thread with its full conversation context. Consumed via
+    /// detection, never assumed: ^P stays dead until the handshake lists it.
+    pub const CLONE_COMMAND: &str = "/new_thread_with_current_context";
+
+    /// feat_thread_clone: record the backend's advertised slash-command set
+    /// from the handshake. Stays empty for mocks and placeholder sessions,
+    /// which keeps the clone shortcut disabled there.
+    pub fn set_backend_commands(&mut self, commands: Vec<String>) {
+        self.backend_commands = commands;
+    }
+
+    /// Whether the connected backend can clone threads. Mocks and offline
+    /// sessions never advertise the command, so this is false for them.
+    pub fn supports_thread_clone(&self) -> bool {
+        self.backend_commands
+            .iter()
+            .any(|c| c == Self::CLONE_COMMAND)
+    }
+
+    /// Clone the ACTIVE thread with full context inheritance, riding on the
+    /// backend's [`Self::CLONE_COMMAND`]. Guard family mirrors the delete
+    /// feature: no-op outside Normal mode, informative popup when the
+    /// backend lacks the command, transient toast when the source is busy
+    /// or a clone is already in flight.
+    ///
+    /// The clone chat is minted here with a fresh UUID but NOT listed yet:
+    /// it waits in [`App::pending_clone`] until the backend acks, so a
+    /// failed request can never leave an orphan thread in the sidebar. The
+    /// staged submission goes out through the event loop (same seam as the
+    /// model picker's hidden exchange).
+    pub fn begin_clone_thread(&mut self) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        if !self.supports_thread_clone() {
+            self.show_error("backend does not support thread cloning \u{2014} update chibi");
+            return;
+        }
+        if self.pending_clone.is_some() {
+            self.show_status("clone already in progress");
+            return;
+        }
+        let Some(source) = self.chats.get(self.active) else {
+            return;
+        };
+        // Delete precedent: refuse while the source has a turn in flight or
+        // prompts queued, a half-answered transcript must not be cloned.
+        if source.is_busy() || !source.queue.is_empty() {
+            self.show_status("can't clone \u{2014} busy");
+            return;
+        }
+        let source_id = source.id.clone();
+        let source_wire = crate::live::wire_thread_id(&source_id);
+        // Fresh UUID, copied display mirror. The messages travel in the
+        // clone's own JSON snapshot for the sidebar and restarts, while the
+        // backend DB stays the context truth (the command re-keys it).
+        let mut clone = Chat::new(format!("{} (copy)", source.name));
+        clone.messages = source
+            .messages
+            .iter()
+            .map(|m| m.normalized_for_storage())
+            .collect();
+        // The request rides ON the new thread (mirrors how /reset arrives on
+        // the thread it resets); the args carry the source wire id and the
+        // clone title for the backend's name registration.
+        let request_id = crate::history::new_request_id();
+        let submitted = Submitted {
+            request_id: request_id.clone(),
+            thread_id: clone.id.clone(),
+            prompt: format!("{} {} {}", Self::CLONE_COMMAND, source_wire, clone.name),
+        };
+        self.pending_clone = Some(PendingClone {
+            chat: clone,
+            request_id,
+            source_id,
+        });
+        self.clone_submission = Some(submitted);
+    }
+
+    /// Hand the staged clone request to the event loop. One-shot, same
+    /// pattern as [`App::take_picker_submission`].
+    pub fn take_clone_submission(&mut self) -> Option<Submitted> {
+        self.clone_submission.take()
+    }
+
+    /// Resolve a terminal event that belongs to the pending clone request.
+    /// Returns true when the event was consumed here, so the normal chat
+    /// routing never sees the not-yet-listed thread id (it would be dropped
+    /// as unknown and the clone would hang forever).
+    fn apply_clone_event(&mut self, event: &BackendEvent) -> bool {
+        let Some(pending) = &self.pending_clone else {
+            return false;
+        };
+        match event {
+            // Progress frames of the unlisted clone: consumed silently, the
+            // chat has no lifecycle to update yet.
+            BackendEvent::Queued {
+                request_id,
+                thread_id,
+            }
+            | BackendEvent::Running {
+                request_id,
+                thread_id,
+            } => {
+                thread_id == &pending.chat.id
+                    && event_matches_request(*request_id, &pending.request_id)
+            }
+            BackendEvent::Result {
+                request_id,
+                thread_id,
+                ..
+            } => {
+                if thread_id != &pending.chat.id
+                    || !event_matches_request(*request_id, &pending.request_id)
+                {
+                    return false;
+                }
+                // Ack: list the clone right after its source and select it.
+                // A source deleted mid-flight degrades to appending at the
+                // end of the list.
+                let PendingClone {
+                    chat, source_id, ..
+                } = self.pending_clone.take().expect("pending checked above");
+                let at = self
+                    .chats
+                    .iter()
+                    .position(|c| c.id == source_id)
+                    .map(|i| i + 1)
+                    .unwrap_or(self.chats.len());
+                self.chats.insert(at, chat);
+                self.active = at;
+                self.scroll = 0;
+                true
+            }
+            BackendEvent::Error {
+                request_id,
+                message,
+                thread_id,
+            } => {
+                let ours = thread_id.as_deref() == Some(pending.chat.id.as_str())
+                    && event_matches_request(*request_id, &pending.request_id);
+                if !ours {
+                    return false;
+                }
+                // Failure: drop the clone (no orphan in the sidebar) and
+                // surface the backend's own error text. Transport-level
+                // failures flip the indicator like the hidden exchanges do.
+                self.pending_clone = None;
+                if is_transport_failure(message) {
+                    self.connection = Connection::Disconnected;
+                }
+                self.show_error(message.clone());
+                true
+            }
+            // Not clone-related (or no lifecycle frame at all).
+            BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => false,
+        }
+    }
+
     // ---- transient status toast -------------------------------------------
 
     /// Show a transient status message in the status line, replacing any
@@ -1603,6 +1788,13 @@ impl App {
         if let BackendEvent::Disconnected = event {
             // The event source itself reported the link down.
             self.connection = Connection::Disconnected;
+            return;
+        }
+
+        // feat_thread_clone: a terminal event of a pending clone resolves
+        // the clone itself and never reaches the chat routing below, which
+        // would drop it as an unknown thread id and hang the clone forever.
+        if self.apply_clone_event(&event) {
             return;
         }
 
@@ -3627,6 +3819,285 @@ mod tests {
         assert!(app.confirm_delete().is_none());
         assert_eq!(app.chats.len(), 1);
         assert!(app.pending_delete.is_none());
+    }
+
+    // ---- feat_thread_clone: detection, guards, ack/error resolution -------
+
+    fn clone_capable_app(n: usize) -> App {
+        let mut app = app_with_chats(n);
+        app.set_backend_commands(vec![
+            "/reset".to_owned(),
+            "/new_thread_with_current_context".to_owned(),
+        ]);
+        app
+    }
+
+    #[test]
+    fn clone_without_capability_shows_informative_popup() {
+        let mut app = app_with_chats(1);
+        assert!(!app.supports_thread_clone(), "nothing advertised yet");
+        app.begin_clone_thread();
+
+        let popup = app.error_popup.as_ref().expect("informative popup");
+        assert!(
+            popup.message.contains("does not support thread cloning"),
+            "popup must explain the missing capability: {popup:?}"
+        );
+        assert!(app.take_clone_submission().is_none(), "nothing staged");
+        assert!(app.pending_clone.is_none(), "no orphan flight state");
+        assert_eq!(app.chats.len(), 1, "sidebar unchanged");
+    }
+
+    #[test]
+    fn clone_gate_ignores_unrelated_commands() {
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(vec!["/reset".to_owned(), "/model".to_owned()]);
+        assert!(!app.supports_thread_clone());
+        app.begin_clone_thread();
+
+        assert!(app.error_popup.is_some(), "still the unsupported path");
+        assert!(app.take_clone_submission().is_none());
+    }
+
+    #[test]
+    fn clone_stages_request_with_wire_shape_and_copied_name() {
+        let mut app = clone_capable_app(1);
+        app.chats[0].name = "My thread".to_owned();
+        let source_id = app.active_thread_id().unwrap().to_owned();
+        app.begin_clone_thread();
+
+        let submitted = app.take_clone_submission().expect("staged");
+        let pending = app.pending_clone.as_ref().expect("clone in flight");
+        // Name defaulting: "<name> (copy)".
+        assert_eq!(pending.chat.name, "My thread (copy)");
+        // Fresh identity: a new UUID, never the source's.
+        assert_ne!(pending.chat.id, source_id);
+        assert_eq!(pending.chat.lifecycle, ChatLifecycle::Idle);
+        assert!(pending.chat.queue.is_empty(), "queue is never copied");
+        // The request rides ON the new chat (its UUID is the frame thread
+        // id); the args carry the source wire id and the clone title.
+        assert_eq!(submitted.thread_id, pending.chat.id);
+        assert_eq!(
+            submitted.prompt,
+            format!(
+                "{} {} My thread (copy)",
+                App::CLONE_COMMAND,
+                crate::live::wire_thread_id(&source_id)
+            )
+        );
+        assert_eq!(submitted.request_id, pending.request_id);
+
+        // Single-flight guard: a re-press while in flight must not mint a
+        // second clone.
+        app.begin_clone_thread();
+        assert!(app.take_clone_submission().is_none());
+        assert!(app.status_message.is_some(), "second press gets a toast");
+    }
+
+    #[test]
+    fn clone_refused_while_source_has_turn_in_flight() {
+        let mut app = clone_capable_app(1);
+        submit_text(&mut app, "long running");
+        app.begin_clone_thread();
+
+        assert!(
+            app.error_popup.is_none(),
+            "refusal follows the delete precedent: toast, not popup"
+        );
+        assert!(app.status_message.is_some(), "busy toast shown");
+        assert!(app.take_clone_submission().is_none());
+        assert!(app.pending_clone.is_none());
+        assert_eq!(app.chats.len(), 1);
+    }
+
+    #[test]
+    fn clone_refused_while_source_has_queued_prompts() {
+        let mut app = clone_capable_app(1);
+        app.chats[0].queue.push_back("queued prompt".to_owned());
+        app.begin_clone_thread();
+
+        assert!(app.status_message.is_some(), "busy toast covers the queue");
+        assert!(app.take_clone_submission().is_none());
+    }
+
+    #[test]
+    fn clone_noop_outside_normal_mode() {
+        let mut app = clone_capable_app(1);
+        app.mode = Mode::ConfirmDelete;
+        app.begin_clone_thread();
+
+        assert!(app.take_clone_submission().is_none());
+        assert!(app.error_popup.is_none());
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn clone_ack_inserts_after_source_selects_and_copies_mirror() {
+        let mut app = clone_capable_app(3);
+        app.select_next(); // active = 1 (chat-1)
+        app.chats[1].messages.push(Message::user("question"));
+        app.chats[1].messages.push(Message::assistant("**answer**"));
+        app.begin_clone_thread();
+        let submitted = app.take_clone_submission().expect("staged");
+        assert_eq!(app.chats.len(), 3, "clone stays unlisted before the ack");
+
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "Thread cloned: chat-1 (copy) (ID: 42). 2 messages copied.".to_owned(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+
+        assert_eq!(app.chats.len(), 4);
+        assert_eq!(
+            app.chats[2].name, "chat-1 (copy)",
+            "clone listed right after its source"
+        );
+        assert_eq!(app.chats[2].messages.len(), 2, "display mirror copied");
+        assert_eq!(app.active, 2, "clone selected");
+        assert_eq!(app.scroll, 0, "follow-bottom for the new chat");
+        assert!(app.pending_clone.is_none(), "flight state cleared");
+    }
+
+    #[test]
+    fn clone_progress_frames_are_consumed_while_unlisted() {
+        let mut app = clone_capable_app(1);
+        app.begin_clone_thread();
+        let submitted = app.take_clone_submission().expect("staged");
+
+        app.apply_backend_event(BackendEvent::Queued {
+            request_id: event_id_of(&submitted.request_id),
+            thread_id: submitted.thread_id.clone(),
+        });
+        app.apply_backend_event(BackendEvent::Running {
+            request_id: event_id_of(&submitted.request_id),
+            thread_id: submitted.thread_id.clone(),
+        });
+
+        assert!(app.pending_clone.is_some(), "still awaiting the ack");
+        assert!(
+            app.chats.iter().all(|c| c.lifecycle == ChatLifecycle::Idle),
+            "no listed chat tracks the clone request"
+        );
+    }
+
+    #[test]
+    fn clone_ack_with_stray_ids_is_ignored() {
+        let mut app = clone_capable_app(1);
+        app.begin_clone_thread();
+        let submitted = app.take_clone_submission().expect("staged");
+
+        // Wrong request id, right thread: not ours.
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of("unrelated-request"),
+            markdown: "ack".to_owned(),
+            thread_id: submitted.thread_id.clone(),
+            model: None,
+        });
+        // Right request id, wrong thread: not ours either.
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "ack".to_owned(),
+            thread_id: "unrelated-thread".to_owned(),
+            model: None,
+        });
+
+        assert_eq!(app.chats.len(), 1, "no listing without a matching ack");
+        assert!(app.pending_clone.is_some(), "clone stays in flight");
+        assert!(app.error_popup.is_none());
+    }
+
+    #[test]
+    fn clone_error_drops_clone_and_surfaces_backend_text() {
+        let mut app = clone_capable_app(1);
+        app.begin_clone_thread();
+        let submitted = app.take_clone_submission().expect("staged");
+
+        app.apply_backend_event(BackendEvent::Error {
+            request_id: event_id_of(&submitted.request_id),
+            message: "Source thread 123 is busy. Wait for it to finish before cloning.".to_owned(),
+            thread_id: Some(submitted.thread_id),
+        });
+
+        assert!(app.pending_clone.is_none(), "clone dropped, no orphan");
+        assert_eq!(app.chats.len(), 1, "sidebar unchanged");
+        let popup = app.error_popup.as_ref().expect("backend error surfaced");
+        assert!(
+            popup.message.contains("Wait for it to finish"),
+            "the backend's own text is shown: {popup:?}"
+        );
+        assert!(app.take_clone_submission().is_none());
+    }
+
+    #[test]
+    fn clone_error_for_other_requests_never_touches_the_clone() {
+        let mut app = clone_capable_app(1);
+        app.begin_clone_thread();
+        let _submitted = app.take_clone_submission().expect("staged");
+
+        app.apply_backend_event(BackendEvent::Error {
+            request_id: event_id_of("unrelated-request"),
+            message: "some other failure".to_owned(),
+            thread_id: None,
+        });
+
+        assert!(app.pending_clone.is_some(), "clone untouched");
+        assert!(app.error_popup.is_none(), "no popup for a foreign error");
+    }
+
+    #[test]
+    fn clone_ack_after_source_deleted_appends_at_the_end() {
+        let mut app = clone_capable_app(2);
+        app.begin_clone_thread();
+        let submitted = app.take_clone_submission().expect("staged");
+        // Source removed while the clone request is in flight.
+        app.chats.remove(0);
+
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "ack".to_owned(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(
+            app.chats[1].name, "chat-0 (copy)",
+            "source gone: clone appends at the end"
+        );
+        assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn clone_persists_via_existing_history_layer() {
+        let mut app = clone_capable_app(1);
+        app.chats[0].messages.push(Message::user("question"));
+        app.begin_clone_thread();
+        let submitted = app.take_clone_submission().expect("staged");
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "ack".to_owned(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+
+        // Event-loop seam: the loop persists the selected chat after the
+        // event; the clone must survive a restart through the same layer.
+        let dir = std::env::temp_dir().join(format!(
+            "chibi-tui-clone-restart-{}-{}",
+            std::process::id(),
+            crate::history::new_thread_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        crate::history::save_chat_in(Some(&dir), &app.chats[app.active]).expect("save");
+
+        let restored = crate::history::load_chats_from(Some(&dir));
+        assert_eq!(restored.len(), 1, "exactly one snapshot file");
+        assert_eq!(restored[0].name, "chat-0 (copy)");
+        assert_eq!(restored[0].messages.len(), 1, "mirror survives restart");
+        assert_eq!(restored[0].lifecycle, ChatLifecycle::Idle);
+        assert!(restored[0].queue.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -39,6 +39,10 @@ use crate::request_pipeline::{PipelineResult, RequestArgs, RequestPipeline};
 #[derive(Clone)]
 pub struct LiveBackend {
     pipeline: RequestPipeline,
+    /// Slash commands the backend advertised at handshake (feat_thread_clone
+    /// feature gate). Copied out of the pipeline handle because a
+    /// reconnect respawns the same program and keeps the set valid.
+    commands: Vec<String>,
 }
 
 impl LiveBackend {
@@ -59,7 +63,14 @@ impl LiveBackend {
     ) -> Result<Self, BackendError> {
         let pipeline =
             RequestPipeline::connect_with_args(workspace_root.as_ref(), 64, extra_args).await?;
-        Ok(Self { pipeline })
+        let commands = pipeline.commands().to_vec();
+        Ok(Self { pipeline, commands })
+    }
+
+    /// Slash commands the backend advertised in the handshake `ready` frame.
+    /// Empty when the peer sent no capabilities (mocks, very old backends).
+    pub fn backend_commands(&self) -> &[String] {
+        &self.commands
     }
 
     /// Submit a fully-formed submission bundle (ids from [`crate::App::take_input`],
@@ -705,6 +716,117 @@ mod tests {
                 BackendEvent::Result { .. } => panic!("cancelled request must not yield Result"),
                 BackendEvent::Disconnected => continue,
             }
+        }
+
+        let _ = live.shutdown().await;
+    }
+
+    // ---- feat_thread_clone: command round trip on the fake peer ------------
+
+    /// The clone command rides ON the destination thread: the fake peer
+    /// echoes the received frame inside the ack, so this asserts the wire
+    /// shape end to end (frame thread_id = destination wire id, args =
+    /// source wire id + clone title).
+    #[tokio::test]
+    async fn clone_command_round_trips_on_destination_thread() {
+        with_fake_backend();
+        let live = tokio::time::timeout(TIMEOUT, LiveBackend::connect("."))
+            .await
+            .expect("connect within timeout")
+            .expect("handshake ok");
+        // Detection over a real handshake: the fake advertises the command,
+        // exactly like the real backend since the clone support task.
+        assert!(
+            live.backend_commands()
+                .iter()
+                .any(|c| c == "/new_thread_with_current_context"),
+            "capabilities must list the clone command: {:?}",
+            live.backend_commands()
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let source_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let dest_uuid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        live.submit_encoded(
+            Submitted {
+                request_id: "99999999-8888-7777-6666-555555555555".to_owned(),
+                thread_id: dest_uuid.to_owned(),
+                prompt: format!(
+                    "/new_thread_with_current_context {} Source (copy)",
+                    wire_thread_id(source_uuid)
+                ),
+            },
+            tx,
+        );
+
+        let mut terminal = None;
+        for _ in 0..4 {
+            let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+                .await
+                .expect("event in time")
+                .expect("channel alive");
+            if matches!(evt, BackendEvent::Result { .. }) {
+                terminal = Some(evt);
+            }
+        }
+        match terminal {
+            Some(BackendEvent::Result {
+                markdown,
+                thread_id,
+                ..
+            }) => {
+                assert_eq!(thread_id, dest_uuid, "ack routed to the destination thread");
+                assert!(
+                    markdown.contains(&format!("dest={}", wire_thread_id(dest_uuid))),
+                    "frame thread_id must be the DESTINATION wire id: {markdown}"
+                );
+                assert!(
+                    markdown.contains(&format!("args={}", wire_thread_id(source_uuid))),
+                    "args must carry the source wire id: {markdown}"
+                );
+            }
+            other => panic!("expected terminal Result, got {other:?}"),
+        }
+
+        let _ = live.shutdown().await;
+    }
+
+    /// Malformed clone args come back as a readable error: the fake answers
+    /// the same frontend-facing code the real backend uses for validation
+    /// failures, which must parse or the request would hang forever.
+    #[tokio::test]
+    async fn clone_command_error_surfaces_readable_text() {
+        with_fake_backend();
+        let live = tokio::time::timeout(TIMEOUT, LiveBackend::connect("."))
+            .await
+            .expect("connect within timeout")
+            .expect("handshake ok");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        live.submit_encoded(
+            Submitted {
+                request_id: "99999999-8888-7777-6666-555555555554".to_owned(),
+                thread_id: "cccccccc-cccc-cccc-cccc-cccccccccccc".to_owned(),
+                prompt: "/new_thread_with_current_context".to_owned(),
+            },
+            tx,
+        );
+
+        let mut terminal = None;
+        for _ in 0..4 {
+            let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+                .await
+                .expect("event in time")
+                .expect("channel alive");
+            if matches!(evt, BackendEvent::Error { .. }) {
+                terminal = Some(evt);
+            }
+        }
+        match terminal {
+            Some(BackendEvent::Error { message, .. }) => {
+                assert!(message.contains("Usage:"), "readable text: {message}");
+            }
+            other => panic!("expected terminal Error, got {other:?}"),
         }
 
         let _ = live.shutdown().await;

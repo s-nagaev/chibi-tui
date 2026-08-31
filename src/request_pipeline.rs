@@ -250,6 +250,10 @@ impl ActorState {
 pub struct RequestPipeline {
     cmd_tx: mpsc::Sender<Command>,
     status_tx: broadcast::Sender<StatusUpdate>,
+    /// Slash commands the backend advertised in the handshake `ready` frame
+    /// (feat_thread_clone consumers). Captured once at connect; a reconnect
+    /// spawns the same program, so the set stays valid for the handle's life.
+    commands: Vec<String>,
 }
 
 impl RequestPipeline {
@@ -290,7 +294,8 @@ impl RequestPipeline {
         argv.extend(extra_args.iter().map(Into::into));
 
         let mut client = spawn_argv(&workspace_root.display().to_string(), argv).await?;
-        let _ready = client.handshake().await?;
+        let ready = client.handshake().await?;
+        let commands = ready.commands().to_vec();
 
         let parts = client.into_parts();
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -306,7 +311,18 @@ impl RequestPipeline {
             },
         ));
 
-        Ok(Self { cmd_tx, status_tx })
+        Ok(Self {
+            cmd_tx,
+            status_tx,
+            commands,
+        })
+    }
+
+    /// Slash-command set the backend advertised at handshake (empty when the
+    /// `ready` frame carried no capabilities). Feature gates read this
+    /// instead of assuming (protocol v1.1 rule: consume via detection).
+    pub fn commands(&self) -> &[String] {
+        &self.commands
     }
 
     /// Submit a request; returns immediately with a one-shot receiver for the

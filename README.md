@@ -130,6 +130,7 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+T` | **Toggle pane focus** Chat ↔ Sidebar (see the pane-focus section below). While the Sidebar holds focus, `↑`/`↓` move the thread selection with live switching and bare `Enter`/`Esc` return to the editor. Works in ANY terminal: it is a plain Ctrl+letter chord, so it never degrades the way the arrow chords do without the kitty protocol. The previous wrap-cycling thread switcher this key used to bind was removed |
 | `↑` / `↓` | Move the text cursor up/down inside the input (navigate the multi-line draft); while the Sidebar holds focus they move the thread selection instead (see pane focus below) |
 | `Ctrl+N` | New chat |
+| `Ctrl+P` | Clone the current thread with its full conversation context: a `<name> (copy)` thread appears right after the source and gets selected. Refused while the thread is busy (in-flight turn or queued prompts). Needs a backend that advertises the clone command; on older backends a popup explains instead |
 | `Ctrl+R` | Rename the current thread inline (`Enter` save · `Esc` cancel) |
 | `Ctrl+D` | Delete the current thread (`Enter`/`y` confirm · `Esc`/`n` cancel; refused while the thread is busy) |
 | `Ctrl+F` | Find in the current thread (type to filter, `↑`/`↓` navigate matches, `Enter` jump to match, `Esc` close) |
@@ -212,7 +213,8 @@ While the **Sidebar** holds focus:
 - `PgUp`/`PgDn` still scroll the CHAT pane — reading works regardless of
   which pane holds focus.
 - global service chords stay live: `^N` (new chat — then focus lands on
-  Chat), `^R` rename, `^D` delete (still refused while busy), `^F` /
+  Chat), `^R` rename, `^D` delete (still refused while busy), `^P` clone
+  thread (same busy refusal), `^F` /
   `Ctrl+Shift+F` search popups, `^G` log viewer, `^O` status strip, `^M`
   model picker, `^L` clear screen, `^C` cancel/quit.
 

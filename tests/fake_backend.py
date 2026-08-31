@@ -49,6 +49,7 @@ def ready_frame():
         "capabilities": {
             "commands": [
                 "/reset",
+                "/new_thread_with_current_context",
                 "/model",
                 "/imagine",
                 "/info",
@@ -151,6 +152,42 @@ def main() -> int:
             return
 
         request_id = obj["request_id"]
+        prompt = obj.get("prompt") or ""
+
+        # feat_thread_clone: deterministic ack for the clone command. The ack
+        # text repeats the received frame (destination thread id + raw args)
+        # so tests can assert the wire shape end to end. Missing args answer
+        # the same invalid_request code the real backend uses.
+        if prompt.startswith("/new_thread_with_current_context"):
+            parts = prompt.split(maxsplit=1)
+            clone_args = parts[1] if len(parts) > 1 else ""
+            emit({"type": "status", "request_id": request_id, "state": "queued"})
+            emit({"type": "status", "request_id": request_id, "state": "running"})
+            if clone_args:
+                emit(
+                    {
+                        "type": "result",
+                        "request_id": request_id,
+                        "content": (
+                            "Thread cloned. "
+                            f"dest={obj['thread_id']} args={clone_args}"
+                        ),
+                    }
+                )
+            else:
+                emit(
+                    {
+                        "type": "error",
+                        "request_id": request_id,
+                        "code": "invalid_request",
+                        "message": (
+                            "Invalid source thread id: ''. Usage: "
+                            "/new_thread_with_current_context <source_thread_id> [name]"
+                        ),
+                    }
+                )
+            return
+
         inflight.add(request_id)
         time.sleep(0.05)
         emit({"type": "status", "request_id": request_id, "state": "queued"})

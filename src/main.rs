@@ -139,6 +139,9 @@ async fn main() -> io::Result<()> {
             match chibi_tui::LiveBackend::connect(&cli.workspace).await {
                 Ok(live) => {
                     app.connection = Connection::Connected;
+                    // feat_thread_clone: feature gates read the handshake's
+                    // advertised commands (detection, never assumption).
+                    app.set_backend_commands(live.backend_commands().to_vec());
                     break Source::Live(live);
                 }
                 Err(e) => {
@@ -235,6 +238,9 @@ async fn connect_live(
     match chibi_tui::LiveBackend::connect(workspace).await {
         Ok(live) => {
             app.connection = Connection::Connected;
+            // feat_thread_clone: refresh the advertised commands after a
+            // reconnect too, the new session re-handshakes.
+            app.set_backend_commands(live.backend_commands().to_vec());
             app.dismiss_error();
             *source = Source::Live(live);
         }
@@ -317,6 +323,13 @@ async fn run_loop(
                             // carries its own ids and adds no bubbles.
                             if let Some(hidden) = app.take_picker_submission() {
                                 send_submitted(source, &hidden, event_tx.clone());
+                            }
+
+                            // feat_thread_clone: a staged clone request rides
+                            // the same send path as any prompt; its terminal
+                            // event resolves the pending clone inside App.
+                            if let Some(clone_req) = app.take_clone_submission() {
+                                send_submitted(source, &clone_req, event_tx.clone());
                             }
 
                             // A rename commit happened iff Enter closed an
@@ -906,6 +919,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // feat_model_picker_lite: same Normal-mode ^M semantics under
             // sidebar focus (parity contract with the chord match below).
             KeyCode::Char('m') if ctrl => app.begin_model_picker(),
+            // feat_thread_clone: same Normal-mode ^P semantics under sidebar
+            // focus (parity contract with the chord match below).
+            KeyCode::Char('p') if ctrl => app.begin_clone_thread(),
             KeyCode::Char('l') if ctrl => {
                 // Same pair as the global ^L arm below (clear + wipe intent).
                 app.clear_input();
@@ -1029,6 +1045,28 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // TUI (same argument as the ^O audit). Mnemonic: Model.
         (KeyCode::Char('m'), true) => {
             app.begin_model_picker();
+            return;
+        }
+        // Ctrl+P: CLONE THE ACTIVE THREAD (feat_thread_clone), the backend
+        // command /new_thread_with_current_context sent on the NEW thread's
+        // identity so the clone inherits the source's full conversation
+        // context. Gated by feature detection: without the command in the
+        // handshake capabilities the chord shows an informative popup
+        // instead of acting (App::begin_clone_thread owns all the guards).
+        //
+        // Chord verification (feat task discipline, same audit class as the
+        // ^G/^O/^M entries): no app binding anywhere in src/ (the only `p`
+        // hits are the splash art color table), and tui-textarea 0.7 maps
+        // Ctrl+P to move-cursor-up, which this binding deliberately
+        // OVERRIDES exactly like the ^U undo override: the global match
+        // claims the chord and returns before the textarea ever sees it, and
+        // no app flow relies on a ^P caret move (plain ↑ is the caret
+        // movement here). No macOS system hijack (Mission Control only takes
+        // ^arrows); the legacy tty VDISCARD-style meaning of ^P is inert
+        // under raw mode plus the kitty keyboard protocol. Mnemonic: P for
+        // photocopy.
+        (KeyCode::Char('p'), true) => {
+            app.begin_clone_thread();
             return;
         }
         // Ctrl+Shift+F: GLOBAL search across ALL threads
@@ -1218,6 +1256,42 @@ mod tests {
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.pending_cancel.is_none());
         assert!(app.should_quit);
+    }
+
+    // ---- feat_thread_clone: ^P routing --------------------------------------
+
+    #[test]
+    fn ctrl_p_routes_to_clone_flow_when_supported() {
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(vec!["/new_thread_with_current_context".to_owned()]);
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        assert!(
+            app.take_clone_submission().is_some(),
+            "^P stages the clone request"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_without_capability_shows_popup_and_stages_nothing() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        assert!(app.error_popup.is_some(), "informative popup");
+        assert!(app.take_clone_submission().is_none());
+    }
+
+    #[test]
+    fn ctrl_p_works_from_sidebar_focus() {
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(vec!["/new_thread_with_current_context".to_owned()]);
+        app.focus = Focus::Sidebar;
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        assert!(
+            app.take_clone_submission().is_some(),
+            "sidebar holds focus but the service chord still fires"
+        );
     }
 
     #[test]
