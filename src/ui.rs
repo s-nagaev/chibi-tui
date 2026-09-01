@@ -313,12 +313,14 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         .borders(Borders::TOP)
         .border_style(Style::new().fg(theme.selection));
 
-    // feat_status_line: when the strip is visible its `cwd: <basename> ·
+    // feat_status_line: when the strip is visible its `cwd: <path tail> ·
     // <model>` readout rides the SAME top-border row as a right-aligned
     // block title: zero extra rows (the dedicated-strip fallback was not
-    // needed; rationale in the task report). Truncated with an ellipsis to
-    // the width left of the left-aligned header title, so long workspace
-    // paths can never collide with it or overflow the pane.
+    // needed; rationale in the task report). The tail is the last three
+    // components of the workspace path with a leading `/`. It is cut from
+    // the LEFT with an ellipsis when it does not fit the width left of the
+    // header title, so the working directory itself and the model survive
+    // and the row never collides with the title or overflows the pane.
     if app.status_strip_visible {
         if let Some(strip) = status_strip_title(app, theme, area.width, &left_title) {
             block = block.title(strip);
@@ -432,16 +434,29 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     }
 }
 
-/// feat_status_line: the strip's text — `cwd: <basename> · <model>` with
+/// feat_status_line: the strip's text — `cwd: <path tail> · <model>` with
 /// `—` placeholders for an unwired workspace root / a chat without a known
-/// model yet. Deliberately a plain formatting seam: the planned v11_02
-/// segment (context size, once the protocol reports real usage) extends
-/// THIS string only — no layout or widget changes.
-fn status_strip_text(app: &App) -> String {
-    format!(
-        "cwd: {} \u{00b7} {}",
-        app.status_cwd().unwrap_or("\u{2014}"),
+/// model yet. The tail is squeezed into the columns the strip can host:
+/// cut from the LEFT with a leading `…`, so a long workspace path never
+/// pushes the model readout out of the row and the working directory
+/// itself stays visible. Deliberately a plain formatting seam: the planned
+/// v11_02 segment (context size, once the protocol reports real usage)
+/// extends THIS string only — no layout or widget changes.
+fn status_strip_text(app: &App, available: usize) -> String {
+    let cwd_tail = app.status_cwd();
+    let cwd = cwd_tail.as_deref().unwrap_or("\u{2014}");
+    let model_part = format!(
+        " \u{00b7} {}",
         app.active_model_label().unwrap_or("\u{2014}")
+    );
+    // Every column minus the `cwd: ` label and the model readout (at least
+    // one, so the fit below is always defined).
+    let cwd_budget = available
+        .saturating_sub("cwd: ".width() + model_part.width())
+        .max(1);
+    format!(
+        "cwd: {}{model_part}",
+        left_truncate_ellipsis(cwd, cwd_budget)
     )
 }
 
@@ -460,7 +475,7 @@ fn status_strip_title<'a>(
     if available == 0 {
         return None;
     }
-    let text = truncate_ellipsis(&status_strip_text(app), available);
+    let text = left_truncate_ellipsis(&status_strip_text(app, available), available);
     // Alignment rides on the Line itself (ratatui groups top titles by the
     // line's own alignment; `Title::alignment` is deprecated in 0.29).
     Some(Title::from(
@@ -468,30 +483,40 @@ fn status_strip_title<'a>(
     ))
 }
 
-/// feat_status_line: right-truncate to at most `max` display columns,
-/// replacing the dropped tail with a single-column ellipsis. Display width
+/// feat_status_line: left-truncate to at most `max` display columns,
+/// replacing the dropped head with a single-column ellipsis. The strip is
+/// right-aligned, so its TAIL (the working directory and the model) is
+/// what has to survive a squeeze, not the `cwd: ` label. Display width
 /// (unicode-width) throughout: wide glyphs (CJK/emoji) are dropped whole
 /// instead of straddling the boundary.
-fn truncate_ellipsis(text: &str, max: usize) -> String {
+fn left_truncate_ellipsis(text: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
     if text.width() <= max {
         return text.to_owned();
     }
-    // Reserve one column for the ellipsis; fill the rest greedily.
+    // Reserve one column for the ellipsis, fill the rest from the right.
     let budget = max - 1;
-    let mut out = String::new();
+    let chars: Vec<(char, usize)> = text
+        .chars()
+        .map(|ch| (ch, ch.width().unwrap_or(0)))
+        .collect();
     let mut used = 0usize;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
+    let mut start = chars.len();
+    while start > 0 {
+        let w = chars[start - 1].1;
         if used + w > budget {
             break;
         }
         used += w;
-        out.push(ch);
+        start -= 1;
     }
+    let mut out = String::new();
     out.push('\u{2026}');
+    for (ch, _) in &chars[start..] {
+        out.push(*ch);
+    }
     out
 }
 
@@ -4086,6 +4111,73 @@ mod tests {
             header.trim_end().width() <= 120,
             "header row overflowed: {} cols",
             header.trim_end().width()
+        );
+    }
+
+    /// The cwd segment shows the last three path components with a leading
+    /// `/` (owner format), not the bare basename.
+    #[test]
+    fn status_strip_shows_the_cwd_path_tail() {
+        let mut app = App::new(mock::initial_chats());
+        app.workspace_root = Some("/Users/sergio/Develop/personal/chibi-tui".into());
+        app.toggle_status_strip();
+
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains("cwd: /Develop/personal/chibi-tui"),
+            "cwd tail missing: {:?}",
+            rows[0]
+        );
+    }
+
+    /// Under width pressure the tail is cut from the LEFT with a leading
+    /// `…` while the working directory itself and the model readout
+    /// survive (the strip is right-aligned, so its tail end is the part
+    /// worth keeping).
+    #[test]
+    fn status_strip_left_truncates_the_cwd_tail_but_keeps_the_directory() {
+        let mut app = App::new(mock::initial_chats());
+        app.workspace_root = Some(format!("/Users/sergio/{}/personal/chibi", "d".repeat(100)));
+        app.toggle_status_strip();
+
+        let rows = render_grid(&mut app);
+        let header = &rows[0];
+        assert!(header.contains('\u{2026}'), "ellipsis missing: {header:?}");
+        assert!(
+            header.contains("/personal/chibi"),
+            "working directory lost: {header:?}"
+        );
+        assert!(
+            !header.contains(&"d".repeat(100)),
+            "untruncated tail leaked into the row: {header:?}"
+        );
+        assert!(
+            !header.contains("/sergio/"),
+            "tail must be cut from the left, not the right: {header:?}"
+        );
+        assert!(
+            header.contains("\u{00b7} \u{2014}"),
+            "model readout must survive the squeeze: {header:?}"
+        );
+        assert!(
+            header.trim_end().width() <= 120,
+            "header row overflowed: {} cols",
+            header.trim_end().width()
+        );
+    }
+
+    /// The owner's example: a tight budget reads `…onal/chibi`, the working
+    /// directory itself never falls under the cut; a roomy budget leaves
+    /// the tail untouched.
+    #[test]
+    fn left_truncate_ellipsis_cuts_from_the_left() {
+        assert_eq!(
+            left_truncate_ellipsis("/Develop/personal/chibi", 11),
+            "\u{2026}onal/chibi"
+        );
+        assert_eq!(
+            left_truncate_ellipsis("/Develop/personal/chibi", 40),
+            "/Develop/personal/chibi"
         );
     }
 

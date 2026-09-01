@@ -363,12 +363,13 @@ pub struct App {
     /// captures keys and survives every modal open/close untouched.
     pub status_strip_visible: bool,
     /// feat_status_line: workspace root backing the strip's cwd segment
-    /// (shown as its basename). Wired once at startup from the CLI
-    /// `--workspace` value (which itself defaults to the process cwd) for
-    /// BOTH backends, mock included. The renderer reads it reactively every
-    /// frame, so if the root ever changes at runtime the next frame shows
-    /// the new basename — today it is CLI-only and never changes.
-    /// `None` renders as the `—` placeholder.
+    /// (rendered as the last three path components with a leading `/`).
+    /// Wired once at startup from the CLI `--workspace` value (which
+    /// itself defaults to the process cwd) for BOTH backends, mock
+    /// included. The renderer reads it reactively every frame, so if the
+    /// root ever changes at runtime the next frame shows the new tail —
+    /// today it is CLI-only and never changes. `None` renders as the `—`
+    /// placeholder.
     pub workspace_root: Option<String>,
     /// feat_model_picker_lite: hidden exchange bundle staged by the key
     /// handlers (`^M` open, Enter selection) for the event loop to hand to
@@ -564,22 +565,42 @@ impl App {
         self.status_strip_visible = !self.status_strip_visible;
     }
 
-    /// feat_status_line: the strip's cwd segment — the BASENAME of the
-    /// workspace root ([`App::workspace_root`], wired from the CLI at
+    /// feat_status_line: the strip's cwd segment, the LAST THREE components
+    /// of the workspace root ([`App::workspace_root`], wired from the CLI at
     /// startup; the TUI knows the root from the request frames / CLI and
     /// today it never changes at runtime, but the value is read reactively
-    /// here so a future runtime change shows up on the next frame). A
-    /// pathless root (`/`, `.`) or a non-UTF-8 tail degrades to the raw
-    /// string; `None` (only before startup wiring) yields `None` and the
-    /// renderer shows the `—` placeholder.
-    pub fn status_cwd(&self) -> Option<&str> {
+    /// here so a future runtime change shows up on the next frame), joined
+    /// with `/` and prefixed with a leading `/`: the owner format
+    /// `/Develop/personal/chibi-tui` instead of the bare `chibi-tui`, so
+    /// sibling workspaces tell themselves apart at a glance. Paths with
+    /// fewer components show the same prefix with what they have, nothing
+    /// is fabricated; the filesystem root (`/`) and non-absolute roots
+    /// (`.`) degrade to the raw string, and so does a tail holding a
+    /// non-UTF-8 component. `None` (only before startup wiring) yields
+    /// `None` and the renderer shows the `—` placeholder.
+    pub fn status_cwd(&self) -> Option<String> {
         let root = self.workspace_root.as_deref()?;
         let path = std::path::Path::new(root);
-        Some(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(root),
-        )
+        if !path.is_absolute() {
+            return Some(root.to_string());
+        }
+        let names: Vec<Option<&str>> = path
+            .components()
+            .skip(1) // the leading `/` of the prefix stands in for RootDir
+            .map(|c| c.as_os_str().to_str())
+            .collect();
+        if names.is_empty() {
+            return Some("/".to_string());
+        }
+        let mut parts: Vec<&str> = Vec::with_capacity(names.len().min(3));
+        for name in &names[names.len().saturating_sub(3)..] {
+            match name {
+                Some(s) => parts.push(s),
+                // non-UTF-8 inside the tail: the raw root is the readout
+                None => return Some(root.to_string()),
+            }
+        }
+        Some(format!("/{}", parts.join("/")))
     }
 
     /// feat_status_line: the strip's model segment — the LAST KNOWN model
@@ -2788,28 +2809,43 @@ mod tests {
         assert!(app.status_strip_visible, "log viewer close must keep it");
     }
 
-    /// The cwd segment is the workspace root's BASENAME (long paths must not
-    /// leak into the strip); pathless roots degrade to the raw string.
+    /// The cwd segment is the workspace root's path TAIL: the last three
+    /// components with a leading `/`; shorter paths show what they have
+    /// and pathless roots degrade to the raw string.
     #[test]
-    fn status_cwd_is_the_workspace_basename() {
+    fn status_cwd_is_the_workspace_path_tail() {
         let mut app = app_with_chats(1);
         assert_eq!(app.status_cwd(), None, "unwired root yields None");
 
         app.workspace_root = Some("/Users/sergio/Develop/personal/chibi-tui".into());
-        assert_eq!(app.status_cwd(), Some("chibi-tui"));
-
-        app.workspace_root = Some("/Users/sergio/Develop/".into());
         assert_eq!(
-            app.status_cwd(),
-            Some("Develop"),
+            app.status_cwd().as_deref(),
+            Some("/Develop/personal/chibi-tui")
+        );
+
+        // Exactly three components: the whole path behind the prefix.
+        app.workspace_root = Some("/home/sergio/chibi-tui".into());
+        assert_eq!(app.status_cwd().as_deref(), Some("/home/sergio/chibi-tui"));
+
+        app.workspace_root = Some("/Users/sergio/".into());
+        assert_eq!(
+            app.status_cwd().as_deref(),
+            Some("/Users/sergio"),
             "trailing slash tolerated"
         );
 
+        app.workspace_root = Some("/chibi-tui".into());
+        assert_eq!(app.status_cwd().as_deref(), Some("/chibi-tui"));
+
         app.workspace_root = Some("/".into());
-        assert_eq!(app.status_cwd(), Some("/"), "pathless root degrades to raw");
+        assert_eq!(
+            app.status_cwd().as_deref(),
+            Some("/"),
+            "pathless root degrades to raw"
+        );
 
         app.workspace_root = Some(".".into());
-        assert_eq!(app.status_cwd(), Some("."));
+        assert_eq!(app.status_cwd().as_deref(), Some("."));
     }
 
     /// Model segment: `None` until a labelled result resolves, then the
