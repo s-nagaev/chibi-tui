@@ -39,6 +39,18 @@ pub struct Theme {
     /// Sidebar marker role slot: the resting dot of a read, unselected
     /// thread (feat_sidebar_unread_marker).
     pub dot_default: Color,
+    /// Log viewer role slots (feat_log_viewer_core): one per diagnostics
+    /// level, so the ^G viewer colorizes without touching raw accents.
+    /// INFO lines (the plain background chatter) rest dim.
+    pub log_info: Color,
+    /// CALL lines (backend tool-call banners) take the cyan slot.
+    pub log_call: Color,
+    /// THINK lines (model reasoning traces) take the purple slot.
+    pub log_think: Color,
+    /// MODERATOR lines take the orange slot.
+    pub log_moderator: Color,
+    /// TOOL lines take the strong blue slot.
+    pub log_tool: Color,
 }
 
 impl Theme {
@@ -66,6 +78,13 @@ impl Theme {
             active_marker: Color::Rgb(158, 206, 106), // #9ece6a, same as green
             unread_activity: Color::Rgb(224, 175, 104), // #e0af68, same as yellow
             dot_default: Color::Rgb(86, 95, 137),     // #565f89, same as dim
+            // Log viewer level slots reuse the Tokyo Night accents they
+            // always rendered with (feat_log_viewer_core).
+            log_info: Color::Rgb(86, 95, 137), // #565f89, same as dim
+            log_call: Color::Rgb(125, 207, 255), // #7dcfff, same as cyan
+            log_think: Color::Rgb(187, 154, 247), // #bb9af7, same as purple
+            log_moderator: Color::Rgb(255, 158, 100), // #ff9e64, same as orange
+            log_tool: Color::Rgb(122, 162, 247), // #7aa2f7, same as blue
         }
     }
 }

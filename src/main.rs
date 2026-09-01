@@ -661,21 +661,29 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
 
     // ---- feat_stderr_log_modal: diagnostics log viewer modal ----
     //
-    // While the ^G log viewer is open, ONLY viewer keys work: PgUp/PgDn (and
-    // ↑/↓) scroll. PgUp/↑ detach from the live tail, PgDn/↓ return towards
-    // it (reaching the bottom re-arms live-tail), Esc closes, Ctrl+C quits
-    // (same class as the other popups). Everything else (typing, global
-    // chords (^N/^R/^D/^T/^L/^F), thread switching) is swallowed so no
-    // keystroke leaks into the textarea and no global binding fires. There
-    // is no Enter action: the viewer is strictly read-only, so Enter is
-    // swallowed and the loop's submit gates need no extra snapshot flag.
+    // While the ^G log viewer is open, ONLY viewer keys work: the cursor
+    // walks logical lines (↑/↓ and k/j by one line, PgUp/PgDn by a page,
+    // g/G to the ends, where G returns to the live tail), `w` toggles wrap.
+    // While the cursor rests on the newest line the view keeps streaming
+    // new arrivals in; one step up pins it to the cursor. Esc closes,
+    // Ctrl+C quits (same class as the other popups). Everything else
+    // (typing, global chords (^N/^R/^D/^T/^L/^F), thread switching) is
+    // swallowed so no keystroke leaks into the textarea and no global
+    // binding fires. There is no Enter action: the viewer is strictly
+    // read-only, so Enter is swallowed and the loop's submit gates need no
+    // extra snapshot flag.
     if matches!(app.mode, Mode::LogViewer { .. }) {
         match key.code {
-            KeyCode::PageUp => app.log_scroll_up(app.log_visible_rows),
-            KeyCode::PageDown => app.log_scroll_down(app.log_visible_rows),
-            // One-line flavor of the same scroll (plain arrows are nav here).
-            KeyCode::Up => app.log_scroll_up(1),
-            KeyCode::Down => app.log_scroll_down(1),
+            KeyCode::PageUp => app.log_page_up(),
+            KeyCode::PageDown => app.log_page_down(),
+            // One-line flavor of the same navigation (plain arrows and the
+            // vim letters move the cursor, the viewport follows it). The
+            // ctrl/alt flavors stay swallowed, same as before.
+            KeyCode::Up | KeyCode::Char('k') if !ctrl && !alt => app.log_cursor_up(1),
+            KeyCode::Down | KeyCode::Char('j') if !ctrl && !alt => app.log_cursor_down(1),
+            KeyCode::Char('g') if !ctrl && !alt => app.log_jump_top(),
+            KeyCode::Char('G') => app.log_jump_bottom(),
+            KeyCode::Char('w') if !ctrl && !alt => app.log_toggle_wrap(),
             KeyCode::Esc => {
                 app.close_log_viewer();
             }
@@ -3024,7 +3032,7 @@ mod tests {
             chibi_tui::app::Mode::LogViewer { state } => state,
             other => panic!("expected LogViewer, got {other:?}"),
         };
-        assert_eq!(state.scroll, 0, "opens live-tailing");
+        assert!(state.at_tail(), "opens live-tailing: cursor on the tail");
         assert!(
             state.lines.contains(&marker),
             "the modal snapshot carries the buffered marker"
@@ -3057,23 +3065,66 @@ mod tests {
     }
 
     #[test]
-    fn log_viewer_pgup_pgdn_and_arrows_scroll() {
+    fn log_viewer_pgup_pgdn_arrows_and_letters_navigate() {
         let mut app = app_with_chats(1);
+        for i in 0..60 {
+            chibi_tui::diag::append(format!("filler-{i}"));
+        }
         press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        // The diag stream is process-global (other tests append in
+        // parallel), so indices are relative to the open-time snapshot.
+        let cursor = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.cursor,
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+        let tail = cursor(&app);
+        assert!(tail >= 59, "the 60 filler lines are in the snapshot");
 
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         assert_eq!(app.log_visible_rows, 20, "page = one modal page");
-        let scroll = |app: &chibi_tui::app::App| match &app.mode {
-            chibi_tui::app::Mode::LogViewer { state } => state.scroll,
+        assert_eq!(cursor(&app), tail - 20, "PgUp pages up, cursor follows");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(cursor(&app), tail - 21, "↑ steps one line");
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(cursor(&app), tail - 22, "k steps one line too");
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(cursor(&app), tail - 2);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(cursor(&app), tail - 1, "↓ steps one line, still pinned");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let at_tail = match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.at_tail(),
             other => panic!("expected LogViewer, got {other:?}"),
         };
-        assert_eq!(scroll(&app), 20, "PgUp detaches by one page");
-        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(scroll(&app), 21, "↑ scrolls one row");
-        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
-        assert_eq!(scroll(&app), 1);
-        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(scroll(&app), 0, "back at the live tail");
+        assert!(at_tail, "j lands back on the live tail (re-armed)");
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(cursor(&app), 0, "g jumps to the top");
+        press(&mut app, KeyCode::Char('G'), KeyModifiers::NONE);
+        let at_tail = match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.at_tail(),
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+        assert!(at_tail, "G jumps back to the live tail");
+    }
+
+    /// `w` toggles wrap from the keyboard; the cursor stays over the same
+    /// logical line (full render-level behavior covered in ui.rs).
+    #[test]
+    fn log_viewer_w_toggles_wrap() {
+        let mut app = app_with_chats(1);
+        chibi_tui::diag::append("some line");
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let wrap = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.wrap,
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+        assert!(!wrap(&app));
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
+        assert!(wrap(&app), "`w` turns wrap on");
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
+        assert!(!wrap(&app), "`w` turns wrap back off");
     }
 
     #[test]
@@ -3096,19 +3147,25 @@ mod tests {
     #[test]
     fn log_viewer_swallows_typing_and_global_chords() {
         let mut app = app_with_chats(3);
+        for i in 0..20 {
+            chibi_tui::diag::append(format!("filler-{i}"));
+        }
         type_in(&mut app, "draft");
         app.scroll_up(30);
         let scroll_before = app.scroll;
         press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
-        let state_scroll = |app: &chibi_tui::app::App| match &app.mode {
-            chibi_tui::app::Mode::LogViewer { state } => state.scroll,
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        let cursor = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.cursor,
             other => panic!("expected LogViewer, got {other:?}"),
         };
+        let cursor_before = cursor(&app);
 
-        // Typing must not reach the textarea and must not scroll (letters
-        // avoid the popup's own keys — though none exist beyond nav/Esc).
+        // Typing must not reach the textarea and must not move the cursor
+        // (letters avoid the viewer's own keys, x/y/z are not bound here).
         type_in(&mut app, "xyz");
-        assert_eq!(state_scroll(&app), 0);
+        assert_eq!(cursor(&app), cursor_before);
         // Global chords suspended: nav, new chat, rename entry, wipe,
         // delete, searches, focus toggle.
         press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
@@ -3140,8 +3197,8 @@ mod tests {
             "typing must not leak into (nor disturb) the prompt textarea"
         );
         assert_eq!(
-            state_scroll(&app),
-            0,
+            cursor(&app),
+            cursor_before,
             "swallowed keys must not move the read position"
         );
     }

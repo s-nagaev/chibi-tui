@@ -99,26 +99,84 @@ pub struct GlobalSearchState {
     pub matches: Vec<GlobalSearchMatch>,
 }
 
-/// State of the open diagnostics-log viewer modal (feat_stderr_log_modal).
+/// State of the open diagnostics-log viewer modal (feat_stderr_log_modal,
+/// interaction core rebuilt by feat_log_viewer_core).
 ///
 /// Read position management is deliberately simple, snapshot-copy based:
 /// the modal holds a COPY of the ring buffer taken at the last refresh, so
 /// the capture task can keep appending (and evicting) freely underneath.
-/// `scroll` counts rows scrolled UP from the bottom — `0` is live-tail mode,
-/// where the snapshot is refreshed every frame so new lines stream in; any
-/// offset > 0 detaches the view: the snapshot freezes and lines arriving
-/// after `snapshot_total` are only counted (the `+K new lines` footer), never
-/// rendered until the user pages back to the bottom.
+/// The cursor walks LOGICAL lines: the newest line is the live tail, so
+/// while the cursor rests there the view stays pinned to the tail and every
+/// new line streams in; one cursor step up unpins, and the view then stays
+/// glued to the cursor instead of jumping to the bottom. `wrap` toggles
+/// Paragraph-style reflow of long lines; the cursor still moves one logical
+/// line per step, no matter how many rows a wrapped line occupies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogViewerState {
     /// Snapshot copy of the buffered lines (oldest → newest) at the last
     /// refresh (open, live-tail frame, or return-to-bottom).
     pub lines: Vec<String>,
-    /// Rows scrolled up from the bottom (0 = live-tail at the bottom).
-    pub scroll: u16,
+    /// Logical line the cursor sits on (0-based; the newest line is the
+    /// live tail).
+    pub cursor: usize,
+    /// `w` toggle: reflow long lines over multiple rows instead of
+    /// right-truncating them.
+    pub wrap: bool,
     /// [`crate::diag::total_appended()`] at snapshot time — the baseline the
     /// `+K new lines` footer hint is computed against.
     pub snapshot_total: u64,
+    /// Row offset of the rendered viewport (render-side bookkeeping, kept
+    /// here so a pinned view scrolls minimally instead of re-anchoring on
+    /// every frame). Rows, not logical lines: wrap changes the grid.
+    pub row_offset: usize,
+}
+
+impl LogViewerState {
+    /// True when the cursor rests on the newest line of the snapshot, the
+    /// live tail. Only then does the viewer keep streaming new lines in.
+    pub fn at_tail(&self) -> bool {
+        self.cursor + 1 >= self.lines.len()
+    }
+
+    /// Rendered row count of one logical line at the given content width:
+    /// 1 when wrapping is off, the chunk count otherwise. The wrap math is
+    /// shared with the renderer so cursor paging and the visible-window
+    /// arithmetic can never disagree.
+    pub fn row_count_of(&self, index: usize, width: usize) -> usize {
+        if self.wrap {
+            wrapped_row_count(&self.lines[index], width)
+        } else {
+            1
+        }
+    }
+}
+
+/// Split one logical line into `width`-wide row chunks (character-level,
+/// display width via unicode-width, so the row math matches what the
+/// renderer shows exactly). `width` 0 is treated as 1: a degenerate
+/// viewport must not divide by zero or loop forever.
+pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for ch in line.chars() {
+        let ch_w = ch.width().unwrap_or(0);
+        if current_w + ch_w > width && !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+            current_w = 0;
+        }
+        current.push(ch);
+        current_w += ch_w;
+    }
+    rows.push(current);
+    rows
+}
+
+/// Row count of a wrapped logical line (see [`wrap_line`]).
+pub fn wrapped_row_count(line: &str, width: usize) -> usize {
+    wrap_line(line, width).len()
 }
 
 /// Phase of the open model-picker popup (feat_model_picker_lite).
@@ -355,6 +413,12 @@ pub struct App {
     /// scroll exactly one page of modal rows. Defaults to 20 until first
     /// render (same seam as [`App::chat_visible_rows`]).
     pub log_visible_rows: u16,
+    /// feat_log_viewer_core: content width (columns) of the log-viewer
+    /// modal's text area, set during `ui::render_log_viewer`. With wrap on,
+    /// page steps are measured in reflowed rows, so the cursor math needs
+    /// the same width the renderer chunks lines at. Defaults to 100 until
+    /// first render.
+    pub log_content_width: u16,
     /// feat_stderr_log_modal: the consumer-side "seen" watermark — the
     /// [`crate::diag::DiagLog::total`] value at the moment the log stream
     /// was last fully viewed (viewer opened / re-tailed / closed at the
@@ -508,6 +572,7 @@ impl App {
             pending_search_jump: None,
             pending_global_search_jump: None,
             log_visible_rows: 20,
+            log_content_width: 100,
             log_seen_total: 0,
             status_strip_visible: false,
             workspace_root: None,
@@ -1098,44 +1163,133 @@ impl App {
         self.log_seen_total = snapshot_total;
         self.mode = Mode::LogViewer {
             state: LogViewerState {
+                cursor: lines.len().saturating_sub(1),
+                wrap: false,
+                row_offset: 0,
                 lines,
-                scroll: 0,
                 snapshot_total,
             },
         };
     }
 
-    /// PgUp (or ↑): detach from the bottom / scroll further up. The snapshot
-    /// freezes — lines arriving while detached are only counted (the
-    /// `+K new lines` footer), never rendered into the frozen view.
-    pub fn log_scroll_up(&mut self, amount: u16) {
+    /// Refresh the snapshot to the CURRENT ring content and park the cursor
+    /// on the (new) newest line: the live tail re-arms, everything shown
+    /// counts as seen. Shared by cursor-down-to-tail, `G` and the render
+    /// loop's tail-follow refresh.
+    fn log_rearm_tail(&mut self) {
         if let Mode::LogViewer { state } = &mut self.mode {
-            state.scroll = state.scroll.saturating_add(amount);
+            let (lines, snapshot_total) = crate::diag::view();
+            state.cursor = lines.len().saturating_sub(1);
+            state.row_offset = 0;
+            state.lines = lines;
+            state.snapshot_total = snapshot_total;
+            self.log_seen_total = snapshot_total;
         }
     }
 
-    /// PgDn (or ↓): back towards the bottom. Reaching `0` re-arms live-tail:
-    /// the snapshot refreshes to the current ring content and everything
-    /// shown counts as seen.
-    pub fn log_scroll_down(&mut self, amount: u16) {
+    /// ↑ or k: move the line cursor up (clamped at the top). One step = one
+    /// LOGICAL line, even when wrap splits it over several rows. Moving up
+    /// unpins the view from the tail: the snapshot freezes and new arrivals
+    /// only count in the `+K new lines` footer.
+    pub fn log_cursor_up(&mut self, amount: usize) {
         if let Mode::LogViewer { state } = &mut self.mode {
-            state.scroll = state.scroll.saturating_sub(amount);
-            if state.scroll == 0 {
-                let (lines, snapshot_total) = crate::diag::view();
-                state.lines = lines;
-                state.snapshot_total = snapshot_total;
-                self.log_seen_total = snapshot_total;
+            state.cursor = state.cursor.saturating_sub(amount);
+        }
+    }
+
+    /// ↓ or j: move the line cursor down (clamped at the bottom). Reaching
+    /// the newest line re-arms the live tail (snapshot refresh + seen
+    /// watermark), matching the tail-follow rule.
+    pub fn log_cursor_down(&mut self, amount: usize) {
+        let reached_tail = match &mut self.mode {
+            Mode::LogViewer { state } => {
+                let last = state.lines.len().saturating_sub(1);
+                state.cursor = state.cursor.saturating_add(amount).min(last);
+                state.cursor == last && !state.lines.is_empty()
             }
+            _ => false,
+        };
+        if reached_tail {
+            self.log_rearm_tail();
         }
     }
 
-    /// Close the log viewer (Esc). Closing while live-tailing (at the
-    /// bottom) marks the stream as seen — the user just watched those lines
-    /// arrive. Closing while scrolled UP keeps the unseen counter, so the
-    /// `log*` status marker keeps flagging the lines missed while detached.
+    /// PgUp: page up by (roughly) one viewport of rows; the cursor lands on
+    /// the page's top line. With wrap on, the page is measured in reflowed
+    /// rows at the render width, so a page is a page in both modes.
+    pub fn log_page_up(&mut self) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            let page = self.log_visible_rows as usize;
+            let width = self.log_content_width.max(1) as usize;
+            let mut skipped = 0usize;
+            let mut target = state.cursor;
+            while target > 0 {
+                target -= 1;
+                skipped += state.row_count_of(target, width);
+                if skipped >= page {
+                    break;
+                }
+            }
+            state.cursor = target;
+        }
+    }
+
+    /// PgDn: page down by one viewport of rows; the cursor lands on the
+    /// page's bottom line. Reaching the newest line re-arms the live tail.
+    pub fn log_page_down(&mut self) {
+        let reached_tail = match &mut self.mode {
+            Mode::LogViewer { state } => {
+                let page = self.log_visible_rows as usize;
+                let width = self.log_content_width.max(1) as usize;
+                let last = state.lines.len().saturating_sub(1);
+                let mut advanced = 0usize;
+                let mut target = state.cursor;
+                while target < last {
+                    advanced += state.row_count_of(target, width);
+                    target += 1;
+                    if advanced >= page {
+                        break;
+                    }
+                }
+                state.cursor = target;
+                state.cursor == last && !state.lines.is_empty()
+            }
+            _ => false,
+        };
+        if reached_tail {
+            self.log_rearm_tail();
+        }
+    }
+
+    /// g: jump to the oldest line. The view stays pinned to the cursor.
+    pub fn log_jump_top(&mut self) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            state.cursor = 0;
+        }
+    }
+
+    /// G: jump to the newest line, back to the live tail. The snapshot
+    /// refreshes to current ring content and the stream counts as seen.
+    pub fn log_jump_bottom(&mut self) {
+        self.log_rearm_tail();
+    }
+
+    /// w: toggle logical-line wrapping. The cursor keeps pointing at the
+    /// same logical line; only the row grid under it changes.
+    pub fn log_toggle_wrap(&mut self) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            state.wrap = !state.wrap;
+        }
+    }
+
+    /// Close the log viewer (Esc). Closing while live-tailing (cursor on
+    /// the newest line) marks the stream as seen: the user just watched
+    /// those lines arrive. Closing while pinned further up keeps the unseen
+    /// counter, so the `log*` status marker keeps flagging the lines missed
+    /// while the view was frozen.
     pub fn close_log_viewer(&mut self) -> bool {
         let at_bottom = match &self.mode {
-            Mode::LogViewer { state } => state.scroll == 0,
+            Mode::LogViewer { state } => state.at_tail(),
             _ => return false,
         };
         self.mode = Mode::Normal;
@@ -5074,7 +5228,10 @@ mod tests {
         app.begin_log_viewer();
 
         let state = log_state(&app);
-        assert_eq!(state.scroll, 0, "opens live-tailing at the bottom");
+        assert!(
+            state.at_tail(),
+            "opens live-tailing: cursor on the newest line"
+        );
         assert!(
             state.lines.contains(&marker),
             "snapshot copy contains the buffered marker"
@@ -5119,16 +5276,24 @@ mod tests {
             "close-at-bottom advances the watermark past arrivals"
         );
 
-        // Closing while DETACHED does not mark: the missed lines stay unseen.
+        // Closing while PINNED (cursor above the tail) does not mark: the
+        // missed lines stay unseen.
         let mut app = App::new(Vec::new());
+        for i in 0..10 {
+            crate::diag::append(format!("filler-{i}"));
+        }
         app.begin_log_viewer();
         let seen_at_open = app.log_seen_total;
-        app.log_scroll_up(5);
-        crate::diag::append("missed-while-detached");
+        app.log_cursor_up(5);
+        assert!(
+            !log_state(&app).at_tail(),
+            "precondition: cursor up pinned the view away from the tail"
+        );
+        crate::diag::append("missed-while-pinned");
         assert!(app.close_log_viewer());
         assert_eq!(
             app.log_seen_total, seen_at_open,
-            "close while scrolled up must not mark the missed lines seen"
+            "close while pinned must not mark the missed lines seen"
         );
         assert!(
             crate::diag::total_appended() > app.log_seen_total,
@@ -5162,34 +5327,54 @@ mod tests {
         app.begin_log_viewer();
         assert!(matches!(app.mode, Mode::SearchingAll { .. }));
 
-        // Already-open viewer: re-open must not reset the scroll.
+        // Already-open viewer: re-open must not reset the cursor.
         let mut app = app_with_chats(0);
+        for i in 0..12 {
+            crate::diag::append(format!("filler-{i}"));
+        }
         app.begin_log_viewer();
-        app.log_scroll_up(7);
+        app.log_cursor_up(7);
+        let pinned_at = log_state(&app).cursor;
         app.begin_log_viewer();
-        assert_eq!(log_state(&app).scroll, 7, "re-open does not clobber");
+        assert_eq!(
+            log_state(&app).cursor,
+            pinned_at,
+            "re-open does not clobber"
+        );
     }
 
     #[test]
-    fn log_scrolling_detaches_and_return_to_bottom_re_arms_live_tail() {
+    fn log_navigation_pins_and_return_to_bottom_re_arms_live_tail() {
         let mut app = app_with_chats(0);
+        for i in 0..40 {
+            crate::diag::append(format!("filler-{i}"));
+        }
         app.begin_log_viewer();
         let baseline = log_state(&app).snapshot_total;
 
-        // Detach: scroll freezes the snapshot (baseline stays put).
-        app.log_scroll_up(30);
-        app.log_scroll_up(30);
-        assert_eq!(log_state(&app).scroll, 60, "PgUp accumulates");
-        app.log_scroll_down(10);
-        assert_eq!(log_state(&app).scroll, 50);
+        // Detach: stepping the cursor up freezes the snapshot (baseline
+        // stays put). Steps walk LOGICAL lines one by one.
+        app.log_cursor_up(30);
+        app.log_cursor_up(30);
+        assert_eq!(log_state(&app).cursor, 0, "cursor clamps at the top");
+        app.log_cursor_down(10);
+        assert_eq!(log_state(&app).cursor, 10);
+        assert!(
+            !log_state(&app).at_tail(),
+            "still pinned away from the tail"
+        );
 
-        // Lines arriving while detached count against the baseline…
+        // Lines arriving while pinned count against the baseline…
         let detached_marker = unique_line("detached");
         crate::diag::append(&detached_marker);
         assert_eq!(
             log_state(&app).snapshot_total,
             baseline,
-            "snapshot frozen while scrolled up"
+            "snapshot frozen while pinned"
+        );
+        assert!(
+            !log_state(&app).lines.contains(&detached_marker),
+            "frozen snapshot does not show the arrival"
         );
         let total_now = crate::diag::total_appended();
         assert!(
@@ -5197,10 +5382,11 @@ mod tests {
             "monotonic total includes the detached arrival"
         );
 
-        // …and re-arming the tail refreshes the snapshot to CURRENT content.
-        app.log_scroll_down(50);
+        // …and G (jump to bottom) re-arms the tail: the snapshot refreshes
+        // to CURRENT content.
+        app.log_jump_bottom();
         let state = log_state(&app);
-        assert_eq!(state.scroll, 0, "back at the bottom");
+        assert!(state.at_tail(), "back at the bottom");
         assert!(
             state.lines.contains(&detached_marker),
             "live-tail refresh picked up the detached arrival"
@@ -5224,10 +5410,14 @@ mod tests {
 
         // Scrolled up: close still resets the UI…
         let mut app = App::new(Vec::new());
+        for i in 0..12 {
+            crate::diag::append(format!("filler-{i}"));
+        }
         app.begin_log_viewer();
         let seen_at_open = app.log_seen_total;
-        app.log_scroll_up(9);
-        crate::diag::append("missed-while-detached");
+        app.log_cursor_up(9);
+        assert!(!log_state(&app).at_tail(), "precondition: pinned");
+        crate::diag::append("missed-while-pinned");
         assert!(app.close_log_viewer());
         assert!(app.mode.is_normal());
         assert_eq!(app.focus, Focus::Chat);
@@ -5256,7 +5446,7 @@ mod tests {
         app.scroll_up(12);
 
         app.begin_log_viewer();
-        app.log_scroll_up(3);
+        app.log_cursor_up(3);
         app.close_log_viewer();
 
         let chats_after: Vec<String> = app
@@ -5270,6 +5460,104 @@ mod tests {
         assert_eq!(chats_after, chats_before, "viewer is read-only on chats");
         assert_eq!(app.input.lines().join(""), "precious draft");
         assert_eq!(app.scroll, 12, "chat scroll untouched by the modal");
+    }
+
+    /// feat_log_viewer_core: `w` flips the wrap flag; the cursor keeps
+    /// pointing at the SAME logical line, and one cursor step still walks
+    /// one logical line even when wrap splits it over several rows.
+    #[test]
+    fn wrap_toggle_keeps_cursor_over_logical_lines() {
+        let mut app = app_with_chats(0);
+        crate::diag::append("short head");
+        crate::diag::append(format!("LONG-{}", "x".repeat(300)));
+        crate::diag::append("short tail");
+        app.begin_log_viewer();
+
+        // The diag stream is process-global and other tests append to it in
+        // parallel, so all indices are relative to the snapshot taken at
+        // open: the three lines above are the LAST three snapshot entries.
+        let len = log_state(&app).lines.len();
+        let tail = len - 1;
+
+        assert!(!log_state(&app).wrap, "wrap starts off");
+        assert!(log_state(&app).at_tail(), "cursor parked on the tail");
+        app.log_toggle_wrap();
+        assert!(log_state(&app).wrap, "`w` turns wrap on");
+        assert_eq!(
+            log_state(&app).cursor,
+            tail,
+            "cursor still on the same logical line"
+        );
+
+        // One step up = one logical line: from `short tail` straight onto
+        // the 300-char line, regardless of its wrapped row count.
+        app.log_cursor_up(1);
+        assert_eq!(log_state(&app).cursor, tail - 1);
+        app.log_cursor_up(1);
+        assert_eq!(log_state(&app).cursor, tail - 2);
+        app.log_cursor_up(1);
+        assert_eq!(
+            log_state(&app).cursor,
+            tail.saturating_sub(3),
+            "clamped only at the very top"
+        );
+
+        app.log_toggle_wrap();
+        assert!(!log_state(&app).wrap, "second `w` turns wrap back off");
+    }
+
+    /// feat_log_viewer_core: PgUp/PgDn move the cursor by one viewport of
+    /// rows (lines while wrap is off); landing back on the newest line
+    /// re-arms the live tail.
+    #[test]
+    fn page_navigation_moves_cursor_by_viewport_rows() {
+        let mut app = app_with_chats(0);
+        for i in 0..60 {
+            crate::diag::append(format!("filler-{i}"));
+        }
+        app.begin_log_viewer();
+        // Default page seam before the first render (same as chat pane).
+        assert_eq!(app.log_visible_rows, 20);
+        // Indices relative to the open-time snapshot: the diag stream is
+        // process-global and other tests append to it in parallel.
+        let tail = log_state(&app).lines.len() - 1;
+        assert_eq!(log_state(&app).cursor, tail, "opens on the newest line");
+
+        app.log_page_up();
+        assert_eq!(log_state(&app).cursor, tail - 20, "PgUp = one page up");
+        app.log_page_up();
+        assert_eq!(log_state(&app).cursor, tail - 40, "PgUp accumulates");
+        app.log_page_down();
+        assert_eq!(log_state(&app).cursor, tail - 20, "PgDn = one page down");
+        let baseline = log_state(&app).snapshot_total;
+        app.log_page_down();
+        assert!(
+            log_state(&app).at_tail(),
+            "PgDn lands back on the tail and re-arms"
+        );
+        assert!(
+            log_state(&app).snapshot_total >= baseline,
+            "tail re-armed: snapshot refreshed to current ring content"
+        );
+    }
+
+    /// feat_log_viewer_core: the shared wrap chunker must agree with the
+    /// renderer row-for-row (character-level, display width, exact fit stays
+    /// one row, degenerate width never loops).
+    #[test]
+    fn wrap_line_chunks_by_display_width() {
+        assert_eq!(super::wrap_line("abc", 10), vec!["abc"]);
+        assert_eq!(super::wrap_line("abc", 3), vec!["abc"]);
+        assert_eq!(super::wrap_line("abcd", 3), vec!["abc", "d"]);
+        assert_eq!(super::wrap_line("abcdef", 2), vec!["ab", "cd", "ef"]);
+        // Wide (CJK) chars count their display width, not their char count.
+        assert_eq!(
+            super::wrap_line("\u{4f60}\u{597d}\u{4e16}", 4),
+            vec!["\u{4f60}\u{597d}", "\u{4e16}"]
+        );
+        // Degenerate width: clamped to 1, no division by zero, no hang.
+        assert_eq!(super::wrap_line("ab", 0), vec!["a", "b"]);
+        assert_eq!(super::wrapped_row_count("", 5), 1);
     }
 
     // ---- feat_model_picker_lite --------------------------------------------

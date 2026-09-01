@@ -818,30 +818,42 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 /// feat_stderr_log_modal: the diagnostics-log viewer modal — a large
-/// centered monospace view over a SNAPSHOT copy of the diag ring buffer
-/// (`App::begin_log_viewer` / `log_scroll_*` own the state, `main.rs` owns
-/// the keys). Live-tail at the bottom: parked at scroll 0 the snapshot
-/// refreshes every frame so new lines stream in; scrolled up, the snapshot
-/// freezes and a `+K new lines` footer counts arrivals instead. Long lines
-/// are right-truncated (no wrap) so one buffer line is always exactly one
-/// row — read-position math stays exact. `[tui]` lifecycle events render
-/// dimmed to visually separate them from verbatim backend stderr.
+/// centered view over a SNAPSHOT copy of the diag ring buffer
+/// (`App::begin_log_viewer` / the `log_*` cursor methods own the state,
+/// `main.rs` owns the keys). Interaction core (feat_log_viewer_core): a
+/// line cursor walks LOGICAL lines: while it rests on the newest line the
+/// view stays pinned to the tail and new lines stream in; one step up pins
+/// the view to the cursor and the snapshot freezes (the `+K new lines`
+/// footer counts arrivals instead). `w` toggles Paragraph-style reflow:
+/// wrap off = compact truncated timeline, wrap on = full text chunked over
+/// rows at the content width. Levels colorize through theme role slots
+/// (`log_info`/`log_call`/`log_think`/`log_moderator`/`log_tool`), and
+/// `[tui]` lifecycle events stay dimmed.
 fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     use ratatui::widgets::{Clear, Padding};
 
-    // Live-tail: while parked at the bottom, refresh the snapshot every
-    // frame (atomic snapshot + baseline, see `diag::view`).
+    // Tail-follow: while the cursor rests on the newest line, refresh the
+    // snapshot every frame (atomic snapshot + baseline, see `diag::view`)
+    // and keep the cursor parked on the tail. Pinned views never refresh.
     if let Mode::LogViewer { state } = &mut app.mode {
-        if state.scroll == 0 {
+        if state.at_tail() {
             let (lines, total) = crate::diag::view();
-            state.lines = lines;
+            state.cursor = lines.len().saturating_sub(1);
             state.snapshot_total = total;
+            state.lines = lines;
         }
     }
-    let (lines, scroll, snapshot_total) = match &app.mode {
-        Mode::LogViewer { state } => (state.lines.clone(), state.scroll, state.snapshot_total),
+    let (lines, cursor, wrap, snapshot_total, mut row_offset) = match &app.mode {
+        Mode::LogViewer { state } => (
+            state.lines.clone(),
+            state.cursor,
+            state.wrap,
+            state.snapshot_total,
+            state.row_offset,
+        ),
         _ => return,
     };
+    let at_tail = cursor + 1 >= lines.len();
     let new_since = crate::diag::total_appended().saturating_sub(snapshot_total);
 
     // ~3/4 of the frame, sane caps so tiny terminals never panic.
@@ -858,13 +870,23 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     };
 
     f.render_widget(Clear, area);
+    // Header state (feat_log_viewer_core) rides the border title: cursor
+    // position, tail state and the wrap toggle. The title row never clips
+    // content and is always visible, even on a 3-row modal.
+    let pos = lines.len().min(cursor + 1);
+    let tail_state = if at_tail { "live" } else { "pinned" };
+    let title = format!(
+        " Diagnostics log \u{00b7} line {pos}/{} \u{00b7} {tail_state} \u{00b7} wrap: {} ",
+        lines.len(),
+        if wrap { "on" } else { "off" },
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(theme.blue))
         .style(Style::new().bg(theme.bg))
         .padding(Padding::horizontal(1))
         .title(Span::styled(
-            " Diagnostics log ",
+            title,
             Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -875,33 +897,82 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     let content = panes[0];
     let footer = panes[1];
 
-    // Page size seam for PgUp/PgDn (same pattern as chat_visible_rows).
+    // Seams for the cursor/page math (same pattern as chat_visible_rows):
+    // the page is a page of rows, and wrap chunks at the render width.
     app.log_visible_rows = content.height.max(1);
+    app.log_content_width = content.width.max(1);
 
-    if content.height > 0 {
+    if content.height > 0 && !lines.is_empty() {
         let visible = content.height as usize;
-        // Bottom-anchored scroll: `scroll` counts rows up from the bottom.
-        let max_scroll = lines.len().saturating_sub(visible);
-        let scrolled = (scroll as usize).min(max_scroll);
-        let skip = (max_scroll - scrolled) as u16;
+        let content_w = content.width.max(1) as usize;
 
-        let rows: Vec<Line<'static>> = lines
-            .iter()
-            .map(|l| {
-                if l.starts_with(crate::diag::TUI_EVENT_PREFIX) {
-                    Line::from(Span::styled(l.clone(), Style::new().fg(theme.dim)))
-                } else {
-                    Line::from(Span::styled(l.clone(), Style::new().fg(theme.fg)))
+        // One rendered row per chunk; rows remember their logical line so
+        // coloring and the cursor highlight survive the reflow.
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut logical_of_row: Vec<usize> = Vec::new();
+        for (idx, logical) in lines.iter().enumerate() {
+            let color = log_line_color(logical, theme);
+            let chunks: Vec<String> = if wrap {
+                crate::app::wrap_line(logical, content_w)
+            } else {
+                vec![logical.clone()]
+            };
+            for chunk in chunks {
+                let mut style = Style::new().fg(color);
+                if idx == cursor {
+                    style = style.bg(theme.selection);
                 }
-            })
-            .collect();
-        let paragraph = Paragraph::new(Text::from(rows)).scroll((skip, 0));
+                rows.push(Line::from(Span::styled(chunk, style)));
+                logical_of_row.push(idx);
+            }
+        }
+
+        // First/last rendered row of the cursor line, then the visible
+        // window: at the tail the view bottom-anchors; pinned, it scrolls
+        // minimally so the cursor line stays fully in view.
+        let total_rows = rows.len();
+        let mut first_row = 0usize;
+        for (idx, logical) in lines.iter().enumerate() {
+            if idx == cursor {
+                break;
+            }
+            first_row += if wrap {
+                crate::app::wrapped_row_count(logical, content_w)
+            } else {
+                1
+            };
+        }
+        let cursor_rows = if wrap {
+            crate::app::wrapped_row_count(&lines[cursor], content_w)
+        } else {
+            1
+        };
+        let last_row = first_row + cursor_rows.saturating_sub(1);
+        let max_offset = total_rows.saturating_sub(visible);
+        if at_tail {
+            row_offset = max_offset;
+        } else {
+            row_offset = row_offset.min(max_offset);
+            if row_offset > first_row {
+                row_offset = first_row;
+            } else if last_row + 1 > row_offset + visible {
+                row_offset = (last_row + 1).saturating_sub(visible);
+            }
+        }
+        // Persist the viewport so the next pinned frame scrolls from here.
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.row_offset = row_offset;
+        }
+
+        let paragraph = Paragraph::new(Text::from(rows)).scroll((row_offset as u16, 0));
         f.render_widget(paragraph, content);
     }
 
     if footer.height > 0 {
-        let mut hint = "Esc close \u{00b7} PgUp/PgDn scroll".to_owned();
-        if new_since > 0 && scroll > 0 {
+        let mut hint =
+            "Esc close \u{00b7} k/j lines \u{00b7} PgUp/PgDn page \u{00b7} g/G ends \u{00b7} w wrap"
+                .to_owned();
+        if new_since > 0 && !at_tail {
             hint.push_str(&format!(" \u{00b7} +{new_since} new lines"));
         }
         f.render_widget(
@@ -911,6 +982,37 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
             ))),
             footer,
         );
+    }
+}
+
+/// feat_log_viewer_core: level → theme-slot mapping for diagnostics lines.
+/// Backend stderr carries the level as a ` | LEVEL | ` field (e.g. `2026-09-01
+/// 14:54:55.135 | INFO | chibi.services.task_manager:run_task:66 - ...`);
+/// unknown lines keep the default foreground, `[tui]` lifecycle events stay
+/// dim. No raw RGB here: everything routes through the theme role slots.
+fn log_level_of(line: &str) -> Option<&'static str> {
+    for level in ["INFO", "CALL", "THINK", "MODERATOR", "TOOL"] {
+        let needle = format!(" | {level} | ");
+        if line.contains(&needle) {
+            return Some(level);
+        }
+    }
+    None
+}
+
+/// Color for one diagnostics line via the theme role slots (see
+/// [`log_level_of`]).
+fn log_line_color(line: &str, theme: &Theme) -> ratatui::style::Color {
+    if line.starts_with(crate::diag::TUI_EVENT_PREFIX) {
+        return theme.dim;
+    }
+    match log_level_of(line) {
+        Some("INFO") => theme.log_info,
+        Some("CALL") => theme.log_call,
+        Some("THINK") => theme.log_think,
+        Some("MODERATOR") => theme.log_moderator,
+        Some("TOOL") => theme.log_tool,
+        _ => theme.fg,
     }
 }
 
@@ -3948,8 +4050,14 @@ mod tests {
             "buffered line visible in the modal: {flat}"
         );
         assert!(
-            flat.contains("Esc close") && flat.contains("PgUp/PgDn scroll"),
+            flat.contains("Esc close") && flat.contains("PgUp/PgDn page"),
             "footer hint visible: {flat}"
+        );
+        // Header state (feat_log_viewer_core): position + tail + wrap state
+        // ride the footer row.
+        assert!(
+            flat.contains("live") && flat.contains("wrap: off"),
+            "header shows tail and wrap state: {flat}"
         );
         // At the bottom: no "+K new lines" (nothing arrived since the open).
         assert!(
@@ -3958,13 +4066,24 @@ mod tests {
         );
     }
 
-    /// Scrolled up with arrivals pending: the frozen view keeps its position
-    /// and the footer counts the new lines (`+K new lines`).
+    /// Pinned (cursor above the tail) with arrivals pending: the frozen view
+    /// keeps its position and the footer counts the new lines
+    /// (`+K new lines`).
     #[test]
     fn log_viewer_modal_shows_plus_k_hint_when_detached() {
         let mut app = App::new(mock::initial_chats());
+        for i in 0..12 {
+            crate::diag::append(format!("filler-{i}"));
+        }
         app.begin_log_viewer();
-        app.log_scroll_up(3);
+        app.log_cursor_up(3);
+        assert!(
+            match &app.mode {
+                Mode::LogViewer { state } => !state.at_tail(),
+                _ => false,
+            },
+            "precondition: pinned"
+        );
 
         let marker = unique_marker("arrived");
         crate::diag::append(&marker);
@@ -3972,16 +4091,16 @@ mod tests {
         let flat = render_grid(&mut app).join("\n");
         assert!(
             flat.contains("new lines"),
-            "+K footer must show while detached with arrivals: {flat}"
+            "+K footer must show while pinned with arrivals: {flat}"
         );
         assert!(
             !flat.contains(&marker),
-            "frozen snapshot must NOT show lines that arrived while detached: {flat}"
+            "frozen snapshot must NOT show lines that arrived while pinned: {flat}"
         );
 
-        // Re-arming the tail (back to the bottom) refreshes the snapshot and
-        // clears the hint.
-        app.log_scroll_down(3);
+        // Re-arming the tail (G / cursor back to the newest line) refreshes
+        // the snapshot and clears the hint.
+        app.log_jump_bottom();
         let flat = render_grid(&mut app).join("\n");
         assert!(
             flat.contains(&marker),
@@ -4020,6 +4139,171 @@ mod tests {
             !flat.contains(&"x".repeat(150)),
             "long line must be truncated, never wrapped: {flat}"
         );
+    }
+
+    // ---- feat_log_viewer_core: header state, wrap, level colors -----------
+
+    /// The header (border title) carries the cursor position, the tail
+    /// state and the wrap toggle; stepping the cursor up flips live →
+    /// pinned, `w` flips wrap: off → on.
+    #[test]
+    fn log_viewer_header_shows_position_tail_and_wrap() {
+        let mut app = App::new(mock::initial_chats());
+        for i in 0..5 {
+            crate::diag::append(format!("filler-{i}"));
+        }
+        app.begin_log_viewer();
+
+        let rows = render_grid(&mut app);
+        let title = rows
+            .iter()
+            .find(|r| r.contains("Diagnostics log"))
+            .expect("viewer title row exists");
+        assert!(title.contains("line "), "position shown: {title}");
+        assert!(title.contains("live"), "tail state shown: {title}");
+        assert!(title.contains("wrap: off"), "wrap state shown: {title}");
+
+        // Two cursor steps up: the header must flip to pinned.
+        app.log_cursor_up(2);
+        let rows = render_grid(&mut app);
+        let title = rows
+            .iter()
+            .find(|r| r.contains("Diagnostics log"))
+            .expect("viewer title row exists");
+        assert!(title.contains("pinned"), "pinned state shown: {title}");
+        assert!(!title.contains(" live "), "no live while pinned: {title}");
+
+        // `w` toggles wrap and the header follows.
+        app.log_toggle_wrap();
+        let rows = render_grid(&mut app);
+        let title = rows
+            .iter()
+            .find(|r| r.contains("Diagnostics log"))
+            .expect("viewer title row exists");
+        assert!(title.contains("wrap: on"), "wrap on shown: {title}");
+    }
+
+    /// Wrap off keeps the compact truncated timeline (the old contract);
+    /// wrap on reflows the SAME logical line over several rows so its tail
+    /// becomes readable. Hermetic: hand-built pinned state, so the global
+    /// diag stream (shared by parallel tests) cannot race the render.
+    #[test]
+    fn log_viewer_wrap_toggle_reflows_long_lines() {
+        use crate::app::LogViewerState;
+        let long = format!("WRAPHEAD-{}", "y".repeat(200));
+        let mk_state = |wrap: bool| LogViewerState {
+            // Pinned to the long line itself: the snapshot stays frozen.
+            cursor: 1,
+            wrap,
+            row_offset: 0,
+            lines: vec![
+                "head filler".to_owned(),
+                long.clone(),
+                "tail filler".to_owned(),
+            ],
+            snapshot_total: crate::diag::total_appended(),
+        };
+
+        let mut app = App::new(mock::initial_chats());
+        app.mode = Mode::LogViewer {
+            state: mk_state(false),
+        };
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            !flat.contains(&"y".repeat(150)),
+            "wrap off: long line stays truncated, never reflowed: {flat}"
+        );
+
+        app.mode = Mode::LogViewer {
+            state: mk_state(true),
+        };
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.contains(&"y".repeat(100)),
+            "wrap on: the line tail is reflowed into view: {flat}"
+        );
+    }
+
+    /// Levels colorize through the theme role slots (feat_log_viewer_core):
+    /// INFO dim, CALL cyan slot, THINK purple slot, MODERATOR orange slot,
+    /// TOOL blue slot. Checked against the actual rendered cells. The viewer
+    /// state is built by hand (pinned, so the render never refreshes it):
+    /// the global diag stream is shared by parallel tests and would race.
+    #[test]
+    fn log_viewer_colors_levels_via_theme_slots() {
+        use crate::app::LogViewerState;
+        let theme = Theme::tokyo_night();
+        let cases: [(&str, ratatui::style::Color); 5] = [
+            ("LVC-INFO", theme.log_info),
+            ("LVC-CALL", theme.log_call),
+            ("LVC-THINK", theme.log_think),
+            ("LVC-MOD", theme.log_moderator),
+            ("LVC-TOOL", theme.log_tool),
+        ];
+        let levels = ["INFO", "CALL", "THINK", "MODERATOR", "TOOL"];
+        let lines: Vec<String> = cases
+            .iter()
+            .zip(levels)
+            .map(|((marker, _), level)| {
+                format!("2026-09-01 10:00:00.000 | {level} | chibi.m:1 - body {marker}")
+            })
+            .collect();
+
+        let mut app = App::new(mock::initial_chats());
+        app.mode = Mode::LogViewer {
+            state: LogViewerState {
+                // Pinned to a middle line: the snapshot stays frozen.
+                cursor: 2,
+                wrap: false,
+                row_offset: 0,
+                lines,
+                snapshot_total: crate::diag::total_appended(),
+            },
+        };
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+
+        for (marker, expected) in &cases {
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(marker))
+                .unwrap_or_else(|| panic!("level line {marker} visible in the viewer"));
+            let col = col_of_sub(row, marker).expect("marker column");
+            assert_eq!(
+                buf[(col as u16, y as u16)].fg,
+                *expected,
+                "level slot color for {marker}"
+            );
+        }
+    }
+
+    /// The level → slot mapping table (pure function): the five known
+    /// levels map to their slots; `[tui]` events and unknown stderr keep
+    /// None (the renderer falls back to default fg / dim).
+    #[test]
+    fn log_level_detection_table() {
+        assert_eq!(
+            log_level_of("2026-09-01 10:00:00.000 | INFO | chibi.m:1 - msg"),
+            Some("INFO")
+        );
+        assert_eq!(
+            log_level_of("2026-09-01 10:00:00.000 | CALL | chibi.m:1 - msg"),
+            Some("CALL")
+        );
+        assert_eq!(
+            log_level_of("2026-09-01 10:00:00.000 | THINK | chibi.m:1 - msg"),
+            Some("THINK")
+        );
+        assert_eq!(
+            log_level_of("2026-09-01 10:00:00.000 | MODERATOR | chibi.m:1 - msg"),
+            Some("MODERATOR")
+        );
+        assert_eq!(
+            log_level_of("2026-09-01 10:00:00.000 | TOOL | chibi.m:1 - msg"),
+            Some("TOOL")
+        );
+        assert_eq!(log_level_of("[tui] handshake ok (protocol v1)"), None);
+        assert_eq!(log_level_of("plain stderr noise"), None);
     }
 
     // ---- feat_status_line: cwd + model strip -------------------------------
