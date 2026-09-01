@@ -165,6 +165,12 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// `\u{25cf}` running (green). The ACTIVE chat additionally keeps its name
 /// bold + highlighted row.
 ///
+/// feat_sidebar_unread_marker: an inactive thread with an unseen reply
+/// lights its idle dot in the `unread_activity` slot and renders its name
+/// bold, but gets NO highlight (the thread stays visually inactive). The
+/// three dot roles (active marker, unread activity, resting default) are
+/// theme slots, so a future theme swap remaps them in one place.
+///
 /// feat_focus_panes: the sidebar advertises keyboard ownership when
 /// `app.focus == Focus::Sidebar` — theme-driven emphasis ONLY, no new
 /// palette: border and ` Chats ` title switch from their resting colors to
@@ -189,19 +195,30 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 ChatLifecycle::Awaiting { .. } => theme.yellow,
                 ChatLifecycle::Idle => {
                     if selected {
-                        // Selected idle dot stays green in both focuses.
-                        theme.green
+                        // Selected idle dot: the active-marker slot, in
+                        // both focuses.
+                        theme.active_marker
+                    } else if chat.unread {
+                        // Unseen reply on an inactive thread: the
+                        // unread-activity slot wins over the focus
+                        // brightening below, the signal must survive.
+                        theme.unread_activity
                     } else if sidebar_focused {
                         // Focus affordance: the dot column brightens while
                         // the sidebar owns the keyboard.
                         theme.fg
                     } else {
-                        theme.dim
+                        // Resting dot of a read thread: the default slot.
+                        theme.dot_default
                     }
                 }
             };
             let name_style = if selected {
                 Style::new().fg(theme.fg).add_modifier(Modifier::BOLD)
+            } else if chat.unread {
+                // Unread thread: the name goes bold but keeps the dim
+                // inactive color, no highlight rides along.
+                Style::new().fg(theme.dim).add_modifier(Modifier::BOLD)
             } else {
                 // Multi-line titles collapse to spaces inside the one-row
                 // sidebar entry (feat_shift_enter_newline allows `\n` in
@@ -4338,5 +4355,53 @@ mod tests {
             !text.contains("1. Qwen3.8 Max"),
             "no rows exist before the hidden listing resolves"
         );
+    }
+
+    // ---- feat_sidebar_unread_marker: rendering ----------------------------
+
+    /// Background reply rendering: the inactive thread's dot turns yellow
+    /// (unread-activity slot) and its name goes bold, while the row keeps
+    /// the resting panel background (NO selection highlight). The selected
+    /// chat keeps its active green dot + highlight, a read neighbour keeps
+    /// the default dim dot and an unbold name. The marker survives fresh
+    /// re-renders (state, not a one-frame effect).
+    #[test]
+    fn unread_background_thread_renders_yellow_dot_bold_name_no_highlight() {
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(vec![
+            Chat::new("fresh"),
+            Chat::new("marked"),
+            Chat::new("quiet"),
+        ]);
+        app.active = 1; // "marked" selected, both neighbours inactive
+        app.chats[0].unread = true;
+
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+        // Sidebar rows: " Chats " title on row 0, chat rows start at 1.
+        assert!(rows[1].contains("fresh") && rows[2].contains("marked"));
+
+        // Unread inactive dot: hollow glyph in the unread-activity yellow.
+        assert_eq!(buf[(0, 1)].symbol(), "\u{25cb}");
+        assert_eq!(buf[(0, 1)].fg, theme.unread_activity);
+        // Bold dim name, resting background: no highlight.
+        assert_eq!(buf[(2, 1)].fg, theme.dim);
+        assert!(buf[(2, 1)].modifier.contains(Modifier::BOLD));
+        assert_ne!(buf[(2, 1)].bg, theme.selection, "no selection highlight");
+        assert_eq!(buf[(2, 1)].bg, theme.panel);
+
+        // Selected chat: active-marker dot, highlight on its row.
+        assert_eq!(buf[(0, 2)].fg, theme.active_marker);
+        assert_eq!(buf[(2, 2)].bg, theme.selection, "selected row highlighted");
+
+        // Read inactive neighbour: default dot, plain dim name.
+        assert_eq!(buf[(0, 3)].fg, theme.dot_default);
+        assert!(!buf[(2, 3)].modifier.contains(Modifier::BOLD));
+
+        // Fresh frame + scrolling: the marker is sticky until selection.
+        let (_, buf2) = render_grid_with_buffer(&mut app);
+        assert_eq!(buf2[(0, 1)].fg, theme.unread_activity, "survives re-render");
+        app.scroll_up(5);
+        let (_, buf3) = render_grid_with_buffer(&mut app);
+        assert_eq!(buf3[(0, 1)].fg, theme.unread_activity, "survives scrolling");
     }
 }

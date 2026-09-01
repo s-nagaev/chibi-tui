@@ -86,6 +86,9 @@ impl From<StoredChat> for Chat {
             // has no live request to resume (see Message::normalized_for_storage).
             lifecycle: crate::model::ChatLifecycle::Idle,
             queue: std::collections::VecDeque::new(),
+            // feat_sidebar_unread_marker: the marker is session-only and
+            // stays out of the persisted format entirely.
+            unread: false,
         }
     }
 }

@@ -244,6 +244,11 @@ pub struct Chat {
     /// Prompts submitted while a request was already in flight; sent FIFO as
     /// soon as the current request reaches a terminal event.
     pub queue: VecDeque<String>,
+    /// feat_sidebar_unread_marker: a visible reply (or an inline error)
+    /// landed in this chat while it was NOT the selected one. Cleared the
+    /// moment the chat is selected (see [`App::select_chat`]). Session-only:
+    /// never persisted, a restart starts every thread clean.
+    pub unread: bool,
 }
 
 impl Chat {
@@ -255,6 +260,7 @@ impl Chat {
             messages: Vec::new(),
             lifecycle: ChatLifecycle::Idle,
             queue: VecDeque::new(),
+            unread: false,
         }
     }
 
@@ -528,16 +534,26 @@ impl App {
         self.chats.get(self.active).map(|c| c.id.as_str())
     }
 
-    pub fn select_next(&mut self) {
-        if self.active + 1 < self.chats.len() {
-            self.active += 1;
+    /// feat_sidebar_unread_marker: the ONE place a chat becomes the selected
+    /// one. Bounds-safe (the index is clamped to the current list), resets
+    /// the chat view to follow-bottom, and clears the unread marker of the
+    /// chat being entered, so a background reply stops signaling as soon as
+    /// it was seen. Every selection mutation (arrows, ^N, search jump,
+    /// delete/clone ack) goes through here.
+    fn select_chat(&mut self, index: usize) {
+        self.active = index.min(self.chats.len().saturating_sub(1));
+        if let Some(chat) = self.chats.get_mut(self.active) {
+            chat.unread = false;
         }
         self.scroll = 0;
     }
 
+    pub fn select_next(&mut self) {
+        self.select_chat(self.active.saturating_add(1));
+    }
+
     pub fn select_prev(&mut self) {
-        self.active = self.active.saturating_sub(1);
-        self.scroll = 0;
+        self.select_chat(self.active.saturating_sub(1));
     }
 
     /// feat_focus_panes: toggle which pane owns the keyboard — Ctrl+T flips
@@ -637,8 +653,7 @@ impl App {
     pub fn new_chat(&mut self) {
         let n = self.chats.len() + 1;
         self.chats.push(Chat::new(format!("New chat {n}")));
-        self.active = self.chats.len() - 1;
-        self.scroll = 0;
+        self.select_chat(self.chats.len() - 1);
         self.focus = Focus::Chat;
     }
 
@@ -1025,11 +1040,11 @@ impl App {
         };
         match jump {
             Some((chat_index, message_index, line_index, col)) if chat_index < self.chats.len() => {
-                // Activate the target thread exactly like Ctrl+↑/↓: index
-                // set + scroll reset to follow-bottom (the jump math in
-                // render_chat then overrides the scroll with the match's row).
-                self.active = chat_index;
-                self.scroll = 0;
+                // Activate the target thread exactly like Ctrl+↑/↓ (via
+                // select_chat: index set + scroll reset + marker clear, the
+                // jump math in render_chat then overrides the scroll with
+                // the match's row).
+                self.select_chat(chat_index);
                 self.pending_global_search_jump =
                     Some((chat_index, message_index, line_index, col));
                 self.mode = Mode::Normal;
@@ -1581,16 +1596,11 @@ impl App {
         let chat = self.chats.get(self.active)?;
         let removed_id = chat.id.clone();
         self.chats.remove(self.active);
-        if self.chats.is_empty() {
-            // Clean empty state: nothing to select.
-            self.active = 0;
-        } else if self.active >= self.chats.len() {
-            // Removed the LAST chat: the previous one slides into focus.
-            self.active = self.chats.len() - 1;
-        }
-        // Removed a first/middle chat: `active` already points at
-        // the chat, that shifted into the slot (the old NEXT neighbour).
-        self.scroll = 0; // follow-bottom for the newly selected chat
+        // Removed the LAST chat: select_chat clamps the index so the
+        // previous one slides into focus; a first/middle removal keeps the
+        // index (the old NEXT neighbour). The selection point also clears
+        // the marker of whatever thread the user lands on.
+        self.select_chat(self.active);
         self.pending_delete = Some(removed_id.clone());
         Some(removed_id)
     }
@@ -1728,8 +1738,7 @@ impl App {
                     .map(|i| i + 1)
                     .unwrap_or(self.chats.len());
                 self.chats.insert(at, chat);
-                self.active = at;
-                self.scroll = 0;
+                self.select_chat(at);
                 true
             }
             BackendEvent::Error {
@@ -1787,6 +1796,20 @@ impl App {
         if let Some(chat) = self.chats.get_mut(self.active) {
             resolve_live_placeholder(chat, "_Cancelled._".to_owned(), None);
             chat.lifecycle = ChatLifecycle::Idle;
+        }
+    }
+
+    /// feat_sidebar_unread_marker: flag a chat that just grew a VISIBLE
+    /// reply while the user was looking at another thread. Only content the
+    /// user has not seen counts: a blank/pure-ACK absorb and a hidden
+    /// plumbing exchange add nothing readable, so they never light the
+    /// marker. The flag on the selected chat is meaningless by construction
+    /// (select_chat clears it, replies to the selected chat are on screen).
+    fn mark_unread_if_background(&mut self, chat_index: usize) {
+        if chat_index != self.active {
+            if let Some(chat) = self.chats.get_mut(chat_index) {
+                chat.unread = true;
+            }
         }
     }
 
@@ -1909,6 +1932,10 @@ impl App {
                                 drop_live_pending_placeholder(chat);
                             } else {
                                 resolve_live_placeholder(chat, markdown, model);
+                                // feat_sidebar_unread_marker: a real reply for a
+                                // background thread is content the user has not
+                                // seen yet.
+                                self.mark_unread_if_background(chat_index);
                             }
                             if stamped.is_some() {
                                 self.picker_model_labels.remove(&thread_id);
@@ -1946,6 +1973,9 @@ impl App {
 
                     let chat = &mut self.chats[chat_index];
                     resolve_live_placeholder(chat, format!("**Error:** {message}"), None);
+                    // feat_sidebar_unread_marker: an inline failure is also a
+                    // reply the user has not seen in a background thread.
+                    self.mark_unread_if_background(chat_index);
 
                     // Transport-level failures (broken pipe, lost backend,
                     // failed cancel of a dead link) escalate to the modal
@@ -3071,6 +3101,149 @@ mod tests {
         assert_eq!(app.chats[1].lifecycle, ChatLifecycle::Idle);
         assert!(app.chats[0].messages.is_empty(), "foreground untouched");
         assert!(app.error_popup.is_none());
+    }
+
+    // ---- feat_sidebar_unread_marker: state --------------------------------
+
+    /// A visible reply landing in a BACKGROUND chat flags it unread; the
+    /// selected chat's own reply never flags anything. The editor draft of
+    /// the other thread stays untouched by the arrival.
+    #[test]
+    fn background_result_marks_chat_unread_and_active_result_does_not() {
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "background work"); // chat 0 goes busy
+        app.select_next(); // user reads chat 1 while chat 0 works
+        type_in(&mut app, "draft in flight, do not disturb");
+        assert!(!app.chats[0].unread, "nothing arrived yet");
+
+        finish_chat(&mut app, 0);
+        assert!(app.chats[0].unread, "background reply must flag the thread");
+        assert!(!app.chats[1].unread);
+        assert_eq!(
+            app.input.lines().join(""),
+            "draft in flight, do not disturb",
+            "mid-typing draft untouched by the background arrival"
+        );
+
+        // The active chat's own reply is on screen: no flag.
+        submit_text(&mut app, "foreground work");
+        finish_chat(&mut app, 1);
+        assert!(!app.chats[1].unread, "selected chat never flags itself");
+        assert!(app.chats[0].unread, "other flag survives unrelated traffic");
+    }
+
+    /// Selecting the flagged thread clears its marker (the single
+    /// select_chat point behind both arrows), and passing a flagged thread
+    /// by without entering it keeps the flag.
+    #[test]
+    fn selecting_the_thread_clears_its_unread_marker() {
+        let mut app = app_with_chats(3);
+        submit_text(&mut app, "work in chat 0");
+        app.select_next(); // active = 1
+        app.select_next(); // active = 2
+        finish_chat(&mut app, 0);
+        assert!(app.chats[0].unread);
+
+        app.select_prev(); // into chat 1, not the flagged one
+        assert!(app.chats[0].unread, "passing by must not clear the flag");
+        app.select_prev(); // INTO chat 0
+        assert!(
+            !app.chats[0].unread,
+            "entering the thread clears its marker"
+        );
+
+        // Re-flag, then clear via the other arrow direction.
+        submit_text(&mut app, "work again in chat 0");
+        app.select_next(); // chat 1
+        finish_chat(&mut app, 0);
+        assert!(app.chats[0].unread);
+        app.select_prev(); // back into chat 0
+        assert!(!app.chats[0].unread);
+    }
+
+    /// The global-search jump activates the target thread through the same
+    /// selection point, so its marker clears on entry too.
+    #[test]
+    fn global_search_jump_clears_the_target_thread_marker() {
+        let mut app = app_with_chats(2);
+        app.chats[1]
+            .messages
+            .push(Message::assistant("needle here"));
+        // Flag chat 1 the way a background reply would (white-box: the
+        // routing that sets the flag is covered by the dedicated tests).
+        app.chats[1].unread = true;
+
+        app.begin_search_all();
+        for ch in "needle".chars() {
+            app.search_all_push(ch);
+        }
+        assert_eq!(app.search_all_matches()[0].chat_index, 1);
+        assert!(app.jump_to_selected_all());
+        assert_eq!(app.active, 1, "target thread activated");
+        assert!(
+            !app.chats[1].unread,
+            "entering via the search jump clears the flag"
+        );
+    }
+
+    /// Only readable content flags a background thread: a blank/pure-ACK
+    /// absorb and a hidden plumbing exchange stay unflagged, while an
+    /// inline error reply does flag.
+    #[test]
+    fn unread_flag_follows_visible_content_only() {
+        // Blank/ACK absorb: nothing to read, no flag.
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "bg blank");
+        app.select_next();
+        finish_chat_with_content(&mut app, 0, ACK_MARKER);
+        assert!(!app.chats[0].unread, "absorbed ACK must not flag");
+
+        // Hidden exchange (model listing fetch) started on chat 0, then the
+        // user switches away before it resolves: plumbing nobody reads,
+        // no flag, the picker still resolves.
+        let mut app = app_with_chats(2);
+        open_picker(&mut app);
+        let req = app.chats[0].lifecycle.request_id().unwrap().to_owned();
+        app.select_next();
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&req),
+            markdown: CAPTURED_LISTING.into(),
+            thread_id: app.chats[0].id.clone(),
+            model: None,
+        });
+        assert!(
+            !app.chats[0].unread,
+            "hidden plumbing exchange must not flag"
+        );
+        assert_eq!(app.chats[0].lifecycle, ChatLifecycle::Idle);
+
+        // An inline error reply IS content the user has not seen.
+        let mut app = app_with_chats(2);
+        let submitted = submit_text(&mut app, "bg doomed");
+        app.select_next();
+        app.apply_backend_event(BackendEvent::Error {
+            request_id: event_id_of(&submitted.request_id),
+            message: "backend exploded".into(),
+            thread_id: Some(app.chats[0].id.clone()),
+        });
+        assert!(app.chats[0].unread, "background error reply flags");
+    }
+
+    /// A clone ack lists and selects the new thread through the single
+    /// selection point; the fresh copy starts with no marker.
+    #[test]
+    fn clone_insert_starts_without_unread_marker() {
+        let mut app = clone_capable_app(1);
+        app.begin_clone_thread();
+        let submitted = app.take_clone_submission().expect("staged");
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "ack".to_owned(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        assert_eq!(app.active, 1, "clone selected");
+        assert!(!app.chats[1].unread, "fresh clone carries no marker");
     }
 
     #[test]

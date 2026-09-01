@@ -16,6 +16,7 @@ fn chat(name: &str, messages: Vec<Message>) -> crate::app::Chat {
         messages,
         lifecycle: crate::model::ChatLifecycle::Idle,
         queue: std::collections::VecDeque::new(),
+        unread: false,
     }
 }
 

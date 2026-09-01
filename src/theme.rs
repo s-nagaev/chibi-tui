@@ -28,6 +28,17 @@ pub struct Theme {
     /// column) so the typing area reads as a distinct surface against both
     /// the sidebar panel and the bare chat background.
     pub input_panel_bg: Color,
+    /// Sidebar marker role slot: the dot of the currently selected chat
+    /// (feat_sidebar_unread_marker). A slot, not a raw accent, so a future
+    /// theme swap only remaps the role.
+    pub active_marker: Color,
+    /// Sidebar marker role slot: the dot of an inactive thread with an
+    /// unseen background reply (feat_sidebar_unread_marker). Pairs with a
+    /// bold name and no row highlight.
+    pub unread_activity: Color,
+    /// Sidebar marker role slot: the resting dot of a read, unselected
+    /// thread (feat_sidebar_unread_marker).
+    pub dot_default: Color,
 }
 
 impl Theme {
@@ -49,6 +60,12 @@ impl Theme {
             code_panel_bg: Color::Rgb(23, 25, 35),  // #171923 — code block panel
             code_border: Color::Rgb(47, 61, 104),   // #2f3d68 — dim Tokyo blue
             input_panel_bg: Color::Rgb(30, 32, 44), // #1e202c — input zone tint
+            // Marker role slots reuse the Tokyo Night accents they always
+            // rendered with: the selected dot stayed green, an unseen
+            // reply lights yellow, a read thread rests dim.
+            active_marker: Color::Rgb(158, 206, 106), // #9ece6a, same as green
+            unread_activity: Color::Rgb(224, 175, 104), // #e0af68, same as yellow
+            dot_default: Color::Rgb(86, 95, 137),     // #565f89, same as dim
         }
     }
 }
