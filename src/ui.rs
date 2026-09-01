@@ -836,23 +836,31 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     // snapshot every frame (atomic snapshot + baseline, see `diag::view`)
     // and keep the cursor parked on the tail. Pinned views never refresh.
     if let Mode::LogViewer { state } = &mut app.mode {
+        // The copy feedback is brief: drop it once its window passed.
+        state.expire_copy_note();
         if state.at_tail() {
             let (lines, total) = crate::diag::view();
             state.cursor = lines.len().saturating_sub(1);
             state.snapshot_total = total;
             state.lines = lines;
+            // New lines can add (or evict) matches: keep the list honest.
+            state.reindex_search();
         }
     }
-    let (lines, cursor, wrap, snapshot_total, mut row_offset) = match &app.mode {
-        Mode::LogViewer { state } => (
-            state.lines.clone(),
-            state.cursor,
-            state.wrap,
-            state.snapshot_total,
-            state.row_offset,
-        ),
-        _ => return,
-    };
+    let (lines, cursor, wrap, snapshot_total, mut row_offset, search_buf, search, copy_note) =
+        match &app.mode {
+            Mode::LogViewer { state } => (
+                state.lines.clone(),
+                state.cursor,
+                state.wrap,
+                state.snapshot_total,
+                state.row_offset,
+                state.search_buf.clone(),
+                state.search.clone(),
+                state.copy_note.clone(),
+            ),
+            _ => return,
+        };
     let at_tail = cursor + 1 >= lines.len();
     let new_since = crate::diag::total_appended().saturating_sub(snapshot_total);
 
@@ -871,15 +879,35 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
 
     f.render_widget(Clear, area);
     // Header state (feat_log_viewer_core) rides the border title: cursor
-    // position, tail state and the wrap toggle. The title row never clips
-    // content and is always visible, even on a 3-row modal.
+    // position, tail state and the wrap toggle. feat_log_viewer_search_copy
+    // appends the search prompt (while typing), the match count and the
+    // copy feedback. One line, width-budgeted by capping the pattern echo.
     let pos = lines.len().min(cursor + 1);
     let tail_state = if at_tail { "live" } else { "pinned" };
-    let title = format!(
-        " Diagnostics log \u{00b7} line {pos}/{} \u{00b7} {tail_state} \u{00b7} wrap: {} ",
+    let mut title = format!(
+        " Diagnostics log \u{00b7} line {pos}/{} \u{00b7} {tail_state} \u{00b7} wrap: {}",
         lines.len(),
         if wrap { "on" } else { "off" },
     );
+    if let Some(buf) = &search_buf {
+        title.push_str(&format!(
+            " \u{00b7} search: /{}",
+            truncate_for_title(buf, 12)
+        ));
+    }
+    if let Some(search) = &search {
+        match search.current {
+            Some(i) => title.push_str(&format!(
+                " \u{00b7} matches: {}/{}",
+                i + 1,
+                search.matches.len()
+            )),
+            None => title.push_str(&format!(" \u{00b7} matches: {}", search.matches.len())),
+        }
+    }
+    if let Some(note) = &copy_note {
+        title.push_str(&format!(" \u{00b7} {note}"));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(theme.blue))
@@ -906,23 +934,48 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
         let visible = content.height as usize;
         let content_w = content.width.max(1) as usize;
 
+        // The line the current search hit sits on (emphasized variant).
+        let current_match_line = search
+            .as_ref()
+            .and_then(|s| s.current.map(|i| s.matches[i]));
+
         // One rendered row per chunk; rows remember their logical line so
-        // coloring and the cursor highlight survive the reflow.
+        // coloring and the cursor highlight survive the reflow. Each chunk
+        // also carries its char offset inside the logical line, so match
+        // ranges cut into the right pieces even when a hit spans a wrap
+        // boundary.
         let mut rows: Vec<Line<'static>> = Vec::new();
         let mut logical_of_row: Vec<usize> = Vec::new();
         for (idx, logical) in lines.iter().enumerate() {
             let color = log_line_color(logical, theme);
-            let chunks: Vec<String> = if wrap {
+            let ranges = search
+                .as_ref()
+                .map(|s| crate::app::find_match_ranges(logical, &s.pattern))
+                .unwrap_or_default();
+            let chunks: Vec<(String, usize)> = if wrap {
+                let mut offset = 0usize;
                 crate::app::wrap_line(logical, content_w)
+                    .into_iter()
+                    .map(|c| {
+                        let start = offset;
+                        offset += c.chars().count();
+                        (c, start)
+                    })
+                    .collect()
             } else {
-                vec![logical.clone()]
+                vec![(logical.clone(), 0)]
             };
-            for chunk in chunks {
-                let mut style = Style::new().fg(color);
-                if idx == cursor {
-                    style = style.bg(theme.selection);
-                }
-                rows.push(Line::from(Span::styled(chunk, style)));
+            for (chunk, chunk_start) in chunks {
+                let spans = log_line_spans(
+                    &chunk,
+                    chunk_start,
+                    &ranges,
+                    idx == cursor,
+                    Some(idx) == current_match_line,
+                    color,
+                    theme,
+                );
+                rows.push(Line::from(spans));
                 logical_of_row.push(idx);
             }
         }
@@ -969,17 +1022,25 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     }
 
     if footer.height > 0 {
-        let mut hint =
-            "Esc close \u{00b7} k/j lines \u{00b7} PgUp/PgDn page \u{00b7} g/G ends \u{00b7} w wrap"
-                .to_owned();
-        if new_since > 0 && !at_tail {
-            hint.push_str(&format!(" \u{00b7} +{new_since} new lines"));
-        }
+        // While the search prompt is open it REPLACES the hint line: the
+        // pattern echoes here with a block cursor, Enter commits, Esc
+        // cancels (feat_log_viewer_search_copy).
+        let (text, color) = if let Some(buf) = &search_buf {
+            (
+                format!("/{}\u{258f} Enter commit \u{00b7} Esc cancel", buf),
+                theme.blue,
+            )
+        } else {
+            let mut hint =
+                "Esc close \u{00b7} k/j lines \u{00b7} PgUp/PgDn page \u{00b7} g/G ends \u{00b7} w wrap \u{00b7} / search \u{00b7} y copy"
+                    .to_owned();
+            if new_since > 0 && !at_tail {
+                hint.push_str(&format!(" \u{00b7} +{new_since} new lines"));
+            }
+            (hint, theme.yellow)
+        };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                hint,
-                Style::new().fg(theme.yellow),
-            ))),
+            Paragraph::new(Line::from(Span::styled(text, Style::new().fg(color)))),
             footer,
         );
     }
@@ -1014,6 +1075,69 @@ fn log_line_color(line: &str, theme: &Theme) -> ratatui::style::Color {
         Some("TOOL") => theme.log_tool,
         _ => theme.fg,
     }
+}
+
+/// Styled spans for one rendered row of the log viewer (see
+/// [`render_log_viewer`]): the base level color, the cursor-line highlight,
+/// and the search-match overlay cut into the row text at the right char
+/// offsets. `chunk_start` is the chunk's offset inside its logical line, so
+/// a hit spanning a wrap boundary lights up in both rows. The current match
+/// line takes the same slot with reversed colors on top.
+fn log_line_spans(
+    chunk: &str,
+    chunk_start: usize,
+    ranges: &[(usize, usize)],
+    is_cursor: bool,
+    is_current_match: bool,
+    base_color: ratatui::style::Color,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut base = Style::new().fg(base_color);
+    if is_cursor {
+        base = base.bg(theme.selection);
+    }
+    let chars: Vec<char> = chunk.chars().collect();
+    let chunk_end = chunk_start + chars.len();
+
+    // Per-char membership, then grouped into runs: simplest correct way to
+    // split the row text at arbitrary (possibly chunk-crossing) ranges.
+    let mut in_match = vec![false; chars.len()];
+    for &(start, end) in ranges {
+        let s = start.max(chunk_start);
+        let e = end.min(chunk_end);
+        for i in s..e {
+            in_match[i - chunk_start] = true;
+        }
+    }
+
+    let mut spans = Vec::new();
+    let mut run = 0usize;
+    for i in 1..=chars.len() {
+        if i == chars.len() || in_match[i] != in_match[run] {
+            let text: String = chars[run..i].iter().collect();
+            let mut style = base;
+            if in_match[run] {
+                style = style.fg(theme.log_match).add_modifier(Modifier::BOLD);
+                if is_current_match {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+            }
+            spans.push(Span::styled(text, style));
+            run = i;
+        }
+    }
+    spans
+}
+
+/// Cap the pattern echo in the border title so the header stays a single
+/// coherent line even with a long query typed in.
+fn truncate_for_title(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// Centered modal model-picker popup (feat_model_picker_lite). Same popup
@@ -4143,6 +4267,25 @@ mod tests {
 
     // ---- feat_log_viewer_core: header state, wrap, level colors -----------
 
+    use crate::app::LogViewerState;
+
+    /// Hand-built viewer state for the hermetic render tests below (the
+    /// global diag stream is shared by parallel tests and would race).
+    /// The feat_log_viewer_search_copy fields default to off.
+    fn viewer_state(cursor: usize, wrap: bool, lines: Vec<String>) -> LogViewerState {
+        LogViewerState {
+            cursor,
+            wrap,
+            row_offset: 0,
+            lines,
+            snapshot_total: crate::diag::total_appended(),
+            search_buf: None,
+            search: None,
+            copy_note: None,
+            copy_note_at: None,
+        }
+    }
+
     /// The header (border title) carries the cursor position, the tail
     /// state and the wrap toggle; stepping the cursor up flips live →
     /// pinned, `w` flips wrap: off → on.
@@ -4189,19 +4332,17 @@ mod tests {
     /// diag stream (shared by parallel tests) cannot race the render.
     #[test]
     fn log_viewer_wrap_toggle_reflows_long_lines() {
-        use crate::app::LogViewerState;
         let long = format!("WRAPHEAD-{}", "y".repeat(200));
-        let mk_state = |wrap: bool| LogViewerState {
-            // Pinned to the long line itself: the snapshot stays frozen.
-            cursor: 1,
-            wrap,
-            row_offset: 0,
-            lines: vec![
-                "head filler".to_owned(),
-                long.clone(),
-                "tail filler".to_owned(),
-            ],
-            snapshot_total: crate::diag::total_appended(),
+        let mk_state = |wrap: bool| {
+            viewer_state(
+                1,
+                wrap,
+                vec![
+                    "head filler".to_owned(),
+                    long.clone(),
+                    "tail filler".to_owned(),
+                ],
+            )
         };
 
         let mut app = App::new(mock::initial_chats());
@@ -4231,7 +4372,6 @@ mod tests {
     /// the global diag stream is shared by parallel tests and would race.
     #[test]
     fn log_viewer_colors_levels_via_theme_slots() {
-        use crate::app::LogViewerState;
         let theme = Theme::tokyo_night();
         let cases: [(&str, ratatui::style::Color); 5] = [
             ("LVC-INFO", theme.log_info),
@@ -4251,14 +4391,8 @@ mod tests {
 
         let mut app = App::new(mock::initial_chats());
         app.mode = Mode::LogViewer {
-            state: LogViewerState {
-                // Pinned to a middle line: the snapshot stays frozen.
-                cursor: 2,
-                wrap: false,
-                row_offset: 0,
-                lines,
-                snapshot_total: crate::diag::total_appended(),
-            },
+            // Pinned to a middle line: the snapshot stays frozen.
+            state: viewer_state(2, false, lines),
         };
         let (rows, buf) = render_grid_with_buffer(&mut app);
 
@@ -4304,6 +4438,217 @@ mod tests {
         );
         assert_eq!(log_level_of("[tui] handshake ok (protocol v1)"), None);
         assert_eq!(log_level_of("plain stderr noise"), None);
+    }
+
+    // ---- feat_log_viewer_search_copy: search + copy ------------------------
+
+    /// Every occurrence of the pattern lights up in the log_match slot, and
+    /// the line the cursor's current hit sits on is emphasized (reversed on
+    /// top of the slot). Non-match text keeps its level color. Hand-built
+    /// pinned state, so the shared diag stream cannot race the render.
+    #[test]
+    fn log_viewer_search_highlights_matches_and_current() {
+        use crate::app::LogSearch;
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(mock::initial_chats());
+        app.mode = Mode::LogViewer {
+            state: viewer_state(
+                0,
+                false,
+                vec![
+                    "one ALPHA mid".to_owned(),
+                    "plain middle".to_owned(),
+                    "three alpha end".to_owned(),
+                ],
+            ),
+        };
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.search = Some(LogSearch {
+                pattern: "alpha".to_owned(),
+                matches: vec![0, 2],
+                current: Some(0),
+            });
+        }
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+
+        // Current hit line: the match cells take the slot AND are reversed.
+        let (y, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("ALPHA"))
+            .expect("current match line visible");
+        let col = col_of_sub(row, "ALPHA").expect("match column");
+        for dx in 0..5usize {
+            let cell = &buf[((col + dx) as u16, y as u16)];
+            assert_eq!(cell.fg, theme.log_match, "match slot fg at dx={dx}");
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "current match emphasized at dx={dx}"
+            );
+        }
+        let before = &buf[((col - 1) as u16, y as u16)];
+        assert_ne!(before.fg, theme.log_match, "text before the hit untouched");
+
+        // The other hit line: same slot, no reversed emphasis.
+        let (y, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("alpha"))
+            .expect("second match line visible");
+        let col = col_of_sub(row, "alpha").expect("match column");
+        let cell = &buf[(col as u16, y as u16)];
+        assert_eq!(cell.fg, theme.log_match);
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "non-current hits stay plain slot color"
+        );
+    }
+
+    /// A hit past the first wrap chunk still highlights: the search runs on
+    /// the logical line and the ranges are cut into the reflowed rows at
+    /// their char offsets.
+    #[test]
+    fn log_viewer_search_highlight_survives_wrap_boundary() {
+        use crate::app::LogSearch;
+        let theme = Theme::tokyo_night();
+        // 110 x's push `alpha` past the first chunk at the demo width.
+        let long = format!("{}alpha tail", "x".repeat(110));
+        let mut app = App::new(mock::initial_chats());
+        // Pinned (cursor 0 of 2 lines): the snapshot never refreshes.
+        app.mode = Mode::LogViewer {
+            state: viewer_state(0, true, vec![long, "tail filler".to_owned()]),
+        };
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.search = Some(LogSearch {
+                pattern: "alpha".to_owned(),
+                matches: vec![0],
+                current: Some(0),
+            });
+        }
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+
+        // The reflow split the line: chunk rows exist, and the row that
+        // carries the hit highlights exactly the pattern cells.
+        let (y, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("alpha"))
+            .expect("the second chunk shows the tail");
+        let col = col_of_sub(row, "alpha").expect("match column in the wrapped row");
+        for dx in 0..5usize {
+            let cell = &buf[((col + dx) as u16, y as u16)];
+            assert_eq!(
+                cell.fg, theme.log_match,
+                "highlight crossed the wrap at dx={dx}"
+            );
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "current hit emphasis survives the reflow at dx={dx}"
+            );
+        }
+        let before = &buf[((col - 1) as u16, y as u16)];
+        assert_ne!(
+            before.fg, theme.log_match,
+            "padding x before the hit untouched"
+        );
+    }
+
+    /// Header carries the whole search/copy state in one line: plain count
+    /// before the first n, `k/N` while navigating, the open prompt echo,
+    /// and the copy feedback (both flavors).
+    #[test]
+    fn log_viewer_header_shows_search_and_copy_states() {
+        use crate::app::LogSearch;
+        let mk = |cursor: usize, lines: Vec<String>| {
+            let mut app = App::new(mock::initial_chats());
+            app.mode = Mode::LogViewer {
+                state: viewer_state(cursor, false, lines),
+            };
+            app
+        };
+        let title_of = |app: &mut App| {
+            render_grid(app)
+                .into_iter()
+                .find(|r| r.contains("Diagnostics log"))
+                .expect("viewer title row exists")
+        };
+
+        // Committed, nothing selected yet: bare count. A 4th line keeps the
+        // cursor off the tail after n, so the hand-built snapshot never
+        // gets replaced by the live refresh.
+        let mut app = mk(
+            0,
+            vec![
+                "alpha one".to_owned(),
+                "filler".to_owned(),
+                "two alpha".to_owned(),
+                "end filler".to_owned(),
+            ],
+        );
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.search = Some(LogSearch {
+                pattern: "alpha".to_owned(),
+                matches: vec![0, 2],
+                current: None,
+            });
+        }
+        let title = title_of(&mut app);
+        assert!(title.contains("matches: 2"), "bare count: {title}");
+        assert!(
+            !title.contains("matches: 2/"),
+            "no position before n: {title}"
+        );
+
+        // After n: the cursor sat on hit #1 already, so n moves to hit #2.
+        app.log_search_next();
+        let title = title_of(&mut app);
+        assert!(title.contains("matches: 2/2"), "navigating count: {title}");
+
+        // Open prompt: pattern echo in the header, prompt line at the
+        // bottom instead of the hint row.
+        app.log_open_search();
+        app.log_search_push('a');
+        app.log_search_push('l');
+        let rows = render_grid(&mut app);
+        let title = rows
+            .iter()
+            .find(|r| r.contains("Diagnostics log"))
+            .expect("title row");
+        assert!(title.contains("search: /al"), "prompt echo: {title}");
+        let footer = rows
+            .iter()
+            .find(|r| r.contains("Enter commit"))
+            .expect("prompt line at the bottom");
+        assert!(footer.contains("/al"), "prompt shows the buffer: {footer}");
+
+        // Copy feedback rides the header too, both flavors.
+        let mut app = mk(0, vec!["a".to_owned(), "b".to_owned()]);
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.copy_note = Some("copied".to_owned());
+            state.copy_note_at = Some(std::time::Instant::now());
+        }
+        let title = title_of(&mut app);
+        assert!(title.contains("\u{00b7} copied"), "success note: {title}");
+
+        let mut app = mk(0, vec!["a".to_owned(), "b".to_owned()]);
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.copy_note = Some("copy: unavailable".to_owned());
+            state.copy_note_at = Some(std::time::Instant::now());
+        }
+        let title = title_of(&mut app);
+        assert!(title.contains("copy: unavailable"), "failure note: {title}");
+
+        // The hint row advertises the new keys when nothing is open.
+        let mut app = mk(0, vec!["a".to_owned(), "b".to_owned()]);
+        let rows = render_grid(&mut app);
+        assert!(
+            rows.iter().any(|r| r.contains("/ search")),
+            "hint mentions search"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("y copy")),
+            "hint mentions copy"
+        );
     }
 
     // ---- feat_status_line: cwd + model strip -------------------------------

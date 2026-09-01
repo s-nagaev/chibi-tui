@@ -664,6 +664,10 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // While the ^G log viewer is open, ONLY viewer keys work: the cursor
     // walks logical lines (↑/↓ and k/j by one line, PgUp/PgDn by a page,
     // g/G to the ends, where G returns to the live tail), `w` toggles wrap.
+    // feat_log_viewer_search_copy adds `/` (opens the search prompt), n/N
+    // (next/prev match) and `y` (copy the cursor line). While the search
+    // prompt is open it owns the keyboard completely: typing edits the
+    // pattern, Enter commits, Esc cancels, everything else is swallowed.
     // While the cursor rests on the newest line the view keeps streaming
     // new arrivals in; one step up pins it to the cursor. Esc closes,
     // Ctrl+C quits (same class as the other popups). Everything else
@@ -673,6 +677,22 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // read-only, so Enter is swallowed and the loop's submit gates need no
     // extra snapshot flag.
     if matches!(app.mode, Mode::LogViewer { .. }) {
+        // The open search prompt takes the keyboard before anything else.
+        let search_prompt_open = match &app.mode {
+            Mode::LogViewer { state } => state.search_buf.is_some(),
+            _ => false,
+        };
+        if search_prompt_open {
+            match key.code {
+                KeyCode::Char(c) if !ctrl && !alt => app.log_search_push(c),
+                KeyCode::Backspace if !ctrl && !alt => app.log_search_pop(),
+                KeyCode::Enter => app.log_commit_search(),
+                KeyCode::Esc => app.log_cancel_search(),
+                KeyCode::Char('c') if ctrl => app.should_quit = true,
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::PageUp => app.log_page_up(),
             KeyCode::PageDown => app.log_page_down(),
@@ -684,6 +704,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('g') if !ctrl && !alt => app.log_jump_top(),
             KeyCode::Char('G') => app.log_jump_bottom(),
             KeyCode::Char('w') if !ctrl && !alt => app.log_toggle_wrap(),
+            // Search round-trip: `/` opens the prompt (see above), n/N walk
+            // the committed matches with wraparound on both ends.
+            KeyCode::Char('/') if !ctrl && !alt => app.log_open_search(),
+            KeyCode::Char('n') if !ctrl && !alt => app.log_search_next(),
+            KeyCode::Char('N') if !ctrl && !alt => app.log_search_prev(),
+            // Copy the full cursor line (OSC 52, with the env fallback).
+            KeyCode::Char('y') if !ctrl && !alt => app.log_copy_selected(),
             KeyCode::Esc => {
                 app.close_log_viewer();
             }
@@ -3201,6 +3228,182 @@ mod tests {
             cursor_before,
             "swallowed keys must not move the read position"
         );
+    }
+
+    // ---- feat_log_viewer_search_copy: `/` search, n/N, `y` copy ----------
+
+    /// Hand-built pinned viewer state: hermetic against the global diag
+    /// stream that parallel tests append to.
+    fn log_viewer_state(
+        cursor: usize,
+        lines: Vec<&str>,
+        search: Option<chibi_tui::app::LogSearch>,
+    ) -> chibi_tui::app::LogViewerState {
+        chibi_tui::app::LogViewerState {
+            cursor,
+            wrap: false,
+            row_offset: 0,
+            lines: lines.into_iter().map(str::to_owned).collect(),
+            snapshot_total: chibi_tui::diag::total_appended(),
+            search_buf: None,
+            search,
+            copy_note: None,
+            copy_note_at: None,
+        }
+    }
+
+    fn viewer_search(app: &chibi_tui::app::App) -> &chibi_tui::app::LogSearch {
+        match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => {
+                state.search.as_ref().expect("search committed")
+            }
+            other => panic!("expected LogViewer, got {other:?}"),
+        }
+    }
+
+    /// `/` opens the prompt, typing fills it, Enter commits; n/N walk the
+    /// hits with wraparound on both ends (line-level, both wrap modes use
+    /// the same logical lines, so this holds under wrap too).
+    #[test]
+    fn log_viewer_search_open_commit_and_navigate_wraparound() {
+        let mut app = app_with_chats(1);
+        app.mode = chibi_tui::app::Mode::LogViewer {
+            state: log_viewer_state(
+                3,
+                vec!["alpha one", "beta ALPHA two", "gamma", "alpha three"],
+                None,
+            ),
+        };
+
+        // Open the prompt and type the pattern.
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for ch in "alpha".chars() {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        let buf = match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => {
+                state.search_buf.clone().expect("prompt open")
+            }
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+        assert_eq!(buf, "alpha", "prompt holds the typed pattern");
+
+        // Enter commits: case-insensitive, line-level, cursor jumps to the
+        // nearest hit at or after its line (3).
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let search = viewer_search(&app);
+        assert_eq!(search.pattern, "alpha");
+        assert_eq!(search.matches, vec![0, 1, 3]);
+        assert_eq!(search.current, None, "no hit selected before the first n");
+        let cursor = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.cursor,
+            other => panic!("expected LogViewer, got {other:?}"),
+        };
+        assert_eq!(cursor(&app), 3);
+
+        // n walks forward and wraps at the tail hit.
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(cursor(&app), 0);
+        assert_eq!(viewer_search(&app).current, Some(0));
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(cursor(&app), 1);
+        assert_eq!(viewer_search(&app).current, Some(1));
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(cursor(&app), 3);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(cursor(&app), 0, "n wraps around at the end");
+
+        // N steps back (wrapping to the tail hit from the top).
+        press(&mut app, KeyCode::Char('N'), KeyModifiers::NONE);
+        assert_eq!(cursor(&app), 3);
+        assert_eq!(viewer_search(&app).current, Some(2));
+    }
+
+    /// Esc on the open prompt cancels it and keeps a previously committed
+    /// search intact; Enter on an empty prompt switches the search off.
+    #[test]
+    fn log_viewer_search_esc_cancels_and_empty_commit_switches_off() {
+        let previous = Some(chibi_tui::app::LogSearch {
+            pattern: "gamma".to_owned(),
+            matches: vec![2],
+            current: Some(0),
+        });
+        let mut app = app_with_chats(1);
+        app.mode = chibi_tui::app::Mode::LogViewer {
+            state: log_viewer_state(0, vec!["alpha one", "gamma line"], previous.clone()),
+        };
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => {
+                assert!(state.search_buf.is_none(), "prompt closed by Esc");
+                assert_eq!(&state.search, &previous, "old search untouched");
+            }
+            other => panic!("expected LogViewer, got {other:?}"),
+        }
+
+        // Empty pattern commit = search off.
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => {
+                assert!(state.search.is_none(), "empty pattern switches off");
+            }
+            other => panic!("expected LogViewer, got {other:?}"),
+        }
+    }
+
+    /// While the search prompt is open it owns the keyboard: nav letters
+    /// and global chords land in the buffer, nothing else moves.
+    #[test]
+    fn log_viewer_search_prompt_swallows_everything_else() {
+        let mut app = app_with_chats(1);
+        app.mode = chibi_tui::app::Mode::LogViewer {
+            state: log_viewer_state(1, vec!["alpha one", "beta two"], None),
+        };
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        // Letters that are viewer keys outside the prompt, plus a global
+        // chord and arrows: all swallowed, only plain chars type.
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('G'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // commit "wnG"
+        match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => {
+                let search = state.search.as_ref().expect("committed");
+                assert_eq!(search.pattern, "wnG", "only plain chars reached the buffer");
+                assert!(
+                    search.matches.is_empty(),
+                    "no line matches, search stays active with zero hits"
+                );
+                assert_eq!(state.cursor, 1, "cursor never moved while typing");
+                assert!(!state.wrap, "w did not toggle wrap inside the prompt");
+            }
+            other => panic!("expected LogViewer, got {other:?}"),
+        }
+    }
+
+    /// `y` copies the cursor line and the header gets the brief `copied`
+    /// feedback (the OSC 52 bytes themselves are asserted in clipboard.rs;
+    /// here the write goes to the test process stdout, which is harmless).
+    #[test]
+    fn log_viewer_y_sets_copied_feedback() {
+        let mut app = app_with_chats(1);
+        app.mode = chibi_tui::app::Mode::LogViewer {
+            state: log_viewer_state(1, vec!["first", "second line"], None),
+        };
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => {
+                assert_eq!(state.copy_note.as_deref(), Some("copied"));
+                assert!(state.copy_note_at.is_some());
+            }
+            other => panic!("expected LogViewer, got {other:?}"),
+        }
     }
 
     /// Ctrl+C keeps its popup-class meaning: quit from the log viewer.

@@ -51,6 +51,11 @@ pub struct Theme {
     pub log_moderator: Color,
     /// TOOL lines take the strong blue slot.
     pub log_tool: Color,
+    /// Log viewer search matches (feat_log_viewer_search_copy): every hit
+    /// inside the rendered text takes this slot, kept apart from the level
+    /// colors so a match stays readable on any level tint. The match the
+    /// cursor currently sits on reuses the slot with reversed colors.
+    pub log_match: Color,
 }
 
 impl Theme {
@@ -85,6 +90,7 @@ impl Theme {
             log_think: Color::Rgb(187, 154, 247), // #bb9af7, same as purple
             log_moderator: Color::Rgb(255, 158, 100), // #ff9e64, same as orange
             log_tool: Color::Rgb(122, 162, 247), // #7aa2f7, same as blue
+            log_match: Color::Rgb(158, 206, 106), // #9ece6a, same as green
         }
     }
 }

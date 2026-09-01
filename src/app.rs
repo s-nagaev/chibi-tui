@@ -129,6 +129,39 @@ pub struct LogViewerState {
     /// here so a pinned view scrolls minimally instead of re-anchoring on
     /// every frame). Rows, not logical lines: wrap changes the grid.
     pub row_offset: usize,
+    /// Buffer of the open `/` search prompt (feat_log_viewer_search_copy).
+    /// `None` while the prompt is closed; while it holds a value the prompt
+    /// owns the keyboard completely (Enter commits, Esc cancels).
+    pub search_buf: Option<String>,
+    /// The committed search: pattern, matching logical lines and which one
+    /// the cursor is on. `None` with no search active (an empty pattern
+    /// commit switches the search off).
+    pub search: Option<LogSearch>,
+    /// Transient header feedback of the last `y` copy attempt (`copied` or
+    /// `copy: unavailable`), cleared by [`LogViewerState::expire_copy_note`]
+    /// after a couple of seconds.
+    pub copy_note: Option<String>,
+    /// When [`LogViewerState::copy_note`] was set; the expiry anchor.
+    pub copy_note_at: Option<std::time::Instant>,
+}
+
+/// One committed log-viewer search (feat_log_viewer_search_copy).
+///
+/// `matches` holds LOGICAL line indices, so navigation stays correct in both
+/// wrap modes: the cursor jumps whole lines, never rows. One entry per line
+/// even when the pattern occurs several times inside it: `n`/`N` walk lines,
+/// while the renderer highlights every occurrence on every matched line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogSearch {
+    /// The committed pattern (case-insensitive substring).
+    pub pattern: String,
+    /// Logical line indices with at least one hit, ascending.
+    pub matches: Vec<usize>,
+    /// Index into `matches` of the hit the cursor is parked on. `None`
+    /// right after commit (before the first `n`/`N`), which is also the
+    /// difference between the header showing `matches: 7` and
+    /// `matches: 3/7`.
+    pub current: Option<usize>,
 }
 
 impl LogViewerState {
@@ -149,6 +182,73 @@ impl LogViewerState {
             1
         }
     }
+
+    /// Recompute the match list after the snapshot changed (live tail
+    /// refresh, return to bottom). The pattern stays, the current-match
+    /// ordinal is kept when it still points somewhere, otherwise dropped.
+    pub fn reindex_search(&mut self) {
+        let Some(pattern) = self.search.as_ref().map(|s| s.pattern.clone()) else {
+            return;
+        };
+        let matches: Vec<usize> = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line_matches(line, &pattern))
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(search) = self.search.as_mut() {
+            search.matches = matches;
+            if let Some(cur) = search.current {
+                if cur >= search.matches.len() {
+                    search.current = None;
+                }
+            }
+        }
+    }
+
+    /// Drop the copy feedback note once its brief display window passed
+    /// (called from the renderer every frame).
+    pub fn expire_copy_note(&mut self) {
+        if let Some(at) = self.copy_note_at {
+            if at.elapsed() > std::time::Duration::from_secs(2) {
+                self.copy_note = None;
+                self.copy_note_at = None;
+            }
+        }
+    }
+}
+
+/// Case-insensitive substring test used by the log search.
+fn line_matches(line: &str, pattern: &str) -> bool {
+    line.to_lowercase().contains(&pattern.to_lowercase())
+}
+
+/// All case-insensitive occurrences of `pattern` in `line`, as char-offset
+/// ranges `(start, end)` (end exclusive, non-overlapping, ascending). Char
+/// offsets on purpose: they line up with the wrap chunks the renderer
+/// builds, so highlights survive the reflow. An empty pattern never
+/// matches.
+pub fn find_match_ranges(line: &str, pattern: &str) -> Vec<(usize, usize)> {
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    let hay: Vec<char> = line.to_lowercase().chars().collect();
+    let pat: Vec<char> = pattern.to_lowercase().chars().collect();
+    if pat.is_empty() || pat.len() > hay.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + pat.len() <= hay.len() {
+        if hay[i..i + pat.len()] == pat[..] {
+            out.push((i, i + pat.len()));
+            i += pat.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Split one logical line into `width`-wide row chunks (character-level,
@@ -1168,6 +1268,10 @@ impl App {
                 row_offset: 0,
                 lines,
                 snapshot_total,
+                search_buf: None,
+                search: None,
+                copy_note: None,
+                copy_note_at: None,
             },
         };
     }
@@ -1184,6 +1288,7 @@ impl App {
             state.lines = lines;
             state.snapshot_total = snapshot_total;
             self.log_seen_total = snapshot_total;
+            state.reindex_search();
         }
     }
 
@@ -1279,6 +1384,170 @@ impl App {
     pub fn log_toggle_wrap(&mut self) {
         if let Mode::LogViewer { state } = &mut self.mode {
             state.wrap = !state.wrap;
+        }
+    }
+
+    // ---- log viewer search (feat_log_viewer_search_copy) ------------------
+
+    /// `/`: open the search prompt at the bottom of the viewer with an
+    /// empty buffer. Also clears the copy feedback, so the header never
+    /// carries two transient notes at once.
+    pub fn log_open_search(&mut self) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            state.search_buf = Some(String::new());
+            state.copy_note = None;
+            state.copy_note_at = None;
+        }
+    }
+
+    /// One printable char into the open search prompt buffer.
+    pub fn log_search_push(&mut self, ch: char) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            if let Some(buf) = state.search_buf.as_mut() {
+                buf.push(ch);
+            }
+        }
+    }
+
+    /// Backspace in the open search prompt buffer (no-op when empty).
+    pub fn log_search_pop(&mut self) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            if let Some(buf) = state.search_buf.as_mut() {
+                buf.pop();
+            }
+        }
+    }
+
+    /// Enter on the open prompt: commit the search. An empty pattern
+    /// switches the search off entirely. Otherwise the match list is
+    /// computed over the whole snapshot and the cursor jumps to the nearest
+    /// match at or after its current line, so the user lands somewhere
+    /// visible without losing the reading position.
+    pub fn log_commit_search(&mut self) {
+        let pattern = match &mut self.mode {
+            Mode::LogViewer { state } => state.search_buf.take().unwrap_or_default(),
+            _ => return,
+        };
+        let jump = match &mut self.mode {
+            Mode::LogViewer { state } => {
+                if pattern.is_empty() {
+                    state.search = None;
+                    None
+                } else {
+                    let matches: Vec<usize> = state
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| line_matches(line, &pattern))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let target = matches.iter().find(|&&m| m >= state.cursor).copied();
+                    state.search = Some(LogSearch {
+                        pattern,
+                        matches,
+                        current: None,
+                    });
+                    target
+                }
+            }
+            _ => None,
+        };
+        if let Some(line) = jump {
+            if let Mode::LogViewer { state } = &mut self.mode {
+                state.cursor = line;
+            }
+        }
+    }
+
+    /// Esc on the open prompt: cancel, keep the previous search (if any)
+    /// untouched.
+    pub fn log_cancel_search(&mut self) {
+        if let Mode::LogViewer { state } = &mut self.mode {
+            state.search_buf = None;
+        }
+    }
+
+    /// n: next match after the cursor line, wrapping around at the end.
+    /// No-op without a committed search or when nothing matched.
+    pub fn log_search_next(&mut self) {
+        self.log_search_step(true);
+    }
+
+    /// N: previous match before the cursor line, wrapping around at the
+    /// start. No-op without a committed search or when nothing matched.
+    pub fn log_search_prev(&mut self) {
+        self.log_search_step(false);
+    }
+
+    /// Shared n/N stepper: picks the neighbouring match line (with
+    /// wraparound), records it as the current hit and moves the cursor
+    /// there. Navigation never re-arms the live tail on purpose: jumping to
+    /// a match is reading, not following the stream.
+    fn log_search_step(&mut self, forward: bool) {
+        let jump = match &mut self.mode {
+            Mode::LogViewer { state } => {
+                let Some(search) = state.search.as_mut() else {
+                    return;
+                };
+                if search.matches.is_empty() {
+                    return;
+                }
+                let target = if forward {
+                    search
+                        .matches
+                        .iter()
+                        .find(|&&m| m > state.cursor)
+                        .copied()
+                        .unwrap_or(search.matches[0])
+                } else {
+                    search
+                        .matches
+                        .iter()
+                        .rev()
+                        .find(|&&m| m < state.cursor)
+                        .copied()
+                        .unwrap_or(*search.matches.last().expect("matches non-empty"))
+                };
+                search.current = Some(
+                    search
+                        .matches
+                        .iter()
+                        .position(|&m| m == target)
+                        .expect("target came from matches"),
+                );
+                Some(target)
+            }
+            _ => None,
+        };
+        if let Some(line) = jump {
+            if let Mode::LogViewer { state } = &mut self.mode {
+                state.cursor = line;
+            }
+        }
+    }
+
+    /// y: copy the full text of the cursor LOGICAL line to the clipboard.
+    ///
+    /// In wrap mode that is the whole message, not the truncated row. The
+    /// transports are [`crate::clipboard::copy_text`]: OSC 52 first, plus
+    /// the `CHIBI_TUI_COPY_CMD` fallback when set. The header gets a brief
+    /// feedback note either way (`copied` / `copy: unavailable`).
+    pub fn log_copy_selected(&mut self) {
+        let note = match &self.mode {
+            Mode::LogViewer { state } => {
+                let Some(text) = state.lines.get(state.cursor) else {
+                    return;
+                };
+                match crate::clipboard::copy_text(text) {
+                    crate::clipboard::CopyOutcome::Copied => "copied".to_owned(),
+                    crate::clipboard::CopyOutcome::Unavailable => "copy: unavailable".to_owned(),
+                }
+            }
+            _ => return,
+        };
+        if let Mode::LogViewer { state } = &mut self.mode {
+            state.copy_note = Some(note);
+            state.copy_note_at = Some(std::time::Instant::now());
         }
     }
 
@@ -5215,6 +5484,123 @@ mod tests {
             Mode::LogViewer { state } => state,
             other => panic!("expected LogViewer mode, got {other:?}"),
         }
+    }
+
+    /// Search semantics at the state level (feat_log_viewer_search_copy):
+    /// commit jumps to the nearest match at or after the cursor, n/N walk
+    /// with wraparound, and a snapshot refresh reindexes while keeping the
+    /// current hit when it still exists.
+    #[test]
+    fn log_search_commit_jump_wraparound_and_reindex() {
+        let lines = vec![
+            "alpha one".to_owned(),
+            "beta ALPHA two".to_owned(),
+            "gamma".to_owned(),
+            "alpha three".to_owned(),
+        ];
+        let mk = |cursor: usize, lines: Vec<String>, search: Option<LogSearch>| Mode::LogViewer {
+            state: LogViewerState {
+                cursor,
+                wrap: false,
+                row_offset: 0,
+                lines,
+                snapshot_total: crate::diag::total_appended(),
+                search_buf: None,
+                search,
+                copy_note: None,
+                copy_note_at: None,
+            },
+        };
+
+        // Commit from the middle: the cursor jumps DOWN to the nearest hit.
+        let mut app = App::new(Vec::new());
+        app.mode = mk(2, lines.clone(), None);
+        app.log_open_search();
+        for ch in "alpha".chars() {
+            app.log_search_push(ch);
+        }
+        app.log_commit_search();
+        let state = log_state(&app);
+        assert_eq!(state.search.as_ref().unwrap().matches, vec![0, 1, 3]);
+        assert_eq!(state.search.as_ref().unwrap().current, None);
+        assert_eq!(state.cursor, 3, "jumped to the nearest match >= cursor");
+
+        // n wraps from the last hit back to the first.
+        app.log_search_next();
+        let state = log_state(&app);
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.search.as_ref().unwrap().current, Some(0));
+
+        // N goes back (wrapping to the tail hit).
+        app.log_search_prev();
+        let state = log_state(&app);
+        assert_eq!(state.cursor, 3);
+        assert_eq!(state.search.as_ref().unwrap().current, Some(2));
+
+        // A snapshot refresh (tail re-arm) reindexes the same pattern; the
+        // current hit survives while its ordinal stays valid.
+        app.mode = mk(
+            0,
+            vec!["alpha again".to_owned(), "unrelated".to_owned()],
+            Some(LogSearch {
+                pattern: "alpha".to_owned(),
+                matches: vec![0, 3, 7],
+                current: Some(2),
+            }),
+        );
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.reindex_search();
+        }
+        let state = log_state(&app);
+        assert_eq!(state.search.as_ref().unwrap().matches, vec![0]);
+        assert_eq!(
+            state.search.as_ref().unwrap().current,
+            None,
+            "ordinal beyond the new list drops the current hit"
+        );
+
+        // An empty pattern commit switches the search off.
+        app.log_open_search();
+        app.log_commit_search();
+        assert!(log_state(&app).search.is_none(), "empty pattern = off");
+    }
+
+    /// y copies the full logical line and leaves the brief header feedback
+    /// behind (hermetic: hand-built state, no diag stream involvement).
+    #[test]
+    fn log_copy_selected_sets_feedback_note() {
+        let mut app = App::new(Vec::new());
+        app.mode = Mode::LogViewer {
+            state: LogViewerState {
+                cursor: 1,
+                wrap: true,
+                row_offset: 0,
+                lines: vec![
+                    "first".to_owned(),
+                    "second line with the content to copy".to_owned(),
+                ],
+                snapshot_total: crate::diag::total_appended(),
+                search_buf: None,
+                search: None,
+                copy_note: None,
+                copy_note_at: None,
+            },
+        };
+        app.log_copy_selected();
+        let state = log_state(&app);
+        assert_eq!(state.copy_note.as_deref(), Some("copied"));
+        assert!(state.copy_note_at.is_some(), "expiry anchor recorded");
+
+        // The note expires: after its window the header is clean again.
+        if let Mode::LogViewer { state } = &mut app.mode {
+            state.copy_note_at = Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(3))
+                    .expect("clock moved backwards"),
+            );
+            state.expire_copy_note();
+        }
+        assert!(log_state(&app).copy_note.is_none());
     }
 
     #[test]
