@@ -10,6 +10,10 @@
 //! * **Progress without blocking** — [`ServerMessage::Status`] frames go to a
 //!   broadcast channel ([`RequestPipeline::subscribe_status`]); they are
 //!   structurally unable to consume a request's final-outcome receiver.
+//! * **Subagent progress without blocking** — mid-turn
+//!   [`ServerMessage::AgentEvent`] frames fan out the same way
+//!   ([`RequestPipeline::subscribe_agent_events`]), equally unable to end a
+//!   request.
 //! * **Per-request cancel** — [`RequestPipeline::cancel`] sends a targeted
 //!   `cancel` frame; the backend answers `error { code: cancelled }`, which is
 //!   routed to exactly that request. Never thread-wide.
@@ -48,7 +52,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::backend_client::{spawn_argv, BackendError, ReapHandle};
 use crate::diag;
-use crate::protocol::{ClientMessage, ServerMessage, StatusState};
+use crate::protocol::{AgentEventKind, ClientMessage, ServerMessage, StatusState};
 
 /// How long [`Command::Shutdown`] waits for the backend to exit gracefully
 /// before escalating to kill. Same budget as the raw client.
@@ -79,6 +83,19 @@ impl std::fmt::Display for StatusUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.request_id.0, self.state)
     }
+}
+
+/// Mid-turn subagent progress delivered out-of-band from an `agent_event`
+/// frame (mirrors [`StatusUpdate`]). Never terminal: it must never resolve
+/// or consume a request's final-outcome receiver. `name` is carried for
+/// wire fidelity; current consumers do not display it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventUpdate {
+    pub request_id: String,
+    pub event: AgentEventKind,
+    pub active: u64,
+    pub total: u64,
+    pub name: Option<String>,
 }
 
 /// A fully-formed protocol request ready for
@@ -250,6 +267,7 @@ impl ActorState {
 pub struct RequestPipeline {
     cmd_tx: mpsc::Sender<Command>,
     status_tx: broadcast::Sender<StatusUpdate>,
+    agent_tx: broadcast::Sender<AgentEventUpdate>,
     /// Slash commands the backend advertised in the handshake `ready` frame
     /// (feat_thread_clone consumers). Captured once at connect; a reconnect
     /// spawns the same program, so the set stays valid for the handle's life.
@@ -300,11 +318,13 @@ impl RequestPipeline {
         let parts = client.into_parts();
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (status_tx, _) = broadcast::channel(status_channel_capacity.max(1));
+        let (agent_tx, _) = broadcast::channel(status_channel_capacity.max(1));
 
         tokio::spawn(actor_loop(
             parts,
             cmd_rx,
             status_tx.clone(),
+            agent_tx.clone(),
             ActorConfig {
                 workspace_root: workspace_root.display().to_string(),
                 script_path,
@@ -314,6 +334,7 @@ impl RequestPipeline {
         Ok(Self {
             cmd_tx,
             status_tx,
+            agent_tx,
             commands,
         })
     }
@@ -371,6 +392,15 @@ impl RequestPipeline {
         self.status_tx.subscribe()
     }
 
+    /// Subscribe to mid-turn subagent progress (`agent_event` frames, emitted
+    /// only for clients that declared `capabilities.subagents`). Same
+    /// broadcast semantics as [`RequestPipeline::subscribe_status`]: these
+    /// updates are structurally unable to consume a request's final-outcome
+    /// receiver.
+    pub fn subscribe_agent_events(&self) -> broadcast::Receiver<AgentEventUpdate> {
+        self.agent_tx.subscribe()
+    }
+
     /// Respawn the backend after a broken pipe / premature exit and restore
     /// handshake state. Pending requests were already failed with
     /// [`BackendError::Broken`] at breakage time.
@@ -409,6 +439,7 @@ async fn actor_loop(
     initial_parts: PartsTuple,
     mut cmd_rx: mpsc::Receiver<Command>,
     status_tx: broadcast::Sender<StatusUpdate>,
+    agent_tx: broadcast::Sender<AgentEventUpdate>,
     config: ActorConfig,
 ) {
     let mut state = ActorState {
@@ -452,7 +483,7 @@ async fn actor_loop(
             }
             event = event_rx.recv() => match event {
                 Some(ActorEvent::Frame(msg)) => {
-                    dispatch_frame(&mut state, &status_tx, msg).await;
+                    dispatch_frame(&mut state, &status_tx, &agent_tx, msg).await;
                 }
                 Some(ActorEvent::Died(reason)) => {
                     // feat_stderr_log_modal: pipe death is a diagnostic lifecycle event too:
@@ -603,6 +634,7 @@ async fn handle_reconnect(
 async fn dispatch_frame(
     state: &mut ActorState,
     status_tx: &broadcast::Sender<StatusUpdate>,
+    agent_tx: &broadcast::Sender<AgentEventUpdate>,
     msg: ServerMessage,
 ) {
     match msg {
@@ -614,6 +646,24 @@ async fn dispatch_frame(
             let _ = status_tx.send(StatusUpdate {
                 request_id: StatusRequestId(request_id),
                 state: st,
+            });
+        }
+        // Mid-turn subagent progress: fan out to the agent-event channel and
+        // leave the request's pending entry (and its final-outcome receiver)
+        // strictly untouched — the frame must never end the request.
+        ServerMessage::AgentEvent {
+            request_id,
+            event,
+            active,
+            total,
+            name,
+        } => {
+            let _ = agent_tx.send(AgentEventUpdate {
+                request_id,
+                event,
+                active,
+                total,
+                name,
             });
         }
         ServerMessage::Result {
@@ -767,5 +817,88 @@ mod tests {
         assert!(parse_frame("not json at all").is_none());
         let (_, after_total) = crate::diag::view();
         assert_eq!(after_total, before_total, "no diag line for plain garbage");
+    }
+
+    /// agent_event lines parse through the reader seam into the dedicated
+    /// variant, tolerant of both wire shapes (with/without `name`).
+    #[test]
+    fn agent_event_lines_parse_through_reader() {
+        let started = r#"{"type":"agent_event","request_id":"r1","event":"started","active":2,"total":5,"name":"scout"}"#;
+        match parse_frame(started).expect("started frame parses") {
+            ServerMessage::AgentEvent {
+                request_id,
+                event,
+                active,
+                total,
+                name,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(event, AgentEventKind::Started);
+                assert_eq!(active, 2);
+                assert_eq!(total, 5);
+                assert_eq!(name.as_deref(), Some("scout"));
+            }
+            other => panic!("expected AgentEvent, got {other:?}"),
+        }
+
+        let finished =
+            r#"{"type":"agent_event","request_id":"r1","event":"finished","active":0,"total":5}"#;
+        match parse_frame(finished).expect("finished frame parses") {
+            ServerMessage::AgentEvent {
+                event,
+                active,
+                name,
+                ..
+            } => {
+                assert_eq!(event, AgentEventKind::Finished);
+                assert_eq!(active, 0);
+                assert_eq!(name, None);
+            }
+            other => panic!("expected AgentEvent, got {other:?}"),
+        }
+    }
+
+    /// Non-terminal lifecycle: an `agent_event` frame fans out to the
+    /// agent-event channel but must NEVER resolve the request's pending
+    /// final-outcome receiver — unlike `result`/`error`, the pending entry
+    /// survives the dispatch intact.
+    #[tokio::test]
+    async fn agent_event_dispatch_never_resolves_pending() {
+        let (status_tx, _status_rx) = broadcast::channel(4);
+        let (agent_tx, mut agent_rx) = broadcast::channel(4);
+        let (result_tx, mut result_rx) = oneshot::channel();
+        let mut state = ActorState {
+            stdin: None,
+            reaper: None,
+            pending: HashMap::new(),
+            broken_reason: None,
+        };
+        state.pending.insert("r1".to_owned(), result_tx);
+
+        let frame: ServerMessage = serde_json::from_str(
+            r#"{"type":"agent_event","request_id":"r1","event":"started","active":2,"total":5}"#,
+        )
+        .expect("agent_event frame parses");
+        dispatch_frame(&mut state, &status_tx, &agent_tx, frame).await;
+
+        assert!(
+            state.pending.contains_key("r1"),
+            "mid-turn frame must not consume the pending entry"
+        );
+        assert!(
+            result_rx.try_recv().is_err(),
+            "final-outcome receiver must stay unresolved"
+        );
+        let update = agent_rx.try_recv().expect("agent event fanned out");
+        assert_eq!(
+            update,
+            AgentEventUpdate {
+                request_id: "r1".to_owned(),
+                event: AgentEventKind::Started,
+                active: 2,
+                total: 5,
+                name: None,
+            }
+        );
     }
 }

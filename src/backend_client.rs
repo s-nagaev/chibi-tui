@@ -259,7 +259,10 @@ impl BackendClient {
                 name: CLIENT_NAME.to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             }),
-            capabilities: Some(ClientCapabilities { thoughts: true }),
+            capabilities: Some(ClientCapabilities {
+                thoughts: true,
+                subagents: true,
+            }),
         };
         let line = serde_json::to_string(&initialize)
             .map_err(|e| BackendError::Handshake(format!("cannot serialize initialize: {e}")))?;

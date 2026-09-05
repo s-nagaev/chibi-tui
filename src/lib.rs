@@ -31,15 +31,15 @@ pub mod ui;
 // Public re-exports: the protocol type surface consumed by `backend_client`
 // (task 3a) — keep stable.
 pub use crate::protocol::{
-    Capabilities, ClientInfo, ClientMessage, CursorPosition, ErrorCode, ProtocolVersion, Selection,
-    ServerInfo, ServerMessage, StatusState,
+    AgentEventKind, Capabilities, ClientInfo, ClientMessage, CursorPosition, ErrorCode,
+    ProtocolVersion, Selection, ServerInfo, ServerMessage, StatusState,
 };
 
 // Public re-exports: the process lifecycle surface of the real client (3a).
 pub use crate::backend_client::{BackendClient, BackendError};
 
 // Public re-exports: request correlation surface of the real client (3b).
-pub use crate::request_pipeline::{RequestArgs, RequestPipeline, StatusUpdate};
+pub use crate::request_pipeline::{AgentEventUpdate, RequestArgs, RequestPipeline, StatusUpdate};
 
 // Public re-exports: application-state surface bridging backend → UI (task 4).
 pub use crate::app::{App, Chat, Connection, Submitted};

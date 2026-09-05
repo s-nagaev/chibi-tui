@@ -5,7 +5,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::protocol::Usage;
+use crate::protocol::{AgentEventKind, Usage};
 
 /// Events pushed from the backend towards the UI, mirroring the coarse
 /// lifecycle of protocol v1 (`status queued/running`, then `result`/`error`).
@@ -21,6 +21,18 @@ pub enum BackendEvent {
     Queued { request_id: u64, thread_id: String },
     /// Backend is processing the request.
     Running { request_id: u64, thread_id: String },
+    /// Mid-turn subagent progress for a request (real backend only, emitted
+    /// for clients that declared `capabilities.subagents`). NON-terminal:
+    /// the app folds it into the live subagent counter and must never
+    /// resolve the request lifecycle from it. `request_id` follows the same
+    /// numeric correlation convention as every other variant.
+    AgentProgress {
+        request_id: u64,
+        thread_id: String,
+        event: AgentEventKind,
+        active: u64,
+        total: u64,
+    },
     /// Final markdown answer.
     ///
     /// `model` is the display label of the model that produced the answer

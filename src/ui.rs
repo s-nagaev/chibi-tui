@@ -144,7 +144,9 @@ fn theme_red() -> ratatui::style::Color {
 
 /// Spinner + lifecycle label rendered just above the input box. Per-thread
 /// async: reflects ONLY the ACTIVE chat — background chats' work is shown by
-/// their sidebar dot, never by this line.
+/// their sidebar dot, never by this line. When the tracked request reports
+/// live subagents, a ` · subagents working: n` segment is appended; without
+/// one the line stays byte-for-byte as before.
 fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let (label, color) = match app.active_lifecycle() {
         ChatLifecycle::Idle => return, // keep the line empty when idle
@@ -152,11 +154,12 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ChatLifecycle::Running { .. } => ("thinking\u{2026}", theme.purple),
     };
     let spinner = app.spinner_char();
+    let mut text = format!(" {spinner} {label}");
+    if let Some(active) = app.active_chat_subagents() {
+        text.push_str(&format!(" \u{00b7} subagents working: {active}"));
+    }
     f.render_widget(
-        Paragraph::new(Span::styled(
-            format!(" {spinner} {label}"),
-            Style::new().fg(color),
-        )),
+        Paragraph::new(Span::styled(text, Style::new().fg(color))),
         area,
     );
 }
@@ -2165,6 +2168,7 @@ mod tests {
     use crate::app::{App, Chat};
     use crate::mock;
     use crate::model::{ChatLifecycle, Message};
+    use crate::protocol::AgentEventKind;
     use crate::theme::Theme;
     use ratatui::backend::TestBackend;
 
@@ -2926,6 +2930,89 @@ mod tests {
         assert!(
             line.trim().is_empty(),
             "background chat must not spin the active chat's line, got {line:?}"
+        );
+    }
+
+    // ---- tui_subagents_b5: subagent counter in the spinner line -----------
+
+    /// While the tracked request reports live subagents, the spinner line
+    /// gains a ` · subagents working: n` segment; without an entry the line
+    /// stays byte-for-byte unchanged.
+    #[test]
+    fn spinner_line_appends_subagents_working_counter() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].lifecycle = ChatLifecycle::Running {
+            request_id: "req-sub".into(),
+        };
+
+        let base = spinner_line_of(&mut app);
+        assert!(base.contains("thinking"), "precondition: spinner visible");
+        assert!(
+            !base.contains("subagents"),
+            "no counter before any agent_event, got {base:?}"
+        );
+
+        app.apply_subagent_event("req-sub", AgentEventKind::Started, 2, 5);
+        let line = spinner_line_of(&mut app);
+        assert_eq!(
+            line.trim_end(),
+            format!("{} \u{00b7} subagents working: 2", base.trim_end()),
+            "counter must append to the unchanged spinner text, got {line:?}"
+        );
+
+        // Fewer live subagents → the rendered count follows the frame values.
+        app.apply_subagent_event("req-sub", AgentEventKind::Finished, 1, 5);
+        let line = spinner_line_of(&mut app);
+        assert!(
+            line.contains("subagents working: 1"),
+            "counter must track the frame values, got {line:?}"
+        );
+    }
+
+    /// A finished (active == 0) entry renders nothing, and an entry keyed by
+    /// a request the active chat does NOT track stays invisible — the
+    /// counter is gated on the currently tracked request id.
+    #[test]
+    fn spinner_line_hides_zero_and_foreign_subagent_counters() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        app.chats[0].lifecycle = ChatLifecycle::Running {
+            request_id: "req-sub".into(),
+        };
+
+        app.apply_subagent_event("req-sub", AgentEventKind::Finished, 0, 5);
+        assert!(
+            !spinner_line_of(&mut app).contains("subagents"),
+            "finished (active == 0) entry must not render"
+        );
+
+        app.apply_subagent_event("req-other", AgentEventKind::Started, 3, 3);
+        assert!(
+            !spinner_line_of(&mut app).contains("subagents"),
+            "counter must be gated on the tracked request id"
+        );
+    }
+
+    /// Background chats' subagents never leak into the active chat's
+    /// spinner line (render-level per-thread isolation, like the lifecycle
+    /// dots above).
+    #[test]
+    fn spinner_line_ignores_background_chat_subagents() {
+        let mut focused = Chat::new("focused");
+        focused.lifecycle = ChatLifecycle::Running {
+            request_id: "req-front".into(),
+        };
+        let mut busy = Chat::new("busy");
+        busy.lifecycle = ChatLifecycle::Running {
+            request_id: "req-bg".into(),
+        };
+        let mut app = App::new(vec![focused, busy]);
+        app.active = 0;
+
+        app.apply_subagent_event("req-bg", AgentEventKind::Started, 4, 4);
+        let line = spinner_line_of(&mut app);
+        assert!(
+            line.contains("thinking") && !line.contains("subagents"),
+            "background counter must not leak, got {line:?}"
         );
     }
 

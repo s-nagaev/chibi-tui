@@ -5,7 +5,7 @@
 //!
 //! Client → server: [`ClientMessage`] — `initialize` / `request` / `cancel` /
 //! `shutdown`. Server → client: [`ServerMessage`] — `ready` / `status` /
-//! `result` / `error`.
+//! `agent_event` / `result` / `error`.
 //!
 //! Protocol-version enforcement is part of the type contract:
 //! [`ProtocolVersion`] only deserializes from the literal `1`, so a handshake
@@ -99,6 +99,26 @@ pub struct Capabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientCapabilities {
     pub thoughts: bool,
+    /// Opts in to mid-turn `agent_event` frames (subagent progress).
+    pub subagents: bool,
+}
+
+/// Kind of a mid-turn `agent_event` frame: a subagent spawn began or ended
+/// within the request's turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventKind {
+    Started,
+    Finished,
+}
+
+impl AgentEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Finished => "finished",
+        }
+    }
 }
 
 /// Token accounting for the turn that produced a `result` frame.
@@ -135,8 +155,9 @@ pub enum ClientMessage {
         protocol_version: ProtocolVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client: Option<ClientInfo>,
-        /// Wave-2 feature flags ({"thoughts": true}). Old backends tolerate
-        /// unknown handshake fields; a missing field parses as `None`.
+        /// Wave-2 feature flags ({"thoughts": true, "subagents": true}). Old
+        /// backends tolerate unknown handshake fields; a missing field
+        /// parses as `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<ClientCapabilities>,
     },
@@ -202,6 +223,21 @@ pub enum ServerMessage {
     Status {
         request_id: String,
         state: StatusState,
+    },
+    /// Mid-turn subagent progress for a request (opt-in via
+    /// `capabilities.subagents` at handshake). NON-terminal: it must never
+    /// end the request lifecycle — it flows through the reader like any
+    /// server message and only updates frontend state. `name` is optional
+    /// and currently unused by consumers; unknown extra fields are ignored.
+    AgentEvent {
+        request_id: String,
+        event: AgentEventKind,
+        #[serde(default)]
+        active: u64,
+        #[serde(default)]
+        total: u64,
+        #[serde(default)]
+        name: Option<String>,
     },
     /// Final successful answer; terminal for its `request_id`.
     Result {
@@ -419,7 +455,8 @@ mod tests {
     }
 
     /// Wave-2 handshake: the client's initialize frame carries
-    /// `capabilities: {"thoughts": true}` on the wire, protocol_version 1.
+    /// `capabilities: {"thoughts": true, "subagents": true}` on the wire,
+    /// protocol_version 1.
     #[test]
     fn initialize_serializes_client_capabilities() {
         let msg = ClientMessage::Initialize {
@@ -428,17 +465,27 @@ mod tests {
                 name: "chibi-tui".into(),
                 version: "0.1.0".into(),
             }),
-            capabilities: Some(ClientCapabilities { thoughts: true }),
+            capabilities: Some(ClientCapabilities {
+                thoughts: true,
+                subagents: true,
+            }),
         };
         let line = serde_json::to_string(&msg).expect("initialize serializes");
         let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(value["protocol_version"], 1);
         assert_eq!(value["capabilities"]["thoughts"], true);
+        assert_eq!(value["capabilities"]["subagents"], true);
 
-        // Deserializing it back keeps the capability (round-trip sanity).
+        // Deserializing it back keeps the capabilities (round-trip sanity).
         match serde_json::from_str::<ClientMessage>(&line).expect("round-trips") {
             ClientMessage::Initialize { capabilities, .. } => {
-                assert_eq!(capabilities, Some(ClientCapabilities { thoughts: true }));
+                assert_eq!(
+                    capabilities,
+                    Some(ClientCapabilities {
+                        thoughts: true,
+                        subagents: true,
+                    })
+                );
             }
             other => panic!("expected Initialize, got {other:?}"),
         }
@@ -451,6 +498,146 @@ mod tests {
         match serde_json::from_str::<ClientMessage>(frame).expect("legacy initialize parses") {
             ClientMessage::Initialize { capabilities, .. } => assert_eq!(capabilities, None),
             other => panic!("expected Initialize, got {other:?}"),
+        }
+    }
+
+    /// agent_event frame: every field present parses with exact values.
+    #[test]
+    fn agent_event_full_parse() {
+        let frame = r#"{
+            "type": "agent_event",
+            "request_id": "r1",
+            "event": "started",
+            "active": 2,
+            "total": 5,
+            "name": "researcher"
+        }"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("full agent_event parses") {
+            ServerMessage::AgentEvent {
+                request_id,
+                event,
+                active,
+                total,
+                name,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(event, AgentEventKind::Started);
+                assert_eq!(active, 2);
+                assert_eq!(total, 5);
+                assert_eq!(name.as_deref(), Some("researcher"));
+            }
+            other => panic!("expected AgentEvent, got {other:?}"),
+        }
+    }
+
+    /// agent_event frame: minimal shape without `name` (optional field).
+    #[test]
+    fn agent_event_minimal_parse() {
+        let frame =
+            r#"{"type":"agent_event","request_id":"r1","event":"finished","active":0,"total":3}"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("minimal agent_event parses") {
+            ServerMessage::AgentEvent {
+                request_id,
+                event,
+                active,
+                total,
+                name,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(event, AgentEventKind::Finished);
+                assert_eq!(active, 0);
+                assert_eq!(total, 3);
+                assert_eq!(name, None);
+            }
+            other => panic!("expected AgentEvent, got {other:?}"),
+        }
+    }
+
+    /// agent_event frame: missing optional/optional-ish fields default
+    /// tolerantly (`active`/`total` to 0, `name` to None).
+    #[test]
+    fn agent_event_defaults_tolerant_parse() {
+        let frame = r#"{"type":"agent_event","request_id":"r1","event":"started"}"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("tolerant agent_event parses") {
+            ServerMessage::AgentEvent {
+                event,
+                active,
+                total,
+                name,
+                ..
+            } => {
+                assert_eq!(event, AgentEventKind::Started);
+                assert_eq!(active, 0);
+                assert_eq!(total, 0);
+                assert_eq!(name, None);
+            }
+            other => panic!("expected AgentEvent, got {other:?}"),
+        }
+    }
+
+    /// agent_event frame: unknown extra fields are ignored (forward
+    /// compatibility), known fields keep their values.
+    #[test]
+    fn agent_event_extra_unknown_fields_ignored() {
+        let frame = r#"{
+            "type": "agent_event",
+            "request_id": "r1",
+            "event": "finished",
+            "active": 1,
+            "total": 2,
+            "name": null,
+            "future_thing": {"nested": [1, 2, 3]}
+        }"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("extra fields ignored") {
+            ServerMessage::AgentEvent {
+                event,
+                active,
+                total,
+                name,
+                ..
+            } => {
+                assert_eq!(event, AgentEventKind::Finished);
+                assert_eq!(active, 1);
+                assert_eq!(total, 2);
+                assert_eq!(name, None);
+            }
+            other => panic!("expected AgentEvent, got {other:?}"),
+        }
+    }
+
+    /// agent_event frame: a bad `event` value fails the parse — strict enum
+    /// policy, matching every other wire enum in this module. The reader's
+    /// diag-warning path (task-1 hardening) catches the dropped line.
+    #[test]
+    fn agent_event_bad_event_value_fails_parse() {
+        let frame = r#"{"type":"agent_event","request_id":"r1","event":"exploded"}"#;
+        assert!(
+            serde_json::from_str::<ServerMessage>(frame).is_err(),
+            "unknown event kind must not parse"
+        );
+    }
+
+    /// agent_event frames survive a serde round-trip with values intact.
+    #[test]
+    fn agent_event_round_trips() {
+        let frame = r#"{"type":"agent_event","request_id":"r1","event":"started","active":2,"total":5,"name":"scout"}"#;
+        let msg: ServerMessage = serde_json::from_str(frame).expect("parses");
+        let line = serde_json::to_string(&msg).expect("serializes");
+        match serde_json::from_str::<ServerMessage>(&line).expect("round-trips") {
+            ServerMessage::AgentEvent {
+                request_id,
+                event,
+                active,
+                total,
+                name,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(event, AgentEventKind::Started);
+                assert_eq!(active, 2);
+                assert_eq!(total, 5);
+                assert_eq!(name.as_deref(), Some("scout"));
+            }
+            other => panic!("expected AgentEvent, got {other:?}"),
         }
     }
 }

@@ -5,9 +5,10 @@
 //! * build a protocol `Request` per submitted prompt — ids come from
 //!   [`crate::app::Submitted`] (client-chosen UUIDs), `workspace_root` from
 //!   the pipeline's own configuration;
-//! * translate the two progress sources into the single [`BackendEvent`]
+//! * translate the three progress sources into the single [`BackendEvent`]
 //!   stream the mock-era UI consumes:
 //!     - `status` frames (broadcast channel) → `Queued` / `Running`,
+//!     - mid-turn `agent_event` frames (broadcast channel) → `AgentProgress`,
 //!     - the per-request final outcome → `Result` / `Error`,
 //! * targeted `cancel` delegation.
 //!
@@ -136,6 +137,9 @@ async fn forward_one_request(
     // updates, so ordering here removes the race entirely. Missing statuses
     // are cosmetically harmless anyway (the UI enters Queued eagerly).
     let status_rx = pipeline.subscribe_status();
+    // Same race removed for mid-turn subagent progress: subscribed before
+    // the request hits the wire, so the first `agent_event` cannot slip by.
+    let agent_rx = pipeline.subscribe_agent_events();
 
     // Debug counter for BackendEvent ids (UI ignores them; kept monotonic).
     let event_id = submitted_event_id(&submitted);
@@ -166,9 +170,17 @@ async fn forward_one_request(
         event_id,
         tx.clone(),
     ));
+    let agent_pump = tokio::spawn(pump_agent_events(
+        agent_rx,
+        submitted.request_id.clone(),
+        submitted.thread_id.clone(),
+        event_id,
+        tx.clone(),
+    ));
 
     let event = terminal_event(result_rx.await, event_id, submitted.thread_id.clone());
     pump.abort();
+    agent_pump.abort();
 
     // Per-thread async: after THIS chat's terminal event the event loop may
     // need to start the next queued prompt of that chat. `send().await`
@@ -279,6 +291,40 @@ async fn pump_statuses(
                         request_id: event_id,
                         thread_id: thread_id.clone(),
                     },
+                };
+                if tx.send(event).await.is_err() {
+                    return; // UI receiver dropped
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue, // best effort
+            Err(broadcast::error::RecvError::Closed) => return,      // pipeline gone
+        }
+    }
+}
+
+/// Forward mid-turn `agent_event` frames for `request_id` as UI events until
+/// aborted (same shape as [`pump_statuses`]): filter by request id, stamp the
+/// owning chat's thread id, never terminal. The frame's `name` field is
+/// parsed upstream but not carried — nothing displays it in v1.
+async fn pump_agent_events(
+    mut agent_rx: broadcast::Receiver<crate::request_pipeline::AgentEventUpdate>,
+    request_id: String,
+    thread_id: String,
+    event_id: u64,
+    tx: mpsc::Sender<BackendEvent>,
+) {
+    loop {
+        match agent_rx.recv().await {
+            Ok(update) => {
+                if update.request_id != request_id {
+                    continue; // some other request's subagents
+                }
+                let event = BackendEvent::AgentProgress {
+                    request_id: event_id,
+                    thread_id: thread_id.clone(),
+                    event: update.event,
+                    active: update.active,
+                    total: update.total,
                 };
                 if tx.send(event).await.is_err() {
                     return; // UI receiver dropped
@@ -723,6 +769,7 @@ mod tests {
                 }
                 BackendEvent::Queued { .. }
                 | BackendEvent::Running { .. }
+                | BackendEvent::AgentProgress { .. }
                 | BackendEvent::QueueDrain { .. } => continue,
                 BackendEvent::Result { .. } => panic!("cancelled request must not yield Result"),
                 BackendEvent::Disconnected => continue,
