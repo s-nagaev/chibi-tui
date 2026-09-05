@@ -951,6 +951,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // feat_status_line: same Normal-mode ^O semantics under sidebar
             // focus (parity contract with the chord match below).
             KeyCode::Char('o') if ctrl => app.toggle_status_strip(),
+            // tui_thoughts_b1: same Normal-mode ^S semantics under sidebar
+            // focus (parity contract with the chord match below).
+            KeyCode::Char('s') if ctrl => app.toggle_thoughts(),
             // feat_model_picker_lite: same Normal-mode ^M semantics under
             // sidebar focus (parity contract with the chord match below).
             KeyCode::Char('m') if ctrl => app.begin_model_picker(),
@@ -1056,6 +1059,24 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // the kitty keyboard protocol. Mnemonic: infO.
         (KeyCode::Char('o'), true) => {
             app.toggle_status_strip();
+            return;
+        }
+        // Ctrl+S: TOGGLE THE THOUGHTS BLOCK (tui_thoughts_b1), the dim
+        // reasoning trace rendered above the latest answer. Session-only
+        // view state (default ON) like the ^O strip: the flip only changes
+        // rendering — nothing is cleared and reasoning is never persisted.
+        //
+        // Chord verification (feat task discipline, same audit class as the
+        // ^G/^O/^M/^P entries): no app binding anywhere in src/ (the only
+        // `Char('s')` hits are plain typing), no tui-textarea 0.7 shortcut
+        // (its Ctrl table covers a/b/d/e/f/h/j/k/n/p/r/u/v/w/x/y/<>/[],
+        // no 's'), not part of this app's readline family (^A/^E/^U/^K/^W/
+        // ^Y/^L), no macOS system hijack (Mission Control only takes
+        // ^arrows), and the legacy tty IXON flow-control meaning of ^S is
+        // inert under raw mode (crossterm enables raw at startup).
+        // Mnemonic: thoughtS.
+        (KeyCode::Char('s'), true) => {
+            app.toggle_thoughts();
             return;
         }
         // Ctrl+M: OPEN THE MODEL PICKER (feat_model_picker_lite), the
@@ -3497,6 +3518,58 @@ mod tests {
         assert!(app.status_strip_visible);
         press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
         assert!(!app.status_strip_visible);
+    }
+
+    // ---- tui_thoughts_b1: ^S toggle -----------------------------------------
+
+    /// ^S toggles the thoughts block, default ON, round-trip; the toggle is
+    /// render-only and never clears the retained reasoning.
+    #[test]
+    fn ctrl_s_toggles_thoughts_round_trip() {
+        let mut app = app_with_chats(1);
+        assert!(app.thoughts_visible, "thoughts must start visible (ON)");
+        app.last_turn_thoughts = Some("chain of thought".into());
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(!app.thoughts_visible);
+        assert_eq!(
+            app.last_turn_thoughts.as_deref(),
+            Some("chain of thought"),
+            "toggle must not clear the retained thoughts"
+        );
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.thoughts_visible);
+    }
+
+    /// Modal branches swallow ^S like every other chord (no toggle leaks
+    /// while a popup is open), and closing keeps the flag.
+    #[test]
+    fn ctrl_s_survives_modals_and_is_swallowed_while_one_is_open() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(!app.thoughts_visible);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(matches!(app.mode, chibi_tui::app::Mode::Searching { .. }));
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(
+            !app.thoughts_visible,
+            "swallowed ^S must not toggle while a modal is open"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.mode.is_normal());
+        assert!(!app.thoughts_visible, "modal close must keep the flag");
+    }
+
+    /// Sidebar-focus parity contract: service chords behave identically
+    /// under both panes — ^S toggles thoughts from the sidebar too.
+    #[test]
+    fn ctrl_s_toggles_thoughts_under_sidebar_focus() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(!app.thoughts_visible);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.thoughts_visible);
     }
 
     // ---- feat_model_picker_lite: ^M chord + modal isolation -----------------

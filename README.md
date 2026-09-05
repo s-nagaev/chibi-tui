@@ -137,6 +137,7 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+Shift+F` | Find in ALL threads (global search; same popup family with thread-title labels and total counts; `Enter` switches to the match's thread and jumps; requires the kitty keyboard protocol) |
 | `Ctrl+G` | Open the diagnostics log viewer (backend stderr + TUI lifecycle events; `PgUp`/`PgDn` or `↑`/`↓` scroll, `Esc` close — see the Diagnostics section) |
 | `Ctrl+O` | Toggle the status strip — a dim one-row `cwd: <workspace> · <model>` readout on the chat header's top border (hidden by default; see the Status strip section) |
+| `Ctrl+S` | Toggle the dim reasoning (thoughts) block above the latest answer (on by default; session-only view state — flipping it never clears anything and reasoning is never saved to history) |
 | `Ctrl+M` | Open the model picker popup (`↑`/`↓` navigate · `Enter` switch · `Esc` close — see the Model picker section; requires the kitty keyboard protocol) |
 | `Enter` | Send message (or queue it while this chat is busy) |
 | `⇧↵` / `⌥↵` | Insert a newline into the input (multi-line prompts) |

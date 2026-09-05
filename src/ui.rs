@@ -314,6 +314,41 @@ fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::
     Line::from(spans)
 }
 
+/// tui_thoughts_b1: how many trailing lines of the raw reasoning trace the
+/// block above the answer keeps. Reasoning closest to the answer is the
+/// relevant part, so the head is dropped, not the tail.
+const THOUGHTS_DISPLAY_LINES: usize = 10;
+
+/// tui_thoughts_b1: the dim reasoning block rendered ABOVE the latest
+/// assistant answer, sourced from the session-only `App::last_turn_thoughts`.
+///
+/// Static plain text (no streaming, no markdown interpretation, no
+/// interactivity, no scrolling UI): every line paints in the [`Theme::dim`]
+/// slot. Only the LAST [`THOUGHTS_DISPLAY_LINES`] lines are kept; on
+/// truncation the first kept line carries a `…` head marker. Absent or
+/// whitespace-only input never reaches this helper — the renderer treats it
+/// as "no block at all" (zero layout impact).
+fn thoughts_block_lines(thoughts: &str, theme: &Theme) -> Vec<markdown::MdLine> {
+    let all: Vec<&str> = thoughts.lines().collect();
+    let truncated = all.len() > THOUGHTS_DISPLAY_LINES;
+    let kept = if truncated {
+        &all[all.len() - THOUGHTS_DISPLAY_LINES..]
+    } else {
+        &all[..]
+    };
+    kept.iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let text = if i == 0 && truncated {
+                format!("\u{2026}{line}")
+            } else {
+                (*line).to_string()
+            };
+            Line::from(Span::styled(text, Style::new().fg(theme.dim)))
+        })
+        .collect()
+}
+
 fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_line: Rect) {
     let title = app.chat_title().replace('\n', " ");
     let left_title = format!(
@@ -357,8 +392,28 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     // the exact line this renderer paints.
     let mut lines: Vec<markdown::MdLine> = Vec::new();
     let mut msg_ranges: Vec<(usize, usize)> = Vec::new();
-    for msg in &chat.messages {
+    // tui_thoughts_b1: the reasoning block belongs to the LATEST answer —
+    // it renders directly above that message's role header, inside its
+    // msg_range, so the search-jump row math stays consistent. Toggle OFF
+    // or absent/whitespace-only thoughts keep the transcript byte-identical
+    // to the pre-wave-2 layout.
+    let last_assistant = chat
+        .messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant);
+    let thoughts = app
+        .thoughts_visible
+        .then_some(app.last_turn_thoughts.as_deref())
+        .flatten()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    for (msg_index, msg) in chat.messages.iter().enumerate() {
         let start = lines.len();
+        if Some(msg_index) == last_assistant {
+            if let Some(t) = thoughts {
+                lines.extend(thoughts_block_lines(t, theme));
+            }
+        }
         match msg.role {
             Role::User => {
                 lines.push(Line::from(Span::styled(
@@ -3238,6 +3293,127 @@ mod tests {
             "placeholder input must show in the empty state: {input_row:?}"
         );
         assert!(rows.last().unwrap().contains("^N"), "hints intact");
+    }
+
+    // ---- tui_thoughts_b1: dim reasoning block above the answer ------------
+
+    /// With thoughts retained and the toggle ON, the block renders in the
+    /// dim slot directly ABOVE the latest answer; ^S hides it while the
+    /// answer itself stays untouched.
+    #[test]
+    fn thoughts_block_renders_dim_above_answer_and_toggle_hides_it() {
+        let mut app = App::new(vec![Chat::new("t")]);
+        app.chats[0].messages.push(Message::user("question"));
+        app.chats[0].messages.push(Message::assistant("the answer"));
+        app.last_turn_thoughts = Some("reasoning trace line".into());
+
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+        let thought_row = rows
+            .iter()
+            .position(|r| r.contains("reasoning trace line"))
+            .expect("thoughts line must render");
+        let answer_row = rows
+            .iter()
+            .position(|r| r.contains("the answer"))
+            .expect("answer must render");
+        assert!(
+            thought_row < answer_row,
+            "thoughts block must sit ABOVE the answer"
+        );
+        // The thought text paints in the dim slot (log_think family).
+        let col = rows[thought_row].find("reasoning").unwrap();
+        assert_eq!(
+            buf[(col as u16, thought_row as u16)].fg,
+            Theme::tokyo_night().dim,
+            "thoughts text must be dim"
+        );
+
+        app.toggle_thoughts();
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            !flat.contains("reasoning trace line"),
+            "toggle OFF must hide the block"
+        );
+        assert!(
+            flat.contains("the answer"),
+            "answer must survive the toggle"
+        );
+    }
+
+    /// Absent or whitespace-only thoughts render NOTHING: the transcript is
+    /// byte-identical to the no-thoughts baseline (zero layout impact), and
+    /// toggle OFF reproduces that baseline even with thoughts retained.
+    #[test]
+    fn thoughts_block_absent_or_blank_renders_nothing() {
+        let mut app = App::new(vec![Chat::new("t")]);
+        app.chats[0].messages.push(Message::assistant("answer"));
+
+        assert_eq!(app.last_turn_thoughts, None);
+        let baseline = render_grid(&mut app).join("\n");
+        assert!(baseline.contains("answer"));
+
+        app.last_turn_thoughts = Some("  \n  ".into());
+        let blank = render_grid(&mut app).join("\n");
+        assert_eq!(
+            blank, baseline,
+            "whitespace-only thoughts must not change the transcript"
+        );
+
+        app.toggle_thoughts();
+        app.last_turn_thoughts = Some("reasoning trace line".into());
+        let hidden = render_grid(&mut app).join("\n");
+        assert_eq!(
+            hidden, baseline,
+            "toggle OFF must reproduce the no-thoughts layout exactly"
+        );
+    }
+
+    /// Long traces keep only the LAST 10 lines, with the `…` head marker on
+    /// the first kept line; exactly-10 lines render unmarked.
+    #[test]
+    fn thoughts_block_caps_last_ten_lines_with_ellipsis_head() {
+        let mut app = App::new(vec![Chat::new("t")]);
+        app.chats[0].messages.push(Message::assistant("answer"));
+        app.last_turn_thoughts = Some(
+            (1..=15)
+                .map(|i| format!("thought line {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        let flat = render_grid(&mut app).join("\n");
+        assert!(!flat.contains("thought line 01"), "pre-cap head is dropped");
+        assert!(!flat.contains("thought line 05"));
+        assert!(
+            flat.contains("thought line 06"),
+            "first kept (last-10) line"
+        );
+        assert!(
+            flat.contains("thought line 15"),
+            "line closest to the answer"
+        );
+        assert!(
+            flat.contains("\u{2026}thought line 06"),
+            "ellipsis head marker on the first kept line"
+        );
+        assert!(
+            !flat.contains("\u{2026}thought line 07"),
+            "marker only on the head line"
+        );
+
+        // Exactly 10 lines: everything visible, no marker.
+        app.last_turn_thoughts = Some(
+            (1..=10)
+                .map(|i| format!("thought line {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let flat = render_grid(&mut app).join("\n");
+        assert!(flat.contains("thought line 01"));
+        assert!(
+            !flat.contains("\u{2026}thought line 01"),
+            "no marker when untruncated"
+        );
     }
 
     // ---- feat_search_thread: render-level checks -------------------------

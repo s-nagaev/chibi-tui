@@ -267,6 +267,51 @@ mod tests {
         assert_eq!(loaded[0].messages.len(), 3);
     }
 
+    /// tui_thoughts_b1: LLM reasoning is session-only and must NEVER reach
+    /// storage. The document is inspected RAW (not just via the loader) so
+    /// the test would catch even a serde-visible thoughts field appearing
+    /// in the file format; the exact key set proves the structure can carry
+    /// nothing else.
+    #[test]
+    fn thoughts_never_persist_to_history_files() {
+        let root = temp_root("thoughts");
+        let mut chat = sample_chat("reasoned");
+        chat.messages.push(Message::assistant("plain answer"));
+
+        let path = save_chat_in(Some(&root), &chat).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read snapshot");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let mut keys: Vec<_> = doc
+            .as_object()
+            .expect("top-level object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["id", "messages", "name"],
+            "persisted format carries nothing beyond id/name/messages: {raw}"
+        );
+        assert!(
+            !raw.contains("thought"),
+            "persisted history must not contain thoughts: {raw}"
+        );
+
+        // Restart semantics: a reload restores messages only — no thoughts
+        // anywhere.
+        let loaded = load_chats_from(Some(&root));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].messages.len(), 3);
+        assert!(
+            loaded[0]
+                .messages
+                .iter()
+                .all(|m| !m.markdown.contains("thought")),
+            "no thought text survives a restart load"
+        );
+    }
+
     #[test]
     fn corrupt_files_are_skipped_not_fatal() {
         let root = temp_root("corrupt");

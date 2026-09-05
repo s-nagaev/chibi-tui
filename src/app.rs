@@ -585,6 +585,12 @@ pub struct App {
     /// (no rendering in the protocol-base task).
     pub last_turn_usage: Option<Usage>,
     pub last_turn_thoughts: Option<String>,
+    /// tui_thoughts_b1: session-only visibility of the dim reasoning block
+    /// rendered above the latest answer from [`Self::last_turn_thoughts`].
+    /// Default ON; ^S flips it. Pure VIEW state like [`Focus`] and the
+    /// status strip — never a [`Mode`], never persisted, and flipping it
+    /// never touches the retained thoughts (render-only switch).
+    pub thoughts_visible: bool,
 }
 
 /// feat_thread_clone: a clone request in flight. The `chat` waits here until
@@ -692,6 +698,7 @@ impl App {
             pending_clone: None,
             last_turn_usage: None,
             last_turn_thoughts: None,
+            thoughts_visible: true,
         }
     }
 
@@ -753,6 +760,15 @@ impl App {
     /// each frame. Default: hidden.
     pub fn toggle_status_strip(&mut self) {
         self.status_strip_visible = !self.status_strip_visible;
+    }
+
+    /// tui_thoughts_b1: toggle the dim reasoning block above the latest
+    /// answer with ^S. Render-only session view state (default ON): nothing
+    /// is cleared, the flip just changes whether the renderer draws the
+    /// [`Self::last_turn_thoughts`] block; the retained reasoning itself is
+    /// untouched and still lives only in memory.
+    pub fn toggle_thoughts(&mut self) {
+        self.thoughts_visible = !self.thoughts_visible;
     }
 
     /// feat_status_line: the strip's cwd segment, the LAST THREE components
@@ -3330,6 +3346,26 @@ mod tests {
         assert!(!msgs[1].pending);
         assert_eq!(msgs[1].markdown, "**done**");
         assert_eq!(msgs[1].model_label(), None);
+    }
+
+    // ---- tui_thoughts_b1: ^S toggle ----------------------------------------
+
+    /// The thoughts block starts visible (ON by contract) and toggling
+    /// round-trips without ever touching the retained reasoning.
+    #[test]
+    fn thoughts_toggle_defaults_on_and_round_trips() {
+        let mut app = app_with_chats(1);
+        assert!(app.thoughts_visible, "thoughts must start visible (ON)");
+        app.last_turn_thoughts = Some("step by step".into());
+        app.toggle_thoughts();
+        assert!(!app.thoughts_visible);
+        assert_eq!(
+            app.last_turn_thoughts.as_deref(),
+            Some("step by step"),
+            "toggle is render-only: thoughts must survive it"
+        );
+        app.toggle_thoughts();
+        assert!(app.thoughts_visible);
     }
 
     // ---- feat_status_line: strip state + segments --------------------------
