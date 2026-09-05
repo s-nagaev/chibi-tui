@@ -13,6 +13,7 @@ use crate::app::{App, Connection, Focus, ModelPickerPhase};
 use crate::markdown;
 use crate::model::{ChatLifecycle, Role};
 use crate::popup::ErrorPopup;
+use crate::protocol::Usage;
 use crate::theme::Theme;
 
 /// Prompt marker shown before the typed text / rename draft. `❯` (U+276F)
@@ -508,12 +509,12 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
 
 /// feat_status_line: the strip's text — `cwd: <path tail> · <model>` with
 /// `—` placeholders for an unwired workspace root / a chat without a known
-/// model yet. The tail is squeezed into the columns the strip can host:
-/// cut from the LEFT with a leading `…`, so a long workspace path never
-/// pushes the model readout out of the row and the working directory
-/// itself stays visible. Deliberately a plain formatting seam: the planned
-/// v11_02 segment (context size, once the protocol reports real usage)
-/// extends THIS string only — no layout or widget changes.
+/// model yet, plus the v11_02 `ctx` usage segment when the last turn
+/// reported usage. The tail is squeezed into the columns the strip can
+/// host: cut from the LEFT with a leading `…`, so a long workspace path
+/// never pushes the model readout out of the row and the working
+/// directory itself stays visible. Deliberately a plain formatting seam:
+/// the segment extends THIS string only — no layout or widget changes.
 fn status_strip_text(app: &App, available: usize) -> String {
     let cwd_tail = app.status_cwd();
     let cwd = cwd_tail.as_deref().unwrap_or("\u{2014}");
@@ -521,15 +522,53 @@ fn status_strip_text(app: &App, available: usize) -> String {
         " \u{00b7} {}",
         app.active_model_label().unwrap_or("\u{2014}")
     );
-    // Every column minus the `cwd: ` label and the model readout (at least
-    // one, so the fit below is always defined).
+    let usage_part = app
+        .last_turn_usage
+        .as_ref()
+        .map(context_usage_segment)
+        .unwrap_or_default();
+    // Every column minus the `cwd: ` label, the model readout and the
+    // usage segment (at least one, so the fit below is always defined).
     let cwd_budget = available
-        .saturating_sub("cwd: ".width() + model_part.width())
+        .saturating_sub("cwd: ".width() + model_part.width() + usage_part.width())
         .max(1);
     format!(
-        "cwd: {}{model_part}",
+        "cwd: {}{model_part}{usage_part}",
         left_truncate_ellipsis(cwd, cwd_budget)
     )
+}
+
+/// feat_status_line: compact human-readable token count — raw digits under
+/// 1000, `x.xk` (tenths TRUNCATED, never rounded up) under a million, else
+/// `x.xM`.
+fn human_tokens(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let (divisor, suffix) = if n < 1_000_000 {
+        (1_000, "k")
+    } else {
+        (1_000_000, "M")
+    };
+    let whole = n / divisor;
+    let tenths = (n % divisor) * 10 / divisor;
+    format!("{whole}.{tenths}{suffix}")
+}
+
+/// feat_status_line: the `ctx` segment — pct is input tokens against the
+/// reported context window (floored), both counts in human format. An
+/// unknown window falls back to the absolute count alone (never an
+/// invented max); a zero window is treated as unknown too.
+fn context_usage_segment(usage: &Usage) -> String {
+    match usage.context_window {
+        Some(window) if window > 0 => format!(
+            " \u{00b7} ctx {}% ({}/{})",
+            usage.input_tokens * 100 / window,
+            human_tokens(usage.input_tokens),
+            human_tokens(window)
+        ),
+        _ => format!(" \u{00b7} ctx {}", human_tokens(usage.input_tokens)),
+    }
 }
 
 /// feat_status_line: the strip as a right-aligned top-border [`Title`] for
@@ -4985,6 +5024,148 @@ mod tests {
             header.trim_end().width() <= 120,
             "header row overflowed: {} cols",
             header.trim_end().width()
+        );
+    }
+
+    // ---- v11_02: ctx usage segment in the strip -----------------------------
+
+    /// Human token formatting: raw digits under 1000, `x.xk` under a
+    /// million, else `x.xM`; tenths truncate (never round up).
+    #[test]
+    fn human_tokens_format_boundaries() {
+        assert_eq!(human_tokens(0), "0");
+        assert_eq!(human_tokens(999), "999");
+        assert_eq!(human_tokens(1000), "1.0k");
+        assert_eq!(human_tokens(18432), "18.4k");
+        assert_eq!(human_tokens(999_999), "999.9k");
+        assert_eq!(human_tokens(1_050_000), "1.0M");
+        assert_eq!(human_tokens(1_310_720), "1.3M");
+    }
+
+    /// Known window: pct is input tokens against the window (floored) and
+    /// both counts render in human format.
+    #[test]
+    fn status_strip_shows_context_usage_with_known_window() {
+        let mut app = App::new(mock::initial_chats());
+        app.last_turn_usage = Some(Usage {
+            input_tokens: 18432,
+            output_tokens: 512,
+            context_window: Some(131_072),
+        });
+        app.toggle_status_strip();
+
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains(" \u{00b7} ctx 14% (18.4k/131.0k)"),
+            "ctx segment missing or malformed: {:?}",
+            rows[0]
+        );
+    }
+
+    /// Unknown window (and the zero-window degenerate): absolute count
+    /// only — no pct, no invented max.
+    #[test]
+    fn status_strip_shows_absolute_usage_when_window_unknown() {
+        let mut app = App::new(mock::initial_chats());
+        app.last_turn_usage = Some(Usage {
+            input_tokens: 18432,
+            output_tokens: 512,
+            context_window: None,
+        });
+        app.toggle_status_strip();
+
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains(" \u{00b7} ctx 18.4k"),
+            "absolute usage missing: {:?}",
+            rows[0]
+        );
+        assert!(
+            !rows[0].contains('%'),
+            "no pct without a window: {:?}",
+            rows[0]
+        );
+
+        let zero_window = Usage {
+            input_tokens: 999,
+            output_tokens: 0,
+            context_window: Some(0),
+        };
+        assert_eq!(
+            context_usage_segment(&zero_window),
+            " \u{00b7} ctx 999",
+            "zero window must degrade to absolute"
+        );
+    }
+
+    /// No usage (fresh app, cleared mid-request, old backend): the segment
+    /// vanishes entirely — the strip carries only `cwd` and `model`.
+    #[test]
+    fn status_strip_omits_the_usage_segment_without_usage() {
+        let mut app = App::new(mock::initial_chats());
+        app.toggle_status_strip();
+
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains("cwd:"),
+            "strip itself must render: {:?}",
+            rows[0]
+        );
+        assert!(
+            !rows[0].contains("ctx"),
+            "usage leaked without data: {:?}",
+            rows[0]
+        );
+    }
+
+    /// Turning usage on/off changes the strip ONLY by the segment: same
+    /// `cwd` + `model` text, segment appended at its tail (the border-dash
+    /// fill shrinks to make room — the strip is right-aligned).
+    #[test]
+    fn strip_with_usage_differs_from_without_only_by_the_segment() {
+        let mut app = App::new(mock::initial_chats());
+        app.toggle_status_strip();
+        let (rows, _) = render_grid_with_buffer(&mut app);
+        let without = &rows[0][rows[0].find("cwd:").unwrap()..];
+
+        app.last_turn_usage = Some(Usage {
+            input_tokens: 18432,
+            output_tokens: 512,
+            context_window: Some(131_072),
+        });
+        let (rows, _) = render_grid_with_buffer(&mut app);
+        let with = &rows[0][rows[0].find("cwd:").unwrap()..];
+        assert_eq!(
+            with,
+            format!("{without} \u{00b7} ctx 14% (18.4k/131.0k)"),
+            "strip must differ only by the ctx segment"
+        );
+    }
+
+    /// Ctrl+O parity: the segment rides INSIDE the existing strip — hidden
+    /// by default even when usage is known, shown only after the toggle.
+    #[test]
+    fn usage_segment_inherits_ctrl_o_visibility() {
+        let mut app = App::new(mock::initial_chats());
+        app.last_turn_usage = Some(Usage {
+            input_tokens: 18432,
+            output_tokens: 512,
+            context_window: Some(131_072),
+        });
+
+        let rows = render_grid(&mut app);
+        assert!(
+            !rows[0].contains("ctx"),
+            "usage must stay hidden with the strip: {:?}",
+            rows[0]
+        );
+
+        app.toggle_status_strip();
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains("ctx"),
+            "usage must appear once the strip is toggled on: {:?}",
+            rows[0]
         );
     }
 
