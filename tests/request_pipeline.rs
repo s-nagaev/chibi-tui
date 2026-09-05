@@ -118,6 +118,7 @@ async fn valid_session_status_then_result_correlated() {
             content,
             model,
             provider,
+            ..
         } => {
             assert_eq!(request_id, "01HXY9K1ABCDEFGH");
             assert!(content.contains("42"), "content: {content}");
@@ -345,6 +346,7 @@ async fn result_without_model_fields_parses_with_none() {
             content,
             model,
             provider,
+            ..
         } => {
             assert_eq!(request_id, "01NOMODELFIELD001");
             assert!(content.contains("42"));

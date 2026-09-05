@@ -199,12 +199,16 @@ fn terminal_event(
             content,
             model,
             provider,
+            usage,
+            thoughts,
             ..
         })) => BackendEvent::Result {
             request_id: event_id,
             markdown: content,
             thread_id,
             model: resolve_model_label(model.as_deref(), provider.as_deref()),
+            usage,
+            thoughts,
         },
         Ok(Ok(unexpected)) => BackendEvent::Error {
             request_id: event_id,
@@ -342,6 +346,8 @@ mod tests {
                 content: "**42**".into(),
                 model: None,
                 provider: None,
+                usage: None,
+                thoughts: None,
             }));
         match terminal_event(outcome, 7, "thread-a".to_owned()) {
             BackendEvent::Result {
@@ -349,6 +355,7 @@ mod tests {
                 markdown,
                 thread_id,
                 model,
+                ..
             } => {
                 assert_eq!(request_id, 7);
                 assert_eq!(markdown, "**42**");
@@ -401,6 +408,8 @@ mod tests {
                 content: "answer".into(),
                 model: Some("glm-5.2".into()),
                 provider: Some("zhipu".into()),
+                usage: None,
+                thoughts: None,
             }));
         match terminal_event(outcome, 1, "t".to_owned()) {
             BackendEvent::Result { model, .. } => assert_eq!(model.as_deref(), Some("glm-5.2")),
@@ -458,6 +467,8 @@ mod tests {
                     content: "ok".into(),
                     model: None,
                     provider: None,
+                    usage: None,
+                    thoughts: None,
                 }));
             tx.send(terminal_event(outcome_ok, 1, "t1".into()))
                 .await

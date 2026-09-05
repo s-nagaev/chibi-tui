@@ -94,6 +94,23 @@ pub struct Capabilities {
     pub commands: Vec<String>,
 }
 
+/// Feature flags the client advertises during the handshake. The backend
+/// gates each capability on an explicit `true`; absent fields mean "off".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientCapabilities {
+    pub thoughts: bool,
+}
+
+/// Token accounting for the turn that produced a `result` frame.
+/// `context_window` is absent/null when the backend cannot know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+}
+
 /// Zero-based half-open line range of the editor selection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
@@ -118,6 +135,10 @@ pub enum ClientMessage {
         protocol_version: ProtocolVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client: Option<ClientInfo>,
+        /// Wave-2 feature flags ({"thoughts": true}). Old backends tolerate
+        /// unknown handshake fields; a missing field parses as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<ClientCapabilities>,
     },
     /// Start LLM work for a prompt with editor context.
     Request {
@@ -190,6 +211,13 @@ pub enum ServerMessage {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// Token accounting for the turn (wave-2); missing → `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        /// Raw LLM reasoning for the turn (wave-2, ≤64KB backend-capped);
+        /// missing → `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thoughts: Option<String>,
     },
     /// Failure for a request or a global failure (`request_id: null`).
     Error {
@@ -270,6 +298,159 @@ mod tests {
         match serde_json::from_str::<ServerMessage>(frame).expect("request_failed parses") {
             ServerMessage::Error { code, .. } => assert_eq!(code, ErrorCode::RequestFailed),
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Wave-2 result frame: every field present parses with exact values.
+    #[test]
+    fn result_usage_thoughts_full_parse() {
+        let frame = r#"{
+            "type": "result",
+            "request_id": "r1",
+            "content": "answer",
+            "usage": {"input_tokens": 120, "output_tokens": 45, "context_window": 200000},
+            "thoughts": "step by step..."
+        }"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("full wave-2 result parses") {
+            ServerMessage::Result {
+                usage, thoughts, ..
+            } => {
+                assert_eq!(
+                    usage,
+                    Some(Usage {
+                        input_tokens: 120,
+                        output_tokens: 45,
+                        context_window: Some(200000),
+                    })
+                );
+                assert_eq!(thoughts.as_deref(), Some("step by step..."));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// Wave-2 result frame: partial shapes. `context_window` may be null and
+    /// `thoughts` may be present without `usage` (and vice versa).
+    #[test]
+    fn result_usage_thoughts_partial_parse() {
+        let null_window = r#"{
+            "type": "result",
+            "request_id": "r1",
+            "content": "a",
+            "usage": {"input_tokens": 1, "output_tokens": 2, "context_window": null}
+        }"#;
+        match serde_json::from_str::<ServerMessage>(null_window).expect("null window parses") {
+            ServerMessage::Result {
+                usage, thoughts, ..
+            } => {
+                assert_eq!(
+                    usage,
+                    Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 2,
+                        context_window: None,
+                    })
+                );
+                assert_eq!(thoughts, None);
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+
+        let thoughts_only = r#"{
+            "type": "result",
+            "request_id": "r1",
+            "content": "a",
+            "thoughts": "hm"
+        }"#;
+        match serde_json::from_str::<ServerMessage>(thoughts_only).expect("thoughts-only parses") {
+            ServerMessage::Result {
+                usage, thoughts, ..
+            } => {
+                assert_eq!(usage, None);
+                assert_eq!(thoughts.as_deref(), Some("hm"));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// Wave-2 result frame: absent usage/thoughts keep parsing (old backend).
+    #[test]
+    fn result_usage_thoughts_absent_parse() {
+        let frame =
+            r#"{"type":"result","request_id":"r1","content":"a","model":"m","provider":"p"}"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("absent wave-2 fields parse") {
+            ServerMessage::Result {
+                usage, thoughts, ..
+            } => {
+                assert_eq!(usage, None);
+                assert_eq!(thoughts, None);
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// Wave-2 result frame: unknown extra fields are ignored.
+    #[test]
+    fn result_extra_unknown_fields_ignored() {
+        let frame = r#"{
+            "type": "result",
+            "request_id": "r1",
+            "content": "a",
+            "usage": {"input_tokens": 3, "output_tokens": 4, "context_window": 8},
+            "thoughts": "t",
+            "future_thing": {"nested": [1, 2, 3]}
+        }"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("extra fields ignored") {
+            ServerMessage::Result {
+                usage, thoughts, ..
+            } => {
+                assert_eq!(
+                    usage,
+                    Some(Usage {
+                        input_tokens: 3,
+                        output_tokens: 4,
+                        context_window: Some(8),
+                    })
+                );
+                assert_eq!(thoughts.as_deref(), Some("t"));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// Wave-2 handshake: the client's initialize frame carries
+    /// `capabilities: {"thoughts": true}` on the wire, protocol_version 1.
+    #[test]
+    fn initialize_serializes_client_capabilities() {
+        let msg = ClientMessage::Initialize {
+            protocol_version: ProtocolVersion::CURRENT,
+            client: Some(ClientInfo {
+                name: "chibi-tui".into(),
+                version: "0.1.0".into(),
+            }),
+            capabilities: Some(ClientCapabilities { thoughts: true }),
+        };
+        let line = serde_json::to_string(&msg).expect("initialize serializes");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(value["protocol_version"], 1);
+        assert_eq!(value["capabilities"]["thoughts"], true);
+
+        // Deserializing it back keeps the capability (round-trip sanity).
+        match serde_json::from_str::<ClientMessage>(&line).expect("round-trips") {
+            ClientMessage::Initialize { capabilities, .. } => {
+                assert_eq!(capabilities, Some(ClientCapabilities { thoughts: true }));
+            }
+            other => panic!("expected Initialize, got {other:?}"),
+        }
+    }
+
+    /// An old fixture initialize without capabilities still parses.
+    #[test]
+    fn initialize_without_capabilities_parses() {
+        let frame = r#"{"type":"initialize","protocol_version":1}"#;
+        match serde_json::from_str::<ClientMessage>(frame).expect("legacy initialize parses") {
+            ClientMessage::Initialize { capabilities, .. } => assert_eq!(capabilities, None),
+            other => panic!("expected Initialize, got {other:?}"),
         }
     }
 }

@@ -621,6 +621,8 @@ async fn dispatch_frame(
             content,
             model,
             provider,
+            usage,
+            thoughts,
         } => {
             if let Some(tx) = state.pending.remove(&request_id) {
                 let _ = tx.send(Ok(ServerMessage::Result {
@@ -628,6 +630,8 @@ async fn dispatch_frame(
                     content,
                     model,
                     provider,
+                    usage,
+                    thoughts,
                 }));
             }
         }
@@ -660,9 +664,30 @@ async fn dispatch_frame(
 // Reader sub-task
 // ---------------------------------------------------------------------------
 
+/// Parse one JSONL stdout line into a [`ServerMessage`]. Reader hardening:
+/// a line that carries an unknown `type` tag (forward protocol growth) is
+/// reported to the diagnostics stream instead of vanishing silently; a plain
+/// parse failure (garbage line) keeps the old silent-drop behavior so a
+/// noisy backend still cannot kill the pipeline. `None` = drop the line.
+fn parse_frame(line: &str) -> Option<ServerMessage> {
+    match serde_json::from_str::<ServerMessage>(line) {
+        Ok(msg) => Some(msg),
+        Err(_) => {
+            let unknown_tag = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned));
+            if let Some(tag) = unknown_tag {
+                diag::append_tui(format!("unknown frame type: {tag}"));
+            }
+            None
+        }
+    }
+}
+
 /// Owns the backend's stdout until it dies. Parses each JSONL line into a
 /// [`ServerMessage`] and forwards it to the actor; malformed lines are
-/// silently ignored (a noisy backend must not kill the pipeline).
+/// silently ignored (a noisy backend must not kill the pipeline), unknown
+/// frame types leave a diagnostics trace via [`parse_frame`].
 fn spawn_reader(
     stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
     event_tx: mpsc::Sender<ActorEvent>,
@@ -681,14 +706,11 @@ fn spawn_reader(
                 }
                 Ok(_) => {
                     let line = buf.trim_end_matches(['\n', '\r']);
-                    match serde_json::from_str::<ServerMessage>(line) {
-                        Ok(msg) => {
-                            if event_tx.send(ActorEvent::Frame(msg)).await.is_err() {
-                                // Actor gone (shutdown): nothing left to feed.
-                                return;
-                            }
+                    if let Some(msg) = parse_frame(line) {
+                        if event_tx.send(ActorEvent::Frame(msg)).await.is_err() {
+                            // Actor gone (shutdown): nothing left to feed.
+                            return;
                         }
-                        Err(_) => continue,
                     }
                 }
                 Err(e) => {
@@ -698,4 +720,52 @@ fn spawn_reader(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reader hardening: a frame with an unknown `type` tag must not vanish
+    /// silently — a `[tui]` diagnostics line names the tag, and the reader
+    /// (parse_frame) keeps the loop alive by yielding `None` instead of an
+    /// error. The global diag buffer is process state, so the assertion is
+    /// delta-based (monotonic total) plus a marker scan, tolerant of
+    /// parallel appends.
+    #[test]
+    fn unknown_frame_type_leaves_diag_trace_and_loop_continues() {
+        let (_, before_total) = crate::diag::view();
+        let line = r#"{"type":"holo_deck","request_id":"r1"}"#;
+
+        assert!(
+            parse_frame(line).is_none(),
+            "unknown type must not become a frame"
+        );
+        assert!(
+            parse_frame(r#"{"type":"result","request_id":"r2","content":"ok"}"#).is_some(),
+            "known types still parse after an unknown one"
+        );
+
+        let (lines, after_total) = crate::diag::view();
+        assert_eq!(
+            after_total,
+            before_total + 1,
+            "exactly one diag line for the unknown type"
+        );
+        let marker = "unknown frame type: holo_deck";
+        assert!(
+            lines.iter().any(|l| l.contains(marker)),
+            "diag line must name the unknown tag; got {lines:?}"
+        );
+    }
+
+    /// A garbage line (no `type` at all) keeps the pre-hardening behavior:
+    /// dropped silently, no diag noise.
+    #[test]
+    fn garbage_line_still_dropped_silently() {
+        let (_, before_total) = crate::diag::view();
+        assert!(parse_frame("not json at all").is_none());
+        let (_, after_total) = crate::diag::view();
+        assert_eq!(after_total, before_total, "no diag line for plain garbage");
+    }
 }

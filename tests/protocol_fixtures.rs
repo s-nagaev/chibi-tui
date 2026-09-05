@@ -107,6 +107,7 @@ fn session_fixture_decodes_into_expected_variants() {
         ClientMessage::Initialize {
             protocol_version,
             client,
+            ..
         } => {
             assert_eq!(protocol_version, ProtocolVersion);
             assert_eq!(client.unwrap().name, "chibi-vscode");

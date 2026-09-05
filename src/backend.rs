@@ -5,6 +5,8 @@
 
 use tokio::sync::mpsc;
 
+use crate::protocol::Usage;
+
 /// Events pushed from the backend towards the UI, mirroring the coarse
 /// lifecycle of protocol v1 (`status queued/running`, then `result`/`error`).
 ///
@@ -30,6 +32,10 @@ pub enum BackendEvent {
         markdown: String,
         thread_id: String,
         model: Option<String>,
+        /// Wave-2 latest-turn token accounting; retained in App state.
+        usage: Option<Usage>,
+        /// Wave-2 latest-turn LLM reasoning; retained in App state.
+        thoughts: Option<String>,
     },
     /// Request failed.
     Error {
@@ -117,6 +123,8 @@ impl Backend for MockBackend {
                     markdown,
                     thread_id: String::new(),
                     model,
+                    usage: None,
+                    thoughts: None,
                 })
                 .await;
         });

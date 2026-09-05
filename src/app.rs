@@ -7,6 +7,7 @@ use crate::markdown;
 use crate::model::{ChatLifecycle, Message};
 use crate::model_picker::{parse_model_listing, parse_selection_confirmation, ModelEntry};
 use crate::popup::ErrorPopup;
+use crate::protocol::Usage;
 use crate::theme::Theme;
 use tui_textarea::TextArea;
 
@@ -578,6 +579,12 @@ pub struct App {
     /// correlation, held between staging and the backend ack. An error
     /// resolution drops it, so a failed clone leaves no orphan thread.
     pending_clone: Option<PendingClone>,
+    /// Wave-2 latest-turn metadata from the most recent `result` frame:
+    /// token usage and raw LLM reasoning. Set on every terminal result,
+    /// cleared when a new request starts; consumed by later wave-2 tasks
+    /// (no rendering in the protocol-base task).
+    pub last_turn_usage: Option<Usage>,
+    pub last_turn_thoughts: Option<String>,
 }
 
 /// feat_thread_clone: a clone request in flight. The `chat` waits here until
@@ -683,6 +690,8 @@ impl App {
             backend_commands: Vec::new(),
             clone_submission: None,
             pending_clone: None,
+            last_turn_usage: None,
+            last_turn_thoughts: None,
         }
     }
 
@@ -1842,6 +1851,8 @@ impl App {
     /// loop needs it for background chats) and swaps the queued marker in
     /// place rather than appending a duplicate user bubble.
     pub fn begin_request(&mut self, submitted: &Submitted) {
+        self.last_turn_usage = None;
+        self.last_turn_thoughts = None;
         if let Some(chat) = self.chats.get_mut(self.active) {
             chat.messages.push(Message::user(submitted.prompt.clone()));
             chat.messages.push(Message::assistant_pending());
@@ -1872,6 +1883,8 @@ impl App {
     /// Note: unlike [`App::begin_request`] this works on ANY chat — the event
     /// loop uses it after terminal events, including for background chats.
     pub fn dequeue_next_for(&mut self, thread_id: &str) -> Option<Submitted> {
+        self.last_turn_usage = None;
+        self.last_turn_thoughts = None;
         let chat = self.chats.iter_mut().find(|c| c.id == thread_id)?;
         let prompt = chat.queue.pop_front()?;
         let submitted = Submitted {
@@ -2311,9 +2324,16 @@ impl App {
                 markdown,
                 request_id,
                 model,
+                usage,
+                thoughts,
                 ..
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
+                    // Wave-2: retain the latest-turn protocol metadata before
+                    // any resolution path runs (hidden exchanges included);
+                    // nothing here renders it.
+                    self.last_turn_usage = usage;
+                    self.last_turn_thoughts = thoughts;
                     // feat_model_picker_lite: a terminal result whose tracked
                     // id is a hidden exchange is suppressed from the
                     // transcript and resolved into the picker/toast state
@@ -2802,11 +2822,110 @@ mod tests {
         finish_chat_with_model(app, index, None);
     }
 
+    // ---- wave-2 protocol base: latest-turn usage/thoughts retention -------
+
+    fn sample_usage() -> Usage {
+        Usage {
+            input_tokens: 120,
+            output_tokens: 45,
+            context_window: Some(200_000),
+        }
+    }
+
+    #[test]
+    fn result_retains_latest_turn_usage_and_thoughts() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "hello");
+        assert_eq!(app.last_turn_usage, None, "no turn yet");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: Some(sample_usage()),
+            thoughts: Some("thinking...".into()),
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "answer".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        assert_eq!(app.last_turn_usage, Some(sample_usage()));
+        assert_eq!(app.last_turn_thoughts.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
+    fn fieldless_result_drops_stale_turn_metadata() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "hello");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: Some(sample_usage()),
+            thoughts: Some("thinking...".into()),
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "answer".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        let submitted = submit_text(&mut app, "again");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "answer 2".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        assert_eq!(app.last_turn_usage, None);
+        assert_eq!(app.last_turn_thoughts, None);
+    }
+
+    #[test]
+    fn new_request_start_clears_latest_turn_metadata() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "hello");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: Some(sample_usage()),
+            thoughts: Some("thinking...".into()),
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "answer".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+        assert!(app.last_turn_usage.is_some());
+        submit_text(&mut app, "next prompt");
+        assert_eq!(app.last_turn_usage, None, "cleared on new request start");
+        assert_eq!(app.last_turn_thoughts, None, "cleared on new request start");
+    }
+
+    #[test]
+    fn dequeued_prompt_clears_latest_turn_metadata() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "hello");
+        let thread_id = submitted.thread_id.clone();
+        // Queue a follow-up while the chat is busy (this does NOT start it).
+        type_in(&mut app, "queued prompt");
+        assert!(app.take_input().is_none(), "busy chat enqueues, no start");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: Some(sample_usage()),
+            thoughts: Some("thinking...".into()),
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "answer".into(),
+            thread_id,
+            model: None,
+        });
+        assert!(
+            app.last_turn_usage.is_some(),
+            "terminal result retains the turn"
+        );
+        let thread_id = app.chats[0].id.clone();
+        app.dequeue_next_for(&thread_id)
+            .expect("queued prompt drained");
+        assert_eq!(app.last_turn_usage, None, "cleared on dequeued start");
+        assert_eq!(app.last_turn_thoughts, None, "cleared on dequeued start");
+    }
+
     /// [`finish_chat`] with a model label (feat_agent_model_label).
     fn finish_chat_with_model(app: &mut App, index: usize, model: Option<&str>) {
         let request_id = app.chats[index].lifecycle.request_id().unwrap().to_owned();
         let thread_id = app.chats[index].id.clone();
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&request_id),
             markdown: "**done**".into(),
             thread_id,
@@ -3370,6 +3489,8 @@ mod tests {
         let request_id = app.chats[index].lifecycle.request_id().unwrap().to_owned();
         let thread_id = app.chats[index].id.clone();
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&request_id),
             markdown: markdown.to_owned(),
             thread_id,
@@ -3629,6 +3750,8 @@ mod tests {
         let req = app.chats[0].lifecycle.request_id().unwrap().to_owned();
         app.select_next();
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&req),
             markdown: CAPTURED_LISTING.into(),
             thread_id: app.chats[0].id.clone(),
@@ -3660,6 +3783,8 @@ mod tests {
         app.begin_clone_thread();
         let submitted = app.take_clone_submission().expect("staged");
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "ack".to_owned(),
             thread_id: submitted.thread_id,
@@ -3748,6 +3873,8 @@ mod tests {
         // B's answer lands first and only touches B.
         let second_req = second.request_id.clone();
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&second_req),
             markdown: "B done".into(),
             thread_id: second.thread_id.clone(),
@@ -3866,6 +3993,8 @@ mod tests {
         let mut app = app_with_chats(1);
         let submitted = submit_text(&mut app, "one shot");
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "answer".into(),
             thread_id: submitted.thread_id.clone(),
@@ -3887,6 +4016,8 @@ mod tests {
         let mut app = app_with_chats(1);
         submit_text(&mut app, "mine");
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: 12345,
             markdown: "not mine".into(),
             thread_id: "00000000-0000-0000-0000-00000000dead".into(),
@@ -4574,6 +4705,8 @@ mod tests {
         assert_eq!(app.chats.len(), 3, "clone stays unlisted before the ack");
 
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "Thread cloned: chat-1 (copy) (ID: 42). 2 messages copied.".to_owned(),
             thread_id: submitted.thread_id,
@@ -4621,6 +4754,8 @@ mod tests {
 
         // Wrong request id, right thread: not ours.
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of("unrelated-request"),
             markdown: "ack".to_owned(),
             thread_id: submitted.thread_id.clone(),
@@ -4628,6 +4763,8 @@ mod tests {
         });
         // Right request id, wrong thread: not ours either.
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "ack".to_owned(),
             thread_id: "unrelated-thread".to_owned(),
@@ -4686,6 +4823,8 @@ mod tests {
         app.chats.remove(0);
 
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "ack".to_owned(),
             thread_id: submitted.thread_id,
@@ -4707,6 +4846,8 @@ mod tests {
         app.begin_clone_thread();
         let submitted = app.take_clone_submission().expect("staged");
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "ack".to_owned(),
             thread_id: submitted.thread_id,
@@ -5099,6 +5240,8 @@ mod tests {
 
         // Stale event for the REMOVED thread id: silently dropped.
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: 987,
             markdown: "ghost".into(),
             thread_id: removed_id.clone(),
@@ -5113,6 +5256,8 @@ mod tests {
         // A late event for the still-present busy chat still routes normally.
         let bg_req = bg.request_id.clone();
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&bg_req),
             markdown: "**done**".into(),
             thread_id: bg.thread_id.clone(),
@@ -5973,6 +6118,8 @@ mod tests {
             .to_owned();
         let thread_id = app.chats[app.active].id.clone();
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&request_id),
             markdown: markdown.to_owned(),
             thread_id,
@@ -6159,6 +6306,8 @@ mod tests {
         let submitted = app.take_input().expect("prompt taken");
         app.begin_request(&submitted);
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "**done**".into(),
             thread_id: submitted.thread_id,
@@ -6189,6 +6338,8 @@ mod tests {
         let submitted = app.take_input().expect("prompt taken");
         app.begin_request(&submitted);
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "**fieldless**".into(),
             thread_id: submitted.thread_id,
@@ -6258,6 +6409,8 @@ mod tests {
             ChatLifecycle::Awaiting { .. }
         ));
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "**done**".into(),
             thread_id: submitted.thread_id,
@@ -6281,6 +6434,8 @@ mod tests {
         );
 
         app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
             request_id: event_id_of(&submitted.request_id),
             markdown: "**done**".into(),
             thread_id: submitted.thread_id,

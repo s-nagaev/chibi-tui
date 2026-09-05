@@ -28,7 +28,8 @@ use tokio::time;
 
 use crate::diag;
 use crate::protocol::{
-    ClientInfo, ClientMessage, ErrorCode, ProtocolVersion, ServerInfo, ServerMessage,
+    ClientCapabilities, ClientInfo, ClientMessage, ErrorCode, ProtocolVersion, ServerInfo,
+    ServerMessage,
 };
 
 /// Client identification sent with the `initialize` frame.
@@ -258,6 +259,7 @@ impl BackendClient {
                 name: CLIENT_NAME.to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             }),
+            capabilities: Some(ClientCapabilities { thoughts: true }),
         };
         let line = serde_json::to_string(&initialize)
             .map_err(|e| BackendError::Handshake(format!("cannot serialize initialize: {e}")))?;
