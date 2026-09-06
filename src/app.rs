@@ -767,15 +767,18 @@ impl App {
 
     /// feat_sidebar_unread_marker: the ONE place a chat becomes the selected
     /// one. Bounds-safe (the index is clamped to the current list), resets
-    /// the chat view to follow-bottom, and clears the unread marker of the
-    /// chat being entered, so a background reply stops signaling as soon as
-    /// it was seen. Every selection mutation (arrows, ^N, search jump,
-    /// delete/clone ack) goes through here.
+    /// the chat view to follow-bottom, clears the unread marker of the
+    /// chat being entered, and re-seeds the sticky ctx segment from the
+    /// entered chat's last-known usage — the status readout always follows
+    /// the thread being entered (neutral when it has none), never the one
+    /// left behind. Every selection mutation (arrows, ^N, search jump,
+    /// delete/clone ack, restore activation) goes through here.
     fn select_chat(&mut self, index: usize) {
         self.active = index.min(self.chats.len().saturating_sub(1));
         if let Some(chat) = self.chats.get_mut(self.active) {
             chat.unread = false;
         }
+        self.last_turn_usage = self.chats.get(self.active).and_then(|chat| chat.last_usage);
         self.scroll = 0;
     }
 
@@ -789,18 +792,18 @@ impl App {
 
     /// Restore seam (remember-last-thread): open the app on a specific
     /// thread id exactly as if the user had picked it — the same selection
-    /// semantics as [`App::select_chat`] plus the sticky ctx-segment seeding
-    /// from that thread's snapshot (the readout is seeded from the initially
-    /// selected chat, so a restored thread that is not the first must reseed
-    /// it here; the per-thread panel model is already staged for every
-    /// restored chat by [`App::new`]). An unknown id is a silent no-op: a
-    /// dangling pointer must never disturb the default startup selection.
+    /// semantics as [`App::select_chat`], whose sticky ctx-segment seeding
+    /// re-seeds the readout from that thread's snapshot (the readout is
+    /// seeded from the initially selected chat, so a restored thread that
+    /// is not the first must reseed it; the per-thread panel model is
+    /// already staged for every restored chat by [`App::new`]). An unknown
+    /// id is a silent no-op: a dangling pointer must never disturb the
+    /// default startup selection.
     pub fn activate_thread(&mut self, thread_id: &str) {
         let Some(index) = self.chats.iter().position(|c| c.id == thread_id) else {
             return;
         };
         self.select_chat(index);
-        self.last_turn_usage = self.chats[index].last_usage;
     }
 
     /// feat_focus_panes: toggle which pane owns the keyboard — Ctrl+T flips
@@ -3320,6 +3323,105 @@ mod tests {
         assert_eq!(app.active_thread_id(), Some(restored_id.as_str()));
         assert_eq!(app.chat_title(), "beta");
         assert_eq!(app.last_turn_usage.map(|u| u.input_tokens), Some(900_000));
+    }
+
+    #[test]
+    fn switching_threads_updates_ctx_value() {
+        let mut alpha = Chat::new("alpha");
+        alpha.last_usage = Some(Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            context_window: Some(100_000),
+        });
+        let mut beta = Chat::new("beta");
+        beta.last_usage = Some(Usage {
+            input_tokens: 900_000,
+            output_tokens: 1,
+            context_window: Some(1_000_000),
+        });
+
+        let mut app = App::new(vec![alpha, beta]);
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(10),
+            "ctx segment seeded from the startup chat"
+        );
+
+        app.select_next();
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(900_000),
+            "switching threads re-seeds the ctx segment from the entered thread"
+        );
+
+        app.select_prev();
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(10),
+            "switching back re-seeds from the entered thread again"
+        );
+    }
+
+    #[test]
+    fn switching_to_thread_without_usage_shows_neutral_ctx() {
+        let mut alpha = Chat::new("alpha");
+        alpha.last_usage = Some(Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            context_window: Some(100_000),
+        });
+        let beta = Chat::new("beta");
+
+        let mut app = App::new(vec![alpha, beta]);
+        assert_eq!(app.last_turn_usage.map(|u| u.input_tokens), Some(10));
+
+        app.select_next();
+        assert_eq!(
+            app.last_turn_usage, None,
+            "a thread without usage resets the ctx segment to neutral, not stale"
+        );
+
+        app.select_prev();
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(10),
+            "switching back restores the carrying thread's value"
+        );
+    }
+
+    #[test]
+    fn usage_frame_after_switch_still_updates_ctx() {
+        let mut alpha = Chat::new("alpha");
+        alpha.last_usage = Some(Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            context_window: Some(100_000),
+        });
+        let beta = Chat::new("beta");
+
+        let mut app = App::new(vec![alpha, beta]);
+        app.select_next();
+        assert_eq!(app.last_turn_usage, None, "neutral after the switch");
+
+        finish_llm_turn(&mut app, "glm-5.2", sample_usage());
+        assert_eq!(
+            app.last_turn_usage,
+            Some(sample_usage()),
+            "an incoming usage frame overwrites the ctx segment after a switch"
+        );
+
+        app.select_prev();
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(10),
+            "switching away reads the per-thread mirror, not the sticky field"
+        );
+        app.select_next();
+        assert_eq!(
+            app.last_turn_usage,
+            Some(sample_usage()),
+            "the live turn's usage is mirrored onto its thread for later switches"
+        );
     }
 
     #[test]
