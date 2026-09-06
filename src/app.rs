@@ -422,6 +422,15 @@ pub struct Chat {
     /// model and hidden `/model <n>` switches both refresh it. `None` for
     /// fresh chats and for snapshots recorded before the field existed.
     pub last_model: Option<String>,
+    /// tui_subagents_b5: live subagent progress for THIS thread, keyed by
+    /// the numeric protocol request id → (active, total). Populated from
+    /// mid-turn `agent_event` frames via [`Chat::apply_subagent_event`]
+    /// regardless of the request lifecycle — background subagents outlive
+    /// their turn's result frame, so the last-known count stays renderable
+    /// while the chat is idle. Per-request keys keep a late frame from ever
+    /// polluting another request's counters; the entry disappears when its
+    /// frame reports `active == 0`. Session state only — never persisted.
+    pub subagent_counts: HashMap<u64, (u64, u64)>,
 }
 
 impl Chat {
@@ -436,12 +445,52 @@ impl Chat {
             unread: false,
             last_usage: None,
             last_model: None,
+            subagent_counts: HashMap::new(),
         }
     }
 
     /// True while this chat has a request in flight.
     pub fn is_busy(&self) -> bool {
         self.lifecycle.is_busy()
+    }
+
+    /// Total live subagents currently known for this thread across its
+    /// requests, or `None` when the spinner line must not show a counter
+    /// (no entries, or every entry reports zero active subagents).
+    pub fn running_subagents(&self) -> Option<u64> {
+        let running: u64 = self
+            .subagent_counts
+            .values()
+            .map(|(active, _)| active)
+            .sum();
+        (running > 0).then_some(running)
+    }
+
+    /// Fold one mid-turn `agent_event` frame into this thread's subagent
+    /// counters. `started` inserts/updates the frame request's entry from
+    /// the frame values; `finished` updates it and removes the entry once
+    /// the frame reports `active == 0` (all subagents of that request are
+    /// done). The frame is non-terminal: the request lifecycle is never
+    /// touched here.
+    pub fn apply_subagent_event(
+        &mut self,
+        request_id: u64,
+        event: AgentEventKind,
+        active: u64,
+        total: u64,
+    ) {
+        match event {
+            AgentEventKind::Started => {
+                self.subagent_counts.insert(request_id, (active, total));
+            }
+            AgentEventKind::Finished => {
+                if active == 0 {
+                    self.subagent_counts.remove(&request_id);
+                } else {
+                    self.subagent_counts.insert(request_id, (active, total));
+                }
+            }
+        }
     }
 }
 
@@ -620,13 +669,6 @@ pub struct App {
     /// status strip — never a [`Mode`], never persisted, and flipping it
     /// never touches the retained thoughts (render-only switch).
     pub thoughts_visible: bool,
-    /// tui_subagents_b5: live subagent progress, keyed by protocol request
-    /// id → (active, total). Populated from mid-turn `agent_event` frames
-    /// via [`Self::apply_subagent_event`]; the spinner renders the counter
-    /// only for the ACTIVE chat's currently tracked request (see
-    /// [`Self::active_chat_subagents`]), so stale entries can never show.
-    /// Session state only — never persisted.
-    subagent_counts: HashMap<String, (u64, u64)>,
 }
 
 /// feat_thread_clone: a clone request in flight. The `chat` waits here until
@@ -748,7 +790,6 @@ impl App {
             last_turn_usage,
             last_turn_thoughts: None,
             thoughts_visible: true,
-            subagent_counts: HashMap::new(),
         }
     }
 
@@ -1920,43 +1961,16 @@ impl App {
             .and_then(|chat| chat.lifecycle.request_id())
     }
 
-    /// Number of live subagents for the ACTIVE chat's in-flight request, or
-    /// `None` when the spinner must not show a counter: no request in
-    /// flight, no aggregation entry, or the entry reports zero active
-    /// subagents. Gating on the CURRENT tracked request id keeps stale
-    /// entries (an old request's leftovers) unrenderable.
+    /// Number of live subagents for the ACTIVE chat, or `None` when the
+    /// spinner line must not show a counter. Independent of the request
+    /// lifecycle: background subagents outlive their turn's result frame,
+    /// so the last-known count keeps rendering while the chat is idle, and
+    /// per-chat storage makes a thread switch show the newly active
+    /// thread's own count (0 → hidden) instead of another thread's.
     pub fn active_chat_subagents(&self) -> Option<u64> {
-        let request_id = self.active_request_id()?;
-        let (active, _) = *self.subagent_counts.get(request_id)?;
-        (active > 0).then_some(active)
-    }
-
-    /// Fold one mid-turn `agent_event` frame into the subagent counter map.
-    /// `started` inserts/updates the request's entry from the frame values;
-    /// `finished` updates it and removes the entry once the frame reports
-    /// `active == 0` (all subagents of that request are done). The frame is
-    /// non-terminal: lifecycle state is never touched here.
-    pub fn apply_subagent_event(
-        &mut self,
-        request_id: &str,
-        event: AgentEventKind,
-        active: u64,
-        total: u64,
-    ) {
-        match event {
-            AgentEventKind::Started => {
-                self.subagent_counts
-                    .insert(request_id.to_owned(), (active, total));
-            }
-            AgentEventKind::Finished => {
-                if active == 0 {
-                    self.subagent_counts.remove(request_id);
-                } else {
-                    self.subagent_counts
-                        .insert(request_id.to_owned(), (active, total));
-                }
-            }
-        }
+        self.chats
+            .get(self.active)
+            .and_then(Chat::running_subagents)
     }
 
     // ---- submission ------------------------------------------------------
@@ -2411,7 +2425,11 @@ impl App {
     /// Request-scoped events carry a `thread_id` (per-thread async) and are
     /// routed to THAT chat, matched against its tracked lifecycle request id:
     /// stray events for unknown threads or finished requests are ignored so
-    /// they cannot corrupt state or resurrect spinners. After a terminal
+    /// they cannot corrupt state or resurrect spinners. Mid-turn subagent
+    /// progress is the exception: it is non-terminal and folds into the
+    /// owning chat's counters even while the chat is idle (background
+    /// subagents outlive their turn's result frame), never resurrecting a
+    /// spinner — the lifecycle is untouched. After a terminal
     /// event the chat's FIFO queue is NOT drained here — the event loop owns
     /// spawning the next request via [`App::dequeue_next_for`], because only
     /// the loop can talk to the backend source.
@@ -2457,6 +2475,25 @@ impl App {
         let Some(chat_index) = self.chats.iter().position(|c| c.id == target) else {
             return; // unknown thread: not ours
         };
+
+        // tui_subagents_b5: mid-turn subagent progress folds into the
+        // owning chat's counters regardless of the request state — the
+        // frames are non-terminal, background subagents keep their count
+        // alive after the turn's result frame (idle chat), and a late
+        // kill-flush for an older request still clears its own entry.
+        // Keyed by the frame's own request id, so no other entry is touched.
+        if let BackendEvent::AgentProgress {
+            request_id,
+            event,
+            active,
+            total,
+            ..
+        } = &event
+        {
+            self.chats[chat_index].apply_subagent_event(*request_id, *event, *active, *total);
+            return;
+        }
+
         // The chat must currently track a request; events for idle chats are
         // stale/stray and ignored.
         let Some(tracked_request_id) = self.chats[chat_index]
@@ -2477,20 +2514,6 @@ impl App {
                 self.chats[chat_index].lifecycle = ChatLifecycle::Running {
                     request_id: tracked_request_id.clone(),
                 };
-            }
-            // Mid-turn subagent progress: fold into the counter map when the
-            // frame belongs to the request the chat currently tracks. No
-            // lifecycle change — the frame is non-terminal by contract.
-            BackendEvent::AgentProgress {
-                request_id,
-                event,
-                active,
-                total,
-                ..
-            } => {
-                if event_matches_request(request_id, &tracked_request_id) {
-                    self.apply_subagent_event(&tracked_request_id, event, active, total);
-                }
             }
             BackendEvent::Result {
                 markdown,
@@ -2613,7 +2636,9 @@ impl App {
                 }
             }
             // Handled by the early returns above; arms kept for exhaustiveness.
-            BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => {}
+            BackendEvent::AgentProgress { .. }
+            | BackendEvent::QueueDrain { .. }
+            | BackendEvent::Disconnected => {}
         }
     }
 
@@ -3509,9 +3534,23 @@ mod tests {
     /// (same correlation path the live glue task uses).
     fn agent_event(app: &mut App, index: usize, event: AgentEventKind, active: u64, total: u64) {
         let request_id = app.chats[index].lifecycle.request_id().unwrap().to_owned();
+        agent_frame(app, index, event_id_of(&request_id), event, active, total);
+    }
+
+    /// Deliver a mid-turn `agent_event` carrying an arbitrary numeric
+    /// request id — the shape of late frames (kill-flush, kept-request
+    /// overlap) whose id differs from the chat's currently tracked request.
+    fn agent_frame(
+        app: &mut App,
+        index: usize,
+        request_id: u64,
+        event: AgentEventKind,
+        active: u64,
+        total: u64,
+    ) {
         let thread_id = app.chats[index].id.clone();
         app.apply_backend_event(BackendEvent::AgentProgress {
-            request_id: event_id_of(&request_id),
+            request_id,
             thread_id,
             event,
             active,
@@ -3542,7 +3581,7 @@ mod tests {
         // The final finish reports active == 0: the entry is removed.
         agent_event(&mut app, 0, AgentEventKind::Finished, 0, 5);
         assert!(
-            app.subagent_counts.is_empty(),
+            app.chats[0].subagent_counts.is_empty(),
             "entry removed at active == 0"
         );
         assert_eq!(app.active_chat_subagents(), None);
@@ -3567,37 +3606,114 @@ mod tests {
     }
 
     #[test]
-    fn subagent_counter_ignores_stale_request_frames() {
+    fn subagent_counter_outlives_the_result_frame_and_folds_late_frames() {
         let mut app = app_with_chats(1);
         let first = submit_text(&mut app, "first");
         agent_event(&mut app, 0, AgentEventKind::Started, 2, 4);
         assert_eq!(app.active_chat_subagents(), Some(2));
 
-        // Terminal event → idle: nothing renders even though the abandoned
-        // request's entry lingers in the map (removal is the finished
-        // frame's job, per the wire contract).
+        // Terminal event → idle: the answer is rendered, but two background
+        // subagents of the turn still run. The counter must stay visible
+        // independently of the request lifecycle (the reported bug).
         finish_chat(&mut app, 0);
+        assert!(matches!(app.chats[0].lifecycle, ChatLifecycle::Idle));
         assert_eq!(
             app.active_chat_subagents(),
-            None,
-            "idle chat renders no counter"
+            Some(2),
+            "counter must outlive the result frame while subagents run"
         );
 
-        // A new request starts; a LATE frame for the OLD request id must be
-        // dropped by the request-correlation gate — never aggregated into
-        // the new request's counter.
-        let _second = submit_text(&mut app, "second");
-        app.apply_backend_event(BackendEvent::AgentProgress {
-            request_id: event_id_of(&first.request_id),
-            thread_id: first.thread_id.clone(),
-            event: AgentEventKind::Finished,
-            active: 0,
-            total: 4,
-        });
+        // A LATE frame for the finished request folds under its own request
+        // id — the count follows live and never touches another entry.
+        agent_frame(
+            &mut app,
+            0,
+            event_id_of(&first.request_id),
+            AgentEventKind::Finished,
+            1,
+            4,
+        );
+        assert_eq!(app.active_chat_subagents(), Some(1));
+
+        // The final finish reports active == 0: the entry is removed and
+        // the idle chat's counter disappears.
+        agent_frame(
+            &mut app,
+            0,
+            event_id_of(&first.request_id),
+            AgentEventKind::Finished,
+            0,
+            4,
+        );
         assert_eq!(
             app.active_chat_subagents(),
             None,
-            "stale frame must not resurrect a counter for the new request"
+            "the count dropping to 0 hides the counter"
+        );
+        assert!(app.chats[0].subagent_counts.is_empty());
+    }
+
+    #[test]
+    fn subagent_counter_sums_live_subagents_across_thread_requests() {
+        let mut app = app_with_chats(1);
+        let first = submit_text(&mut app, "first");
+        agent_event(&mut app, 0, AgentEventKind::Started, 2, 4);
+        finish_chat(&mut app, 0);
+
+        // A new request starts while the previous turn's subagents still
+        // run: frames fold per request id, the display sums the thread.
+        let second = submit_text(&mut app, "second");
+        agent_event(&mut app, 0, AgentEventKind::Started, 1, 1);
+        assert_eq!(
+            app.active_chat_subagents(),
+            Some(3),
+            "the old request's live subagents plus the new request's"
+        );
+
+        // The old request's late finish removes only its own entry.
+        agent_frame(
+            &mut app,
+            0,
+            event_id_of(&first.request_id),
+            AgentEventKind::Finished,
+            0,
+            4,
+        );
+        assert_eq!(app.active_chat_subagents(), Some(1));
+
+        agent_frame(
+            &mut app,
+            0,
+            event_id_of(&second.request_id),
+            AgentEventKind::Finished,
+            0,
+            1,
+        );
+        assert_eq!(app.active_chat_subagents(), None);
+    }
+
+    #[test]
+    fn subagent_counter_follows_the_thread_switched_to() {
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "work");
+        agent_event(&mut app, 0, AgentEventKind::Started, 2, 4);
+        finish_chat(&mut app, 0);
+        assert_eq!(app.active_chat_subagents(), Some(2));
+
+        // Switching to a thread without subagents hides the indicator —
+        // the idle thread must not show another thread's count.
+        app.active = 1;
+        assert_eq!(
+            app.active_chat_subagents(),
+            None,
+            "a thread with no subagents renders no counter"
+        );
+
+        app.active = 0;
+        assert_eq!(
+            app.active_chat_subagents(),
+            Some(2),
+            "switching back restores the owning thread's count"
         );
     }
 

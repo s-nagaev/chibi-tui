@@ -128,6 +128,9 @@ impl From<StoredChat> for Chat {
             unread: false,
             last_usage: stored.last_usage,
             last_model: stored.last_model,
+            // tui_subagents_b5: live subagent counters are session-only —
+            // a restart starts every thread with an empty counter map.
+            subagent_counts: std::collections::HashMap::new(),
         }
     }
 }

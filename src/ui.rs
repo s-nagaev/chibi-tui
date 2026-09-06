@@ -144,18 +144,34 @@ fn theme_red() -> ratatui::style::Color {
 
 /// Spinner + lifecycle label rendered just above the input box. Per-thread
 /// async: reflects ONLY the ACTIVE chat — background chats' work is shown by
-/// their sidebar dot, never by this line. When the tracked request reports
-/// live subagents, a ` · subagents working: n` segment is appended; without
-/// one the line stays byte-for-byte as before.
+/// their sidebar dot, never by this line. When the active chat reports live
+/// subagents, a ` · subagents working: n` segment is appended. That segment
+/// is independent of the request lifecycle: background subagents outlive
+/// their turn's result frame, so an idle chat with live subagents renders
+/// the counter alone (no spinner, no label); without any the line stays
+/// byte-for-byte as before.
 fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let subagents = app.active_chat_subagents();
     let (label, color) = match app.active_lifecycle() {
-        ChatLifecycle::Idle => return, // keep the line empty when idle
+        ChatLifecycle::Idle => {
+            // Keep the request indicator empty while idle; only a live
+            // subagent count still has something to show here.
+            let Some(active) = subagents else {
+                return;
+            };
+            let text = format!(" \u{00b7} subagents working: {active}");
+            f.render_widget(
+                Paragraph::new(Span::styled(text, Style::new().fg(theme.green))),
+                area,
+            );
+            return;
+        }
         ChatLifecycle::Awaiting { .. } => ("queued\u{2026}", theme.yellow),
         ChatLifecycle::Running { .. } => ("thinking\u{2026}", theme.purple),
     };
     let spinner = app.spinner_char();
     let mut text = format!(" {spinner} {label}");
-    if let Some(active) = app.active_chat_subagents() {
+    if let Some(active) = subagents {
         text.push_str(&format!(" \u{00b7} subagents working: {active}"));
     }
     f.render_widget(
@@ -2944,9 +2960,9 @@ mod tests {
 
     // ---- tui_subagents_b5: subagent counter in the spinner line -----------
 
-    /// While the tracked request reports live subagents, the spinner line
-    /// gains a ` · subagents working: n` segment; without an entry the line
-    /// stays byte-for-byte unchanged.
+    /// While the active chat reports live subagents, the spinner line gains
+    /// a ` · subagents working: n` segment; without one the line stays
+    /// byte-for-byte unchanged.
     #[test]
     fn spinner_line_appends_subagents_working_counter() {
         let mut app = App::new(vec![Chat::new("chat")]);
@@ -2961,7 +2977,7 @@ mod tests {
             "no counter before any agent_event, got {base:?}"
         );
 
-        app.apply_subagent_event("req-sub", AgentEventKind::Started, 2, 5);
+        app.chats[0].apply_subagent_event(11, AgentEventKind::Started, 2, 5);
         let line = spinner_line_of(&mut app);
         assert_eq!(
             line.trim_end(),
@@ -2970,7 +2986,7 @@ mod tests {
         );
 
         // Fewer live subagents → the rendered count follows the frame values.
-        app.apply_subagent_event("req-sub", AgentEventKind::Finished, 1, 5);
+        app.chats[0].apply_subagent_event(11, AgentEventKind::Finished, 1, 5);
         let line = spinner_line_of(&mut app);
         assert!(
             line.contains("subagents working: 1"),
@@ -2978,26 +2994,53 @@ mod tests {
         );
     }
 
-    /// A finished (active == 0) entry renders nothing, and an entry keyed by
-    /// a request the active chat does NOT track stays invisible — the
-    /// counter is gated on the currently tracked request id.
+    /// The counter is independent of the request lifecycle: an IDLE chat
+    /// whose turn's subagents still run renders the counter alone — no
+    /// spinner, no lifecycle label — and hides it once the count hits 0.
     #[test]
-    fn spinner_line_hides_zero_and_foreign_subagent_counters() {
+    fn spinner_line_shows_subagents_without_a_request() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        assert!(
+            spinner_line_of(&mut app).trim().is_empty(),
+            "precondition: idle chat renders an empty line"
+        );
+
+        app.chats[0].apply_subagent_event(11, AgentEventKind::Started, 2, 5);
+        let line = spinner_line_of(&mut app);
+        assert!(
+            line.contains("subagents working: 2"),
+            "idle chat must keep the subagent counter visible, got {line:?}"
+        );
+        assert!(
+            !line.contains("thinking") && !line.contains("queued"),
+            "no request indicator while idle, got {line:?}"
+        );
+        assert!(
+            !line.contains(app.spinner_char()),
+            "the spinner belongs to the request lifecycle only, got {line:?}"
+        );
+
+        app.chats[0].apply_subagent_event(11, AgentEventKind::Finished, 0, 5);
+        assert!(
+            spinner_line_of(&mut app).trim().is_empty(),
+            "count 0 must hide the counter again"
+        );
+    }
+
+    /// A finished (active == 0) entry renders nothing, even while the chat
+    /// is busy again.
+    #[test]
+    fn spinner_line_hides_zero_subagent_counters() {
         let mut app = App::new(vec![Chat::new("chat")]);
         app.chats[0].lifecycle = ChatLifecycle::Running {
             request_id: "req-sub".into(),
         };
 
-        app.apply_subagent_event("req-sub", AgentEventKind::Finished, 0, 5);
+        app.chats[0].apply_subagent_event(11, AgentEventKind::Started, 3, 3);
+        app.chats[0].apply_subagent_event(11, AgentEventKind::Finished, 0, 3);
         assert!(
             !spinner_line_of(&mut app).contains("subagents"),
             "finished (active == 0) entry must not render"
-        );
-
-        app.apply_subagent_event("req-other", AgentEventKind::Started, 3, 3);
-        assert!(
-            !spinner_line_of(&mut app).contains("subagents"),
-            "counter must be gated on the tracked request id"
         );
     }
 
@@ -3010,14 +3053,11 @@ mod tests {
         focused.lifecycle = ChatLifecycle::Running {
             request_id: "req-front".into(),
         };
-        let mut busy = Chat::new("busy");
-        busy.lifecycle = ChatLifecycle::Running {
-            request_id: "req-bg".into(),
-        };
+        let busy = Chat::new("busy");
         let mut app = App::new(vec![focused, busy]);
         app.active = 0;
 
-        app.apply_subagent_event("req-bg", AgentEventKind::Started, 4, 4);
+        app.chats[1].apply_subagent_event(9, AgentEventKind::Started, 4, 4);
         let line = spinner_line_of(&mut app);
         assert!(
             line.contains("thinking") && !line.contains("subagents"),
