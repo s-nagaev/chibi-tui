@@ -408,6 +408,17 @@ pub struct Chat {
     /// moment the chat is selected (see [`App::select_chat`]). Session-only:
     /// never persisted, a restart starts every thread clean.
     pub unread: bool,
+    /// Thread's last known turn usage, carried across restarts: the event
+    /// loop keeps it fresh on every usage-carrying terminal frame and the
+    /// history layer writes it with the thread snapshot, so the next launch
+    /// can seed the ctx segment without waiting for a live turn. `None` for
+    /// fresh chats and for snapshots recorded before the field existed.
+    pub last_usage: Option<Usage>,
+    /// Thread's last known model label, persisted with the thread snapshot
+    /// (same lifecycle as [`Chat::last_usage`]): visible replies stamping a
+    /// model and hidden `/model <n>` switches both refresh it. `None` for
+    /// fresh chats and for snapshots recorded before the field existed.
+    pub last_model: Option<String>,
 }
 
 impl Chat {
@@ -420,6 +431,8 @@ impl Chat {
             lifecycle: ChatLifecycle::Idle,
             queue: VecDeque::new(),
             unread: false,
+            last_usage: None,
+            last_model: None,
         }
     }
 
@@ -564,8 +577,9 @@ pub struct App {
     /// until the chat's next visible reply stamps its OWN label (which
     /// retires the override) — the status strip reads
     /// [`App::active_model_label`] and picks the switch up with zero
-    /// coupling. Session-scoped exactly like the per-message labels; never
-    /// persisted.
+    /// coupling. Startup restore seeds one entry per thread whose snapshot
+    /// recorded a persisted last-known model (see [`Chat::last_model`]), so
+    /// the map itself stays session-only and is never written to disk.
     picker_model_labels: HashMap<String, String>,
     /// feat_thread_clone: slash commands the backend advertised at handshake.
     /// Empty for mocks/offline; gates the ^P clone shortcut via detection.
@@ -584,8 +598,10 @@ pub struct App {
     /// Usage is the sticky last-known token count: a terminal frame updates
     /// it only when the frame actually carries usage, and a new request never
     /// clears it, so command results and hidden exchanges between answers
-    /// keep the previous readout alive and the ctx segment disappears only
-    /// when no usage has arrived this session. Thoughts keep the per-turn
+    /// keep the previous readout alive. The ctx segment is empty only while
+    /// no usage has arrived this session AND the initially selected chat's
+    /// snapshot carried no persisted usage (startup restore seeds this field
+    /// from [`Chat::last_usage`]). Thoughts keep the per-turn
     /// contract: every terminal result replaces them and a new request start
     /// clears them.
     pub last_turn_usage: Option<Usage>,
@@ -677,6 +693,18 @@ impl App {
     pub fn new(chats: Vec<Chat>) -> Self {
         let mut input = TextArea::default();
         input.set_placeholder_text("Type a message…  (\u{23ce} send)");
+        // Restore seam: threads carry their last known usage/model across
+        // restarts, so the sticky display state is seeded from the snapshot
+        // instead of starting blind. The ctx segment is a single app-level
+        // readout, so it takes the initially selected chat's usage; the
+        // panel model is per thread, so every restored chat with a recorded
+        // label stages the same session-scoped override the model picker
+        // uses (retired by the chat's next visible labelled reply).
+        let picker_model_labels: HashMap<String, String> = chats
+            .iter()
+            .filter_map(|c| c.last_model.as_ref().map(|m| (c.id.clone(), m.clone())))
+            .collect();
+        let last_turn_usage = chats.first().and_then(|c| c.last_usage);
         Self {
             chats,
             active: 0,
@@ -704,11 +732,11 @@ impl App {
             picker_submission: None,
             hidden_requests: HashMap::new(),
             hidden_queue: VecDeque::new(),
-            picker_model_labels: HashMap::new(),
+            picker_model_labels,
             backend_commands: Vec::new(),
             clone_submission: None,
             pending_clone: None,
-            last_turn_usage: None,
+            last_turn_usage,
             last_turn_thoughts: None,
             thoughts_visible: true,
             subagent_counts: HashMap::new(),
@@ -830,7 +858,9 @@ impl App {
     /// new message (visible next frame), an error/fieldless resolution
     /// stamps `None` (the previous label remains "last known"), and
     /// switching chats re-labels from that chat's own message history.
-    /// Session-scoped exactly like the header labels — never persisted.
+    /// Session-scoped like the header labels: the map is never written to
+    /// disk, but startup restore seeds it from each thread's persisted
+    /// last-known model (see [`App::picker_model_labels`]).
     /// `None` renders as the `—` placeholder.
     ///
     /// feat_model_picker_lite: a hidden `/model <n>` switch has no transcript
@@ -2420,8 +2450,11 @@ impl App {
                     // Usage is sticky last-known: a frame without usage
                     // (command results, hidden exchanges) must not wipe the
                     // previous value. Thoughts are replaced every frame.
-                    if usage.is_some() {
-                        self.last_turn_usage = usage;
+                    // The owning chat mirrors the usage so the thread
+                    // snapshot persisted right after this event carries it.
+                    if let Some(u) = usage {
+                        self.chats[chat_index].last_usage = Some(u);
+                        self.last_turn_usage = Some(u);
                     }
                     self.last_turn_thoughts = thoughts;
                     // feat_model_picker_lite: a terminal result whose tracked
@@ -2470,7 +2503,8 @@ impl App {
                                 // seen yet.
                                 self.mark_unread_if_background(chat_index);
                             }
-                            if stamped.is_some() {
+                            if let Some(label) = stamped {
+                                self.chats[chat_index].last_model = Some(label);
                                 self.picker_model_labels.remove(&thread_id);
                             }
                             self.scroll = 0;
@@ -2594,6 +2628,7 @@ impl App {
             .or(if label.is_empty() { None } else { Some(label) });
         if let Some(label) = stamped {
             let thread_id = self.chats[chat_index].id.clone();
+            self.chats[chat_index].last_model = Some(label.clone());
             self.picker_model_labels.insert(thread_id, label);
         }
     }
@@ -3122,14 +3157,16 @@ mod tests {
     }
 
     #[test]
-    fn restart_resets_sticky_display_state() {
+    fn restart_restores_sticky_display_state_from_persisted_snapshot() {
         let mut app = app_with_chats(1);
         finish_llm_turn(&mut app, "glm-5.2", sample_usage());
         assert!(app.last_turn_usage.is_some());
         assert_eq!(app.active_model_label(), Some("glm-5.2"));
 
         // Restart seam: the event loop persists the chat and a new App loads
-        // it. Labels are session-scoped and stripped by the history layer.
+        // it. Per-message labels stay session-scoped (stripped by the
+        // history layer), while the thread-level last-known usage/model pair
+        // rides along with the snapshot and seeds the display state.
         let dir = std::env::temp_dir().join(format!(
             "chibi-tui-sticky-restart-{}-{}",
             std::process::id(),
@@ -3148,13 +3185,99 @@ mod tests {
                 .all(|m| m.model_label().is_none()),
             "restored answers carry no annotation"
         );
+        assert_eq!(
+            restored[0].last_usage,
+            Some(sample_usage()),
+            "last-known usage persists with the thread"
+        );
+        assert_eq!(
+            restored[0].last_model.as_deref(),
+            Some("glm-5.2"),
+            "last-known model persists with the thread"
+        );
 
         let fresh = App::new(restored);
-        assert_eq!(fresh.last_turn_usage, None, "usage is not persisted");
+        assert_eq!(
+            fresh.last_turn_usage,
+            Some(sample_usage()),
+            "ctx segment is seeded from the persisted usage"
+        );
         assert_eq!(
             fresh.active_model_label(),
-            None,
-            "model label is not persisted"
+            Some("glm-5.2"),
+            "panel model is seeded from the persisted label"
+        );
+        assert!(
+            fresh.chats[0]
+                .messages
+                .iter()
+                .all(|m| m.model_label().is_none()),
+            "restore never backfills per-message annotations"
+        );
+    }
+
+    #[test]
+    fn terminal_turn_persists_last_known_usage_and_model() {
+        let mut app = app_with_chats(1);
+        finish_llm_turn(&mut app, "glm-5.2", sample_usage());
+
+        // The event-loop persist seam (terminal events and the final
+        // snapshot before shutdown both go through save_chat_in) must carry
+        // the thread's last-known pair into the JSON document itself.
+        let dir = std::env::temp_dir().join(format!(
+            "chibi-tui-persist-last-{}-{}",
+            std::process::id(),
+            crate::history::new_thread_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = crate::history::save_chat_in(Some(&dir), &app.chats[0]).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read snapshot");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(
+            doc["last_model"], "glm-5.2",
+            "model recorded on the terminal turn: {raw}"
+        );
+        assert_eq!(
+            doc["last_usage"]["input_tokens"], 120,
+            "usage recorded on the terminal turn: {raw}"
+        );
+        assert_eq!(doc["last_usage"]["output_tokens"], 45);
+        assert_eq!(doc["last_usage"]["context_window"], 200_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_change_is_reflected_in_the_snapshot_on_next_persist() {
+        let mut app = app_with_chats(1);
+        finish_llm_turn(&mut app, "glm-5.2", sample_usage());
+        let dir = std::env::temp_dir().join(format!(
+            "chibi-tui-model-switch-{}-{}",
+            std::process::id(),
+            crate::history::new_thread_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        crate::history::save_chat_in(Some(&dir), &app.chats[0]).expect("first save");
+
+        let switched = Usage {
+            input_tokens: 900,
+            output_tokens: 10,
+            context_window: Some(131_072),
+        };
+        finish_llm_turn(&mut app, "kimi-k2.7", switched);
+        crate::history::save_chat_in(Some(&dir), &app.chats[0]).expect("resave");
+
+        let loaded = crate::history::load_chats_from(Some(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(loaded.len(), 1, "same thread id, same snapshot file");
+        assert_eq!(
+            loaded[0].last_model.as_deref(),
+            Some("kimi-k2.7"),
+            "the next persist carries the switched model"
+        );
+        assert_eq!(
+            loaded[0].last_usage,
+            Some(switched),
+            "the next persist carries the switched turn's usage"
         );
     }
 

@@ -7,6 +7,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Last-known usage and model now persist per thread and survive a restart:
+  the ctx segment in the status strip and the panel model readout are seeded
+  from the thread snapshot on startup instead of starting blank until the
+  first live turn. The fields are stored as optional `last_usage` /
+  `last_model` keys in the thread's history file and are only written once a
+  turn or a model switch actually reports them; existing history files parse
+  unchanged, threads without recorded data display exactly as before, and
+  per-answer model annotations remain session-scoped (no backfill, restored
+  answers keep plain headers).
 - Status strip (`Ctrl+O`): a hideable dim one-row `cwd: <workspace> · <model>`
   readout on the chat header's top border — right-aligned, zero vertical cost,
   truncated with an ellipsis on narrow terminals, hidden by default. The model

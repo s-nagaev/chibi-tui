@@ -9,6 +9,13 @@
 //!     { "name": "...", "id": "<thread_uuid>", "messages": [ … ] }
 //! ```
 //!
+//! Threads also carry their last known turn usage and model label as the
+//! optional `last_usage` / `last_model` keys once a snapshot records them;
+//! snapshots from before those keys existed (and threads with nothing
+//! recorded yet) omit them entirely and parse unchanged, so the format is
+//! strictly additive. There is no backfill: nothing is ever invented for
+//! threads whose history predates the fields.
+//!
 //! `dirs::data_dir()` is chosen over `config_dir()` because this is
 //! regenerated state, not configuration. Save failures are non-fatal and only
 //! reported on stderr: losing a history snapshot must never take down the TUI.
@@ -20,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::Chat;
 use crate::model::Message;
+use crate::protocol::Usage;
 
 /// Fresh stable thread id for a new chat (UUID v4).
 pub fn new_thread_id() -> String {
@@ -58,6 +66,19 @@ struct StoredChat {
     name: String,
     id: String,
     messages: Vec<Message>,
+    /// Thread's last known turn usage, restored into the ctx segment on the
+    /// next launch. Strictly additive optional field: `#[serde(default)]`
+    /// keeps snapshots from before the field parsing (a missing key loads as
+    /// `None`, never a thread lost from the sidebar) and
+    /// `skip_serializing_if` keeps snapshots with nothing recorded
+    /// byte-compatible with the legacy format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_usage: Option<Usage>,
+    /// Thread's last known model label, restored into the panel readout on
+    /// the next launch. Same additive compatibility contract as
+    /// [`StoredChat::last_usage`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model: Option<String>,
 }
 
 impl From<&Chat> for StoredChat {
@@ -72,6 +93,8 @@ impl From<&Chat> for StoredChat {
                 .iter()
                 .map(|m| m.normalized_for_storage())
                 .collect(),
+            last_usage: chat.last_usage,
+            last_model: chat.last_model.clone(),
         }
     }
 }
@@ -89,6 +112,8 @@ impl From<StoredChat> for Chat {
             // feat_sidebar_unread_marker: the marker is session-only and
             // stays out of the persisted format entirely.
             unread: false,
+            last_usage: stored.last_usage,
+            last_model: stored.last_model,
         }
     }
 }
@@ -309,6 +334,64 @@ mod tests {
                 .iter()
                 .all(|m| !m.markdown.contains("thought")),
             "no thought text survives a restart load"
+        );
+    }
+
+    /// A thread with nothing recorded yet keeps the legacy key set exactly:
+    /// the optional last-known usage/model keys are absent until real data
+    /// arrives, and no backfill ever invents them.
+    #[test]
+    fn fresh_chat_persists_without_last_known_fields() {
+        let root = temp_root("fresh-last");
+        let path = save_chat_in(Some(&root), &sample_chat("fresh")).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read snapshot");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let keys: Vec<_> = doc
+            .as_object()
+            .expect("top-level object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["id", "messages", "name"],
+            "a thread with nothing recorded keeps the legacy key set: {raw}"
+        );
+    }
+
+    /// Backward compatibility contract: a snapshot written before the
+    /// last-known usage/model fields existed parses unchanged, loads with
+    /// neither field, and renders the same display state as ever (no ctx
+    /// segment, no panel model, plain answer headers).
+    #[test]
+    fn old_format_file_without_last_known_fields_parses_and_displays_as_today() {
+        let root = temp_root("old-format");
+        let id = new_thread_id();
+        let legacy = format!(
+            r#"{{"name":"legacy","id":"{id}","messages":[
+                {{"role":"User","markdown":"question","pending":false}},
+                {{"role":"Assistant","markdown":"answer","pending":false}}]}}"#
+        );
+        std::fs::create_dir_all(root.join("threads")).expect("threads dir");
+        std::fs::write(root.join("threads").join(format!("{id}.json")), legacy)
+            .expect("write legacy snapshot");
+
+        let loaded = load_chats_from(Some(&root));
+        assert_eq!(loaded.len(), 1, "old files must keep parsing");
+        assert_eq!(loaded[0].name, "legacy");
+        assert_eq!(loaded[0].messages.len(), 2);
+        assert_eq!(loaded[0].last_usage, None, "no invented usage");
+        assert_eq!(loaded[0].last_model, None, "no invented model");
+
+        let app = crate::app::App::new(loaded);
+        assert_eq!(
+            app.last_turn_usage, None,
+            "ctx segment unchanged for old files"
+        );
+        assert_eq!(
+            app.active_model_label(),
+            None,
+            "panel model unchanged for old files"
         );
     }
 

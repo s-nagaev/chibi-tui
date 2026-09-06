@@ -337,7 +337,9 @@ async fn subagent_counter_appears_on_spinner_line_and_clears_after_result() {
 /// Thoughts are session-only: a full live turn with reasoning, saved and
 /// reloaded as a fresh session (restart), shows the answer but never the
 /// reasoning — and replaying the same result frame into the fresh app
-/// (replaced backend) cannot resurrect it.
+/// (replaced backend) cannot resurrect it. The thread's last-known usage
+/// rides the same restart the other way: it IS restored into the ctx
+/// segment seed, and an ignored replay cannot wipe it.
 #[tokio::test]
 async fn thoughts_never_persist_across_restart_or_replay() {
     let live = connect(&["--with-usage", "--with-thoughts"]).await;
@@ -367,9 +369,10 @@ async fn thoughts_never_persist_across_restart_or_replay() {
     let chats = load_chats_from(Some(&dir));
     assert_eq!(chats.len(), 1, "round trip preserves the thread");
     let mut fresh = App::new(chats);
+    let (_, usage, _) = terminal_result(&events);
     assert_eq!(
-        fresh.last_turn_usage, None,
-        "usage is latest-turn only, never restored"
+        fresh.last_turn_usage, usage,
+        "ctx segment is seeded from the persisted thread usage"
     );
     assert_eq!(fresh.last_turn_thoughts, None, "thoughts are session-only");
 
@@ -396,8 +399,8 @@ async fn thoughts_never_persist_across_restart_or_replay() {
         "replay must not resurrect thoughts"
     );
     assert_eq!(
-        fresh.last_turn_usage, None,
-        "replay must not resurrect usage either"
+        fresh.last_turn_usage, usage,
+        "a replay ignored by the idle chat cannot wipe the restored usage"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
