@@ -816,13 +816,17 @@ while true; do sleep 1; done
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let snap = diag::snapshot();
-        assert!(snap.contains(&marker), "stderr line captured verbatim");
         assert!(
-            snap.iter().any(|l| l == "partial-tail"),
+            snap.iter().any(|l| l.text == *marker),
+            "stderr line captured verbatim"
+        );
+        assert!(
+            snap.iter().any(|l| l.text == "partial-tail"),
             "trailing partial line flushed as a final line at EOF"
         );
         assert!(
-            snap.iter().any(|l| l.starts_with("[tui] spawn `/bin/sh`")),
+            snap.iter()
+                .any(|l| l.text.starts_with("[tui] spawn `/bin/sh`")),
             "spawn lifecycle event stamped with the [tui] prefix"
         );
     }
@@ -840,7 +844,7 @@ echo '{"type":"ready","protocol_version":1,"server":{"name":"chibi","version":"1
         let snap = diag::snapshot();
         assert!(
             snap.iter()
-                .any(|l| l.starts_with("[tui] handshake ok (protocol v1)")),
+                .any(|l| l.text.starts_with("[tui] handshake ok (protocol v1)")),
             "ok handshake stamped: {:?}",
             snap.last()
         );
@@ -852,7 +856,8 @@ echo '{"type":"ready","protocol_version":1,"server":{"name":"chibi","version":"1
         assert!(client.handshake().await.is_err());
         let snap = diag::snapshot();
         assert!(
-            snap.iter().any(|l| l.starts_with("[tui] handshake failed")),
+            snap.iter()
+                .any(|l| l.text.starts_with("[tui] handshake failed")),
             "failed handshake stamped"
         );
     }

@@ -924,8 +924,10 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// the view to the cursor and the snapshot freezes (the `+K new lines`
 /// footer counts arrivals instead). `w` toggles Paragraph-style reflow:
 /// wrap off = compact truncated timeline, wrap on = full text chunked over
-/// rows at the content width. Levels colorize through theme role slots
-/// (`log_info`/`log_call`/`log_think`/`log_moderator`/`log_tool`), and
+/// rows at the content width. Levels parsed at ingestion colorize per the
+/// [`log_line_style`] table (`TRACE` very dim, `DEBUG` dim gray, `INFO` and
+/// `SUCCESS` green, `WARNING` yellow, `ERROR` red, `CRITICAL` bold red);
+/// lines without a recognizable level keep the default foreground and
 /// `[tui]` lifecycle events stay dimmed.
 fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     use ratatui::widgets::{Clear, Padding};
@@ -1045,14 +1047,14 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
         let mut rows: Vec<Line<'static>> = Vec::new();
         let mut logical_of_row: Vec<usize> = Vec::new();
         for (idx, logical) in lines.iter().enumerate() {
-            let color = log_line_color(logical, theme);
+            let base_style = log_line_style(logical, theme);
             let ranges = search
                 .as_ref()
-                .map(|s| crate::app::find_match_ranges(logical, &s.pattern))
+                .map(|s| crate::app::find_match_ranges(&logical.text, &s.pattern))
                 .unwrap_or_default();
             let chunks: Vec<(String, usize)> = if wrap {
                 let mut offset = 0usize;
-                crate::app::wrap_line(logical, content_w)
+                crate::app::wrap_line(&logical.text, content_w)
                     .into_iter()
                     .map(|c| {
                         let start = offset;
@@ -1061,7 +1063,7 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
                     })
                     .collect()
             } else {
-                vec![(logical.clone(), 0)]
+                vec![(logical.text.clone(), 0)]
             };
             for (chunk, chunk_start) in chunks {
                 let spans = log_line_spans(
@@ -1070,7 +1072,7 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
                     &ranges,
                     idx == cursor,
                     Some(idx) == current_match_line,
-                    color,
+                    base_style,
                     theme,
                 );
                 rows.push(Line::from(spans));
@@ -1088,13 +1090,13 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
                 break;
             }
             first_row += if wrap {
-                crate::app::wrapped_row_count(logical, content_w)
+                crate::app::wrapped_row_count(&logical.text, content_w)
             } else {
                 1
             };
         }
         let cursor_rows = if wrap {
-            crate::app::wrapped_row_count(&lines[cursor], content_w)
+            crate::app::wrapped_row_count(&lines[cursor].text, content_w)
         } else {
             1
         };
@@ -1144,34 +1146,27 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     }
 }
 
-/// feat_log_viewer_core: level → theme-slot mapping for diagnostics lines.
-/// Backend stderr carries the level as a ` | LEVEL | ` field (e.g. `2026-09-01
-/// 14:54:55.135 | INFO | chibi.services.task_manager:run_task:66 - ...`);
-/// unknown lines keep the default foreground, `[tui]` lifecycle events stay
-/// dim. No raw RGB here: everything routes through the theme role slots.
-fn log_level_of(line: &str) -> Option<&'static str> {
-    for level in ["INFO", "CALL", "THINK", "MODERATOR", "TOOL"] {
-        let needle = format!(" | {level} | ");
-        if line.contains(&needle) {
-            return Some(level);
-        }
+/// Level to style table for diagnostics lines, driven by the level parsed
+/// at ingestion (see [`crate::diag::LogEntry::parse`]): `TRACE` very dim,
+/// `DEBUG` dim gray, `INFO` and `SUCCESS` green, `WARNING` yellow, `ERROR`
+/// red, `CRITICAL` bold red. Entries without a level (old backends,
+/// malformed lines, non-log stderr output) keep the default foreground;
+/// `[tui]` lifecycle events stay dim. No raw RGB here: everything routes
+/// through the theme slots.
+fn log_line_style(entry: &crate::diag::LogEntry, theme: &Theme) -> ratatui::style::Style {
+    if entry.text.starts_with(crate::diag::TUI_EVENT_PREFIX) {
+        return Style::new().fg(theme.dim);
     }
-    None
-}
-
-/// Color for one diagnostics line via the theme role slots (see
-/// [`log_level_of`]).
-fn log_line_color(line: &str, theme: &Theme) -> ratatui::style::Color {
-    if line.starts_with(crate::diag::TUI_EVENT_PREFIX) {
-        return theme.dim;
-    }
-    match log_level_of(line) {
-        Some("INFO") => theme.log_info,
-        Some("CALL") => theme.log_call,
-        Some("THINK") => theme.log_think,
-        Some("MODERATOR") => theme.log_moderator,
-        Some("TOOL") => theme.log_tool,
-        _ => theme.fg,
+    use crate::diag::LogLevel;
+    match entry.level {
+        Some(LogLevel::Trace) => Style::new().fg(theme.log_trace),
+        Some(LogLevel::Debug) => Style::new().fg(theme.log_debug),
+        Some(LogLevel::Info) => Style::new().fg(theme.green),
+        Some(LogLevel::Warning) => Style::new().fg(theme.yellow),
+        Some(LogLevel::Error) => Style::new().fg(theme.red),
+        Some(LogLevel::Critical) => Style::new().fg(theme.red).add_modifier(Modifier::BOLD),
+        Some(LogLevel::Success) => Style::new().fg(theme.green),
+        None => Style::new().fg(theme.fg),
     }
 }
 
@@ -1187,10 +1182,10 @@ fn log_line_spans(
     ranges: &[(usize, usize)],
     is_cursor: bool,
     is_current_match: bool,
-    base_color: ratatui::style::Color,
+    base_style: ratatui::style::Style,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
-    let mut base = Style::new().fg(base_color);
+    let mut base = base_style;
     if is_cursor {
         base = base.bg(theme.selection);
     }
@@ -3449,7 +3444,7 @@ mod tests {
             thought_row < answer_row,
             "thoughts block must sit ABOVE the answer"
         );
-        // The thought text paints in the dim slot (log_think family).
+        // The thought text paints in the dim slot.
         let col = rows[thought_row].find("reasoning").unwrap();
         assert_eq!(
             buf[(col as u16, thought_row as u16)].fg,
@@ -4576,13 +4571,18 @@ mod tests {
 
     /// Hand-built viewer state for the hermetic render tests below (the
     /// global diag stream is shared by parallel tests and would race).
-    /// The feat_log_viewer_search_copy fields default to off.
+    /// Lines go through the same ingestion parse as real arrivals, so the
+    /// tests exercise the production level attribution. The
+    /// feat_log_viewer_search_copy fields default to off.
     fn viewer_state(cursor: usize, wrap: bool, lines: Vec<String>) -> LogViewerState {
         LogViewerState {
             cursor,
             wrap,
             row_offset: 0,
-            lines,
+            lines: lines
+                .into_iter()
+                .map(crate::diag::LogEntry::parse)
+                .collect(),
             snapshot_total: crate::diag::total_appended(),
             search_buf: None,
             search: None,
@@ -4670,26 +4670,27 @@ mod tests {
         );
     }
 
-    /// Levels colorize through the theme role slots (feat_log_viewer_core):
-    /// INFO dim, CALL cyan slot, THINK purple slot, MODERATOR orange slot,
-    /// TOOL blue slot. Checked against the actual rendered cells. The viewer
-    /// state is built by hand (pinned, so the render never refreshes it):
-    /// the global diag stream is shared by parallel tests and would race.
+    /// Levels parsed at ingestion colorize per the log_line_style table:
+    /// TRACE very dim, DEBUG dim gray, INFO/SUCCESS green, WARNING yellow,
+    /// ERROR red, CRITICAL bold red. Checked against the actual rendered
+    /// cells. The viewer state is built by hand (pinned, so the render
+    /// never refreshes it): the global diag stream is shared by parallel
+    /// tests and would race.
     #[test]
-    fn log_viewer_colors_levels_via_theme_slots() {
+    fn log_viewer_colors_levels_per_mapping() {
         let theme = Theme::tokyo_night();
-        let cases: [(&str, ratatui::style::Color); 5] = [
-            ("LVC-INFO", theme.log_info),
-            ("LVC-CALL", theme.log_call),
-            ("LVC-THINK", theme.log_think),
-            ("LVC-MOD", theme.log_moderator),
-            ("LVC-TOOL", theme.log_tool),
+        let cases: [(&str, &str, ratatui::style::Color, bool); 7] = [
+            ("LVC-TRACE", "TRACE", theme.log_trace, false),
+            ("LVC-DEBUG", "DEBUG", theme.log_debug, false),
+            ("LVC-INFO", "INFO", theme.green, false),
+            ("LVC-WARN", "WARNING", theme.yellow, false),
+            ("LVC-ERROR", "ERROR", theme.red, false),
+            ("LVC-CRIT", "CRITICAL", theme.red, true),
+            ("LVC-OK", "SUCCESS", theme.green, false),
         ];
-        let levels = ["INFO", "CALL", "THINK", "MODERATOR", "TOOL"];
         let lines: Vec<String> = cases
             .iter()
-            .zip(levels)
-            .map(|((marker, _), level)| {
+            .map(|(marker, level, _, _)| {
                 format!("2026-09-01 10:00:00.000 | {level} | chibi.m:1 - body {marker}")
             })
             .collect();
@@ -4697,52 +4698,72 @@ mod tests {
         let mut app = App::new(mock::initial_chats());
         app.mode = Mode::LogViewer {
             // Pinned to a middle line: the snapshot stays frozen.
-            state: viewer_state(2, false, lines),
+            state: viewer_state(3, false, lines),
         };
         let (rows, buf) = render_grid_with_buffer(&mut app);
 
-        for (marker, expected) in &cases {
+        for (marker, _, expected, bold) in &cases {
             let (y, row) = rows
                 .iter()
                 .enumerate()
                 .find(|(_, r)| r.contains(marker))
                 .unwrap_or_else(|| panic!("level line {marker} visible in the viewer"));
             let col = col_of_sub(row, marker).expect("marker column");
+            let cell = &buf[(col as u16, y as u16)];
+            assert_eq!(cell.fg, *expected, "level color for {marker}");
             assert_eq!(
-                buf[(col as u16, y as u16)].fg,
-                *expected,
-                "level slot color for {marker}"
+                cell.modifier.contains(Modifier::BOLD),
+                *bold,
+                "bold flag for {marker}"
             );
         }
     }
 
-    /// The level → slot mapping table (pure function): the five known
-    /// levels map to their slots; `[tui]` events and unknown stderr keep
-    /// None (the renderer falls back to default fg / dim).
+    /// Graceful degradation: lines without a recognizable ` | LEVEL | `
+    /// field (old backends, malformed output, plain stderr noise) render in
+    /// the default foreground exactly as before, and `[tui]` lifecycle
+    /// events stay dim.
     #[test]
-    fn log_level_detection_table() {
+    fn log_viewer_unknown_lines_render_default_and_tui_events_stay_dim() {
+        let theme = Theme::tokyo_night();
+        let lines = vec![
+            "plain stderr noise".to_owned(),
+            "2026-09-01 10:00:00.000 | NOTALEVEL | chibi.m:1 - body".to_owned(),
+            "a | INFO".to_owned(),
+            "[tui] handshake ok (protocol v1)".to_owned(),
+        ];
+
+        let mut app = App::new(mock::initial_chats());
+        app.mode = Mode::LogViewer {
+            state: viewer_state(1, false, lines),
+        };
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+
+        for marker in ["plain stderr noise", "NOTALEVEL", "a | INFO"] {
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(marker))
+                .unwrap_or_else(|| panic!("line {marker:?} visible in the viewer"));
+            let col = col_of_sub(row, marker).expect("marker column");
+            assert_eq!(
+                buf[(col as u16, y as u16)].fg,
+                theme.fg,
+                "default foreground for {marker:?}"
+            );
+        }
+
+        let (y, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("handshake ok"))
+            .expect("tui event visible in the viewer");
+        let col = col_of_sub(row, "handshake ok").expect("marker column");
         assert_eq!(
-            log_level_of("2026-09-01 10:00:00.000 | INFO | chibi.m:1 - msg"),
-            Some("INFO")
+            buf[(col as u16, y as u16)].fg,
+            theme.dim,
+            "[tui] events stay dim"
         );
-        assert_eq!(
-            log_level_of("2026-09-01 10:00:00.000 | CALL | chibi.m:1 - msg"),
-            Some("CALL")
-        );
-        assert_eq!(
-            log_level_of("2026-09-01 10:00:00.000 | THINK | chibi.m:1 - msg"),
-            Some("THINK")
-        );
-        assert_eq!(
-            log_level_of("2026-09-01 10:00:00.000 | MODERATOR | chibi.m:1 - msg"),
-            Some("MODERATOR")
-        );
-        assert_eq!(
-            log_level_of("2026-09-01 10:00:00.000 | TOOL | chibi.m:1 - msg"),
-            Some("TOOL")
-        );
-        assert_eq!(log_level_of("[tui] handshake ok (protocol v1)"), None);
-        assert_eq!(log_level_of("plain stderr noise"), None);
     }
 
     // ---- feat_log_viewer_search_copy: search + copy ------------------------

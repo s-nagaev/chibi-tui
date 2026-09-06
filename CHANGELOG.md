@@ -79,6 +79,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `unknown frame type: <tag>` trace in the diagnostics log (`Ctrl+G`)
   instead of vanishing silently; the request lifecycle is unaffected and
   plain garbage lines are still dropped quietly.
+- Log viewer level colors: stderr lines shaped
+  `YYYY-MM-DD HH:MM:SS | LEVEL | message` are parsed once at ingestion and
+  each diagnostics entry keeps its level next to the raw text; the `Ctrl+G`
+  viewer colorizes per level (`TRACE` very dim, `DEBUG` dim gray, `INFO`
+  and `SUCCESS` green, `WARNING` yellow, `ERROR` red, `CRITICAL` bold red).
+  Lines without a recognizable level (old backends, malformed or non-log
+  output) render exactly as before, `[tui]` lifecycle events stay dim, and
+  the `CHIBI_TUI_LOG` file mirror stays plain text with no ANSI codes.
 
 ### Fixed
 - Sticky last-known display state: the `ctx` usage segment no longer loses

@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::backend::BackendEvent;
+use crate::diag::LogEntry;
 use crate::markdown;
 use crate::model::{ChatLifecycle, Message};
 use crate::model_picker::{parse_model_listing, parse_selection_confirmation, ModelEntry};
@@ -114,9 +115,10 @@ pub struct GlobalSearchState {
 /// line per step, no matter how many rows a wrapped line occupies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogViewerState {
-    /// Snapshot copy of the buffered lines (oldest → newest) at the last
-    /// refresh (open, live-tail frame, or return-to-bottom).
-    pub lines: Vec<String>,
+    /// Snapshot copy of the buffered log entries (oldest → newest) at the
+    /// last refresh (open, live-tail frame, or return-to-bottom). Each
+    /// entry carries the raw text plus the level parsed at ingestion.
+    pub lines: Vec<LogEntry>,
     /// Logical line the cursor sits on (0-based; the newest line is the
     /// live tail).
     pub cursor: usize,
@@ -178,7 +180,7 @@ impl LogViewerState {
     /// arithmetic can never disagree.
     pub fn row_count_of(&self, index: usize, width: usize) -> usize {
         if self.wrap {
-            wrapped_row_count(&self.lines[index], width)
+            wrapped_row_count(&self.lines[index].text, width)
         } else {
             1
         }
@@ -195,7 +197,7 @@ impl LogViewerState {
             .lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line_matches(line, &pattern))
+            .filter(|(_, entry)| line_matches(&entry.text, &pattern))
             .map(|(i, _)| i)
             .collect();
         if let Some(search) = self.search.as_mut() {
@@ -1513,7 +1515,7 @@ impl App {
                         .lines
                         .iter()
                         .enumerate()
-                        .filter(|(_, line)| line_matches(line, &pattern))
+                        .filter(|(_, entry)| line_matches(&entry.text, &pattern))
                         .map(|(i, _)| i)
                         .collect();
                     let target = matches.iter().find(|&&m| m >= state.cursor).copied();
@@ -1610,10 +1612,10 @@ impl App {
     pub fn log_copy_selected(&mut self) {
         let note = match &self.mode {
             Mode::LogViewer { state } => {
-                let Some(text) = state.lines.get(state.cursor) else {
+                let Some(entry) = state.lines.get(state.cursor) else {
                     return;
                 };
-                match crate::clipboard::copy_text(text) {
+                match crate::clipboard::copy_text(&entry.text) {
                     crate::clipboard::CopyOutcome::Copied => "copied".to_owned(),
                     crate::clipboard::CopyOutcome::Unavailable => "copy: unavailable".to_owned(),
                 }
@@ -6171,7 +6173,10 @@ mod tests {
                 cursor,
                 wrap: false,
                 row_offset: 0,
-                lines,
+                lines: lines
+                    .into_iter()
+                    .map(crate::diag::LogEntry::parse)
+                    .collect(),
                 snapshot_total: crate::diag::total_appended(),
                 search_buf: None,
                 search,
@@ -6246,7 +6251,10 @@ mod tests {
                 lines: vec![
                     "first".to_owned(),
                     "second line with the content to copy".to_owned(),
-                ],
+                ]
+                .into_iter()
+                .map(crate::diag::LogEntry::parse)
+                .collect(),
                 snapshot_total: crate::diag::total_appended(),
                 search_buf: None,
                 search: None,
@@ -6287,7 +6295,7 @@ mod tests {
             "opens live-tailing: cursor on the newest line"
         );
         assert!(
-            state.lines.contains(&marker),
+            state.lines.iter().any(|e| e.text == *marker),
             "snapshot copy contains the buffered marker"
         );
         // Reset-on-open (consumer-side watermark): everything up to the
@@ -6427,7 +6435,10 @@ mod tests {
             "snapshot frozen while pinned"
         );
         assert!(
-            !log_state(&app).lines.contains(&detached_marker),
+            !log_state(&app)
+                .lines
+                .iter()
+                .any(|e| e.text == *detached_marker),
             "frozen snapshot does not show the arrival"
         );
         let total_now = crate::diag::total_appended();
@@ -6442,7 +6453,7 @@ mod tests {
         let state = log_state(&app);
         assert!(state.at_tail(), "back at the bottom");
         assert!(
-            state.lines.contains(&detached_marker),
+            state.lines.iter().any(|e| e.text == *detached_marker),
             "live-tail refresh picked up the detached arrival"
         );
         assert!(

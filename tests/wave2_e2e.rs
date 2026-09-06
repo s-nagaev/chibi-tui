@@ -433,7 +433,7 @@ async fn unknown_frame_mid_request_is_tolerated_and_traced() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("unknown frame type: holo_deck")),
+            .any(|l| l.text.contains("unknown frame type: holo_deck")),
         "diag trace must name the unknown tag; got {lines:?}"
     );
 }

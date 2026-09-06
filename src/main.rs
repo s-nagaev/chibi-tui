@@ -3087,7 +3087,7 @@ mod tests {
         };
         assert!(state.at_tail(), "opens live-tailing: cursor on the tail");
         assert!(
-            state.lines.contains(&marker),
+            state.lines.iter().any(|e| e.text == *marker),
             "the modal snapshot carries the buffered marker"
         );
     }
@@ -3269,7 +3269,10 @@ mod tests {
             cursor,
             wrap: false,
             row_offset: 0,
-            lines: lines.into_iter().map(str::to_owned).collect(),
+            lines: lines
+                .into_iter()
+                .map(|s| chibi_tui::diag::LogEntry::parse(s.to_owned()))
+                .collect(),
             snapshot_total: chibi_tui::diag::total_appended(),
             search_buf: None,
             search,

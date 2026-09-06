@@ -804,7 +804,7 @@ mod tests {
         );
         let marker = "unknown frame type: holo_deck";
         assert!(
-            lines.iter().any(|l| l.contains(marker)),
+            lines.iter().any(|l| l.text.contains(marker)),
             "diag line must name the unknown tag; got {lines:?}"
         );
     }

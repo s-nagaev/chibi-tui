@@ -44,6 +44,67 @@ pub const FILE_SINK_ENV: &str = "CHIBI_TUI_LOG";
 /// Prefix stamped on TUI-side lifecycle events (vs. verbatim backend stderr).
 pub const TUI_EVENT_PREFIX: &str = "[tui]";
 
+/// Log levels the viewer colorizes, in loguru spelling. Parsed from the
+/// ` | LEVEL | ` field of a backend stderr line at ingestion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Critical,
+    Success,
+}
+
+impl LogLevel {
+    /// Match one ` | LEVEL | ` field token, case-insensitively; `None` for
+    /// anything that is not a known level name.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.to_ascii_uppercase().as_str() {
+            "TRACE" => Some(Self::Trace),
+            "DEBUG" => Some(Self::Debug),
+            "INFO" => Some(Self::Info),
+            "WARNING" => Some(Self::Warning),
+            "ERROR" => Some(Self::Error),
+            "CRITICAL" => Some(Self::Critical),
+            "SUCCESS" => Some(Self::Success),
+            _ => None,
+        }
+    }
+}
+
+/// One diagnostic line: the raw text plus the log level parsed at
+/// ingestion. `text` is always the untouched line (display, search, copy
+/// and the file mirror all work from it); `level` is `None` for anything
+/// without a recognizable ` | LEVEL | ` field, which renders in the
+/// default style (graceful degradation for old backends and non-log
+/// output).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    /// The raw line, verbatim as it arrived.
+    pub text: String,
+    /// Log level parsed from the ` | LEVEL | ` field at ingestion, if any.
+    pub level: Option<LogLevel>,
+}
+
+impl LogEntry {
+    /// Ingestion parse: split on ` | `; the level is the second token when
+    /// the line carries at least three tokens and that token names a known
+    /// level, case-insensitively (loguru spelling). Everything else keeps
+    /// `level: None`.
+    pub fn parse(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let tokens: Vec<&str> = text.split(" | ").collect();
+        let level = if tokens.len() >= 3 {
+            LogLevel::parse(tokens[1])
+        } else {
+            None
+        };
+        Self { text, level }
+    }
+}
+
 /// Optional append-mode mirror of the log stream.
 enum Sink {
     /// No file mirror (default).
@@ -65,7 +126,7 @@ enum Sink {
 /// construction (totals only ever grow) and survives multiple open/close
 /// cycles without extra global state.
 pub struct DiagLog {
-    lines: VecDeque<String>,
+    lines: VecDeque<LogEntry>,
     /// Monotonic count of ALL lines ever appended (survives eviction) — the
     /// baseline both the viewer's `+K new lines` hint and the consumer-side
     /// unseen tracking are computed against.
@@ -97,27 +158,29 @@ impl DiagLog {
         }
     }
 
-    /// Append ONE line (already line-split by the caller). Evicts the oldest
-    /// line beyond [`LOG_CAPACITY`] and mirrors to the file sink when one is
-    /// configured.
+    /// Append ONE line (already line-split by the caller). The level is
+    /// parsed once here, at ingestion (see [`LogEntry::parse`]); the raw
+    /// text is kept verbatim for display, search, copy and the file
+    /// mirror. Evicts the oldest line beyond [`LOG_CAPACITY`] and mirrors
+    /// to the file sink when one is configured.
     pub fn push(&mut self, line: impl Into<String>) {
-        let line = line.into();
+        let entry = LogEntry::parse(line);
         if self.lines.len() >= LOG_CAPACITY {
             self.lines.pop_front();
         }
-        self.lines.push_back(line.clone());
+        self.lines.push_back(entry.clone());
         self.total = self.total.saturating_add(1);
         if let Sink::Open(file) = &mut self.sink {
             // Best-effort mirror: a write failure (disk full, file removed)
             // must never panic or surface — diagnostics stay memory-only.
-            let _ = writeln!(file, "{line}");
+            let _ = writeln!(file, "{}", entry.text);
         }
     }
 
     /// Snapshot copy of the buffered lines (oldest → newest). The viewer
     /// modal reads a copy so the ring can keep appending freely while the
     /// modal holds and renders its view.
-    pub fn snapshot(&self) -> Vec<String> {
+    pub fn snapshot(&self) -> Vec<LogEntry> {
         self.lines.iter().cloned().collect()
     }
 
@@ -220,7 +283,7 @@ pub fn append_tui(event: impl fmt::Display) {
 }
 
 /// Snapshot copy of the global buffer (oldest → newest) for the viewer modal.
-pub fn snapshot() -> Vec<String> {
+pub fn snapshot() -> Vec<LogEntry> {
     lock().snapshot()
 }
 
@@ -234,7 +297,7 @@ pub fn total_appended() -> u64 {
 /// live-tail at the bottom, so the `+K new lines` baseline is always
 /// consistent with the snapshot it came with (no interleaved append can slip
 /// between the two reads).
-pub fn view() -> (Vec<String>, u64) {
+pub fn view() -> (Vec<LogEntry>, u64) {
     let log = lock();
     (log.snapshot(), log.total())
 }
@@ -275,9 +338,9 @@ mod tests {
         assert_eq!(log.len(), LOG_CAPACITY, "ring never grows past the cap");
         // The oldest `extra` lines were evicted; the first survivor is #extra.
         let snap = log.snapshot();
-        assert_eq!(snap.first().map(String::as_str), Some("line-37"));
+        assert_eq!(snap.first().map(|e| e.text.as_str()), Some("line-37"));
         assert_eq!(
-            snap.last().map(String::as_str),
+            snap.last().map(|e| e.text.as_str()),
             Some(format!("line-{}", LOG_CAPACITY + extra - 1).as_str())
         );
         // Snapshot is a COPY: mutating it does not touch the ring.
@@ -324,8 +387,9 @@ mod tests {
         log.push(""); // empty stderr lines stay verbatim
         assert_eq!(log.len(), 2);
         let snap = log.snapshot();
-        assert_eq!(snap[0], "plain line");
-        assert_eq!(snap[1], "");
+        assert_eq!(snap[0].text, "plain line");
+        assert_eq!(snap[1].text, "");
+        assert_eq!(snap[0].level, None, "plain lines ingest level-free");
     }
 
     // ---- file sink -----------------------------------------------------------
@@ -363,7 +427,7 @@ mod tests {
         let mut log = DiagLog::with_sink_path(Some(&path));
         log.push("still buffered");
         assert_eq!(log.len(), 1, "sink failure must not lose lines");
-        assert_eq!(log.snapshot(), ["still buffered".to_owned()]);
+        assert_eq!(log.snapshot()[0].text, "still buffered");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -393,5 +457,87 @@ mod tests {
             "[tui] pipe closed: a b",
             "embedded newlines collapse so rows stay intact"
         );
+    }
+
+    // ---- level parsing at ingestion -----------------------------------------
+
+    #[test]
+    fn log_entry_parses_every_known_level() {
+        for (name, expected) in [
+            ("TRACE", LogLevel::Trace),
+            ("DEBUG", LogLevel::Debug),
+            ("INFO", LogLevel::Info),
+            ("WARNING", LogLevel::Warning),
+            ("ERROR", LogLevel::Error),
+            ("CRITICAL", LogLevel::Critical),
+            ("SUCCESS", LogLevel::Success),
+        ] {
+            let line = format!("2026-09-06 10:00:00.000 | {name} | chibi.m:1 - body");
+            let entry = LogEntry::parse(line.clone());
+            assert_eq!(entry.level, Some(expected), "level for {name}");
+            assert_eq!(entry.text, line, "raw text kept verbatim for {name}");
+        }
+    }
+
+    #[test]
+    fn log_entry_level_parse_is_case_insensitive() {
+        assert_eq!(LogEntry::parse("t | info | m").level, Some(LogLevel::Info));
+        assert_eq!(
+            LogEntry::parse("t | Warning | m").level,
+            Some(LogLevel::Warning)
+        );
+        assert_eq!(
+            LogEntry::parse("t | success | m").level,
+            Some(LogLevel::Success)
+        );
+    }
+
+    #[test]
+    fn log_entry_unknown_or_short_lines_stay_level_free() {
+        for line in [
+            "plain stderr noise",
+            "",
+            "[tui] handshake ok (protocol v1)",
+            "only | two",
+            "2026-09-06 10:00:00.000 | NOTALEVEL | chibi.m:1 - body",
+        ] {
+            let entry = LogEntry::parse(line);
+            assert_eq!(entry.level, None, "no level for {line:?}");
+            assert_eq!(entry.text, line, "raw text kept verbatim for {line:?}");
+        }
+    }
+
+    #[test]
+    fn push_parses_level_at_ingestion() {
+        let mut log = DiagLog::new();
+        log.push("t1 | ERROR | boom");
+        log.push("plain noise");
+        log.push("[tui] spawn ok");
+        let snap = log.snapshot();
+        assert_eq!(snap[0].level, Some(LogLevel::Error));
+        assert_eq!(snap[0].text, "t1 | ERROR | boom");
+        assert_eq!(snap[1].level, None);
+        assert_eq!(snap[2].level, None);
+    }
+
+    #[test]
+    fn file_mirror_stays_ansi_free_for_leveled_lines() {
+        let dir = temp_dir("mirror_plain");
+        let path = dir.join("tui.log");
+        let mut log = DiagLog::with_sink_path(Some(&path));
+        log.push("2026-09-06 10:00:00 | CRITICAL | melting");
+        log.push("plain");
+
+        let content = std::fs::read_to_string(&path).expect("sink file exists");
+        assert_eq!(
+            content, "2026-09-06 10:00:00 | CRITICAL | melting\nplain\n",
+            "mirror writes the raw text verbatim"
+        );
+        assert!(
+            !content.contains('\u{1b}'),
+            "the file mirror never gains ANSI codes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
