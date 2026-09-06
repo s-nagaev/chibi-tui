@@ -7,6 +7,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Model picker (`Ctrl+M`): `PgUp`/`PgDn` page the list by one viewport of
+  visible rows instead of stepping item by item. The page size is the
+  popup's rendered list height (the same render-fed seam the chat pane and
+  the log viewer page by), the jump is clamped at both edges (no
+  wraparound, matching the arrow keys), and the landed-on row stays
+  highlighted and on screen. The picker footer hint now reads
+  `↑↓ navigate · PgUp/PgDn page · Enter switch · Esc close · Ctrl+C quit`.
 - Last-known usage and model now persist per thread and survive a restart:
   the ctx segment in the status strip and the panel model readout are seeded
   from the thread snapshot on startup instead of starting blank until the

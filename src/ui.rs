@@ -1243,8 +1243,9 @@ fn truncate_for_title(s: &str, max: usize) -> String {
 /// with a stateful [`List`] body: the selection is ratatui-selection-aware,
 /// so a listing longer than the viewport scrolls and the highlighted row
 /// auto-scrolls into view. `Loading` shows a quiet placeholder row while
-/// the hidden `/model` request is in flight. Purely visual — all key
-/// handling lives in `main.rs`.
+/// the hidden `/model` request is in flight. The body's visible row height
+/// feeds [`App::picker_visible_rows`] so PgUp/PgDn page exactly one
+/// on-screen viewport. Purely visual — all key handling lives in `main.rs`.
 fn render_model_picker(f: &mut Frame, app: &mut App, theme: &Theme) {
     use ratatui::widgets::{Clear, List, ListItem, ListState, Padding};
 
@@ -1256,8 +1257,7 @@ fn render_model_picker(f: &mut Frame, app: &mut App, theme: &Theme) {
     let selected = state.selected;
     let count = entries.len();
 
-    let hint =
-        "\u{2191}\u{2193} navigate \u{00b7} Enter switch \u{00b7} Esc close \u{00b7} Ctrl+C quit";
+    let hint = "\u{2191}\u{2193} navigate \u{00b7} PgUp/PgDn page \u{00b7} Enter switch \u{00b7} Esc close \u{00b7} Ctrl+C quit";
 
     // Max model rows shown before the stateful list scrolls internally
     // (the highlighted row auto-scrolls into view).
@@ -1326,6 +1326,8 @@ fn render_model_picker(f: &mut Frame, app: &mut App, theme: &Theme) {
         height: 1,
         ..inner
     };
+
+    app.picker_visible_rows = body.height.max(1);
 
     if loading {
         f.render_widget(
@@ -5410,7 +5412,7 @@ mod tests {
             "first parsed row rendered: {text}"
         );
         assert!(
-            text.contains("↑↓ navigate · Enter switch · Esc close · Ctrl+C quit"),
+            text.contains("↑↓ navigate · PgUp/PgDn page · Enter switch · Esc close · Ctrl+C quit"),
             "decision hint on the footer row"
         );
         // The highlighted row carries the ▸ marker.
@@ -5460,6 +5462,23 @@ mod tests {
         assert!(
             !text.contains("1. Qwen3.8 Max"),
             "no rows exist before the hidden listing resolves"
+        );
+    }
+
+    #[test]
+    fn picker_render_feeds_the_page_size_seam() {
+        let mut app = picker_app_at(0);
+        render_grid(&mut app);
+        assert_eq!(
+            app.picker_visible_rows, 12,
+            "the page size is the popup's actual visible row count"
+        );
+
+        let mut app = picker_app_at(0);
+        render_grid_at_with_buffer(&mut app, 120, 8);
+        assert_eq!(
+            app.picker_visible_rows, 3,
+            "a tiny terminal shrinks the page to the real viewport"
         );
     }
 

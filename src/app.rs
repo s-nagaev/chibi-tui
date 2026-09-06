@@ -353,7 +353,8 @@ pub enum Mode {
     /// snapshot with a `+K new lines` footer while scrolled up.
     LogViewer { state: LogViewerState },
     /// The ^M model-picker popup is open (feat_model_picker_lite). Modal
-    /// isolation like the search family: ↑/↓ navigate, Enter selects,
+    /// isolation like the search family: ↑/↓ navigate, PgUp/PgDn page the
+    /// selection by one viewport of visible rows, Enter selects,
     /// Esc closes, everything else is swallowed. The listing arrives through
     /// the NORMAL request pipeline as a hidden exchange — see
     /// [`HiddenPurpose`] and [`App::begin_model_picker`].
@@ -533,6 +534,11 @@ pub struct App {
     /// the same width the renderer chunks lines at. Defaults to 100 until
     /// first render.
     pub log_content_width: u16,
+    /// Visible list height (rows) of the open model-picker popup, set
+    /// during `ui::render_model_picker` so PgUp/PgDn page exactly one
+    /// viewport of picker rows. Defaults to 20 until first render (same
+    /// seam as [`App::chat_visible_rows`] and [`App::log_visible_rows`]).
+    pub picker_visible_rows: u16,
     /// feat_stderr_log_modal: the consumer-side "seen" watermark — the
     /// [`crate::diag::DiagLog::total`] value at the moment the log stream
     /// was last fully viewed (viewer opened / re-tailed / closed at the
@@ -726,6 +732,7 @@ impl App {
             pending_global_search_jump: None,
             log_visible_rows: 20,
             log_content_width: 100,
+            picker_visible_rows: 20,
             log_seen_total: 0,
             status_strip_visible: false,
             workspace_root: None,
@@ -1729,6 +1736,30 @@ impl App {
     pub fn model_picker_select_prev(&mut self) {
         if let Mode::ModelPicking { state } = &mut self.mode {
             state.selected = state.selected.saturating_sub(1);
+        }
+    }
+
+    /// PgUp in the picker: jump the selection up one page of the popup's
+    /// visible list rows (render-fed [`App::picker_visible_rows`], the same
+    /// seam the chat pane and the log viewer page by). Clamped at the top
+    /// edge: the arrows never wrap, so paging does not either. The
+    /// ratatui selection-aware list keeps the landed-on row in view.
+    pub fn model_picker_page_up(&mut self) {
+        if let Mode::ModelPicking { state } = &mut self.mode {
+            let page = self.picker_visible_rows.max(1) as usize;
+            state.selected = state.selected.saturating_sub(page);
+        }
+    }
+
+    /// PgDn in the picker: jump the selection down one page of the popup's
+    /// visible list rows, clamped at the last navigable row. No wraparound
+    /// (same edge rule as the arrows); the ratatui selection-aware list
+    /// keeps the landed-on row in view after the jump.
+    pub fn model_picker_page_down(&mut self) {
+        if let Mode::ModelPicking { state } = &mut self.mode {
+            let page = self.picker_visible_rows.max(1) as usize;
+            let last = state.entries.len().saturating_sub(1);
+            state.selected = state.selected.saturating_add(page).min(last);
         }
     }
 

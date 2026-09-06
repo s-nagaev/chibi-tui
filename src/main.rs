@@ -723,7 +723,10 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // ---- feat_model_picker_lite: model-picker modal captures everything ----
     //
     // While the ^M picker is open, ONLY picker keys work: ↑/↓ move the
-    // selection (clamped at the list edges), Enter confirms the highlighted
+    // selection (clamped at the list edges), PgUp/PgDn page the selection
+    // by one viewport of the popup's visible rows (same clamp rule; the
+    // page size is the rendered list height fed back by the renderer),
+    // Enter confirms the highlighted
     // row (stages the hidden `/model <n>` request, a no-op until the
     // listing arrives), Esc closes without acting (a parked fetch is
     // dropped; an already-confirmed selection stays queued), Ctrl+C quits
@@ -738,6 +741,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         match key.code {
             KeyCode::Up => app.model_picker_select_prev(),
             KeyCode::Down => app.model_picker_select_next(),
+            KeyCode::PageUp => app.model_picker_page_up(),
+            KeyCode::PageDown => app.model_picker_page_down(),
             KeyCode::Enter => app.confirm_model_picker(),
             KeyCode::Esc => {
                 app.close_model_picker();
@@ -3597,6 +3602,14 @@ mod tests {
         };
     }
 
+    /// Park the injected picker's selection on `selected` (0-based) without
+    /// touching the rows (paging tests need non-zero start offsets).
+    fn park_picker_selection(app: &mut chibi_tui::app::App, selected: usize) {
+        if let chibi_tui::app::Mode::ModelPicking { state } = &mut app.mode {
+            state.selected = selected;
+        }
+    }
+
     #[test]
     fn ctrl_m_opens_the_model_picker_in_normal_mode() {
         let mut app = app_with_chats(1);
@@ -3647,7 +3660,8 @@ mod tests {
         inject_ready_picker(&mut app, 3);
 
         // Typing leaks nowhere; global chords and thread switching are
-        // swallowed; the mode never moves.
+        // swallowed; the mode never moves. PgUp is a picker nav key now:
+        // it pages the LIST, never the chat pane.
         press(&mut app, KeyCode::Char('x'), KeyModifiers::empty());
         press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
@@ -3670,10 +3684,13 @@ mod tests {
             "precious draft",
             "no keystroke leaked into the textarea"
         );
-        assert_eq!(app.scroll, 0, "PgUp did not scroll the chat pane");
+        assert_eq!(
+            app.scroll, 0,
+            "picker PgUp pages the list, never the chat pane"
+        );
 
-        // The ONLY working keys: ↑/↓ navigate, Enter confirms, Esc cancels,
-        // Ctrl+C quits.
+        // The ONLY working keys: ↑/↓ and PgUp/PgDn navigate, Enter confirms,
+        // Esc cancels, Ctrl+C quits.
         press(&mut app, KeyCode::Down, KeyModifiers::empty());
         press(&mut app, KeyCode::Down, KeyModifiers::empty());
         press(&mut app, KeyCode::Up, KeyModifiers::empty());
@@ -3743,6 +3760,101 @@ mod tests {
         inject_ready_picker(&mut app, 2);
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn picker_page_down_jumps_a_full_page_from_the_top() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 104);
+        app.picker_visible_rows = 12;
+        press(&mut app, KeyCode::PageDown, KeyModifiers::empty());
+        assert_eq!(
+            app.model_picker_selected(),
+            12,
+            "one page of visible rows from the top"
+        );
+        press(&mut app, KeyCode::PageDown, KeyModifiers::empty());
+        assert_eq!(app.model_picker_selected(), 24, "each press steps one page");
+        press(&mut app, KeyCode::PageUp, KeyModifiers::empty());
+        assert_eq!(
+            app.model_picker_selected(),
+            12,
+            "page up steps back one page"
+        );
+    }
+
+    #[test]
+    fn picker_page_navigation_steps_one_page_from_the_middle() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 104);
+        app.picker_visible_rows = 12;
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        }
+        assert_eq!(app.model_picker_selected(), 5, "mid-page starting offset");
+        press(&mut app, KeyCode::PageDown, KeyModifiers::empty());
+        assert_eq!(
+            app.model_picker_selected(),
+            17,
+            "page down from mid-page steps a full page"
+        );
+        press(&mut app, KeyCode::PageUp, KeyModifiers::empty());
+        assert_eq!(
+            app.model_picker_selected(),
+            5,
+            "page up returns to the row a page above"
+        );
+    }
+
+    #[test]
+    fn picker_page_down_clamps_at_the_bottom_edge() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 20);
+        app.picker_visible_rows = 12;
+        park_picker_selection(&mut app, 15);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::empty());
+        assert_eq!(
+            app.model_picker_selected(),
+            19,
+            "clamped to the last row, no wraparound"
+        );
+        press(&mut app, KeyCode::PageDown, KeyModifiers::empty());
+        assert_eq!(
+            app.model_picker_selected(),
+            19,
+            "paging past the edge stays clamped"
+        );
+        press(&mut app, KeyCode::PageUp, KeyModifiers::empty());
+        assert_eq!(app.model_picker_selected(), 7);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::PageUp, KeyModifiers::empty());
+        }
+        assert_eq!(
+            app.model_picker_selected(),
+            0,
+            "page up clamps at the top edge too"
+        );
+    }
+
+    #[test]
+    fn picker_paging_applies_to_the_filtered_entries_list() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 104);
+        // The picker has no query input today; `entries` IS the navigable
+        // list (a future filter would prune it the same way). Paging must
+        // measure against this list, never a hardcoded 104-row listing.
+        if let chibi_tui::app::Mode::ModelPicking { state } = &mut app.mode {
+            state.entries.truncate(15);
+        }
+        app.picker_visible_rows = 12;
+        press(&mut app, KeyCode::PageDown, KeyModifiers::empty());
+        assert_eq!(app.model_picker_selected(), 12);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::empty());
+        assert_eq!(
+            app.model_picker_selected(),
+            14,
+            "clamped to the filtered list's last row"
+        );
     }
 
     #[test]
