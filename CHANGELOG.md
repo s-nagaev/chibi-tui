@@ -14,8 +14,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-chat across switches, `—` placeholder when unknown); the workspace cwd is
   the `--workspace` basename. Hints bar gained the permanent `^O info` token at
   a net-zero width change (`^D del`/`^T panel` compacted to bare `^D`/`^T`), so
-  the 120-column contract with the longest status label still holds. Designed
-  to extend with a context-size segment once the protocol reports real usage.
+  the 120-column contract with the longest status label still holds.
 - Model label in the assistant header: when the backend's `result` frame
   carries the optional `model`/`provider` fields, the answer's header renders
   as `● Chibi (model)` with a dim parenthetical (model preferred, provider as
@@ -37,6 +36,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   editor prefilled with the current title; `Enter` saves (trimmed, empty
   rejected), `Esc` cancels keeping the message draft; works on busy threads;
   renamed titles persist across restarts.
+- Reasoning (thoughts) display: when the backend's `result` frame carries the
+  optional `thoughts` field, a dim block with the raw reasoning trace renders
+  ABOVE the latest answer. The block is static text (no streaming); reasoning
+  over 64 KB arrives already truncated by the backend with a visible
+  `[... LLM reasoning truncated: 64 KB limit reached ...]` marker. Toggled
+  with `Ctrl+S`, on by default; the block is session view state only: it is
+  never written to the history file, and answers without reasoning (or with
+  the toggle off) render exactly as before the feature existed.
+- Context usage segment in the status strip: when the `result` frame carries
+  the optional `usage` object, the `Ctrl+O` readout gains a trailing
+  `· ctx 14% (18.4k/131.0k)` segment: a floored percent of input tokens
+  against the backend-reported context window, with both counts humanized.
+  An unknown window shows the absolute count alone (`· ctx 18.4k`), never an
+  invented maximum; the segment is omitted entirely until usage arrives and
+  only updates when a new result frame resolves.
+- Subagent counter: while the active chat has a request in flight and the
+  backend reports live subagent progress, the spinner line appends
+  `· subagents working: n` (n = currently active subagents). The segment
+  follows the active chat only (background work keeps showing in the sidebar
+  dot) and without live subagents the line stays byte-for-byte unchanged.
+- Handshake capabilities: the TUI declares `{"thoughts": true, "subagents":
+  true}` during the version handshake; the protocol version is unchanged
+  (1) and older backends tolerate the unknown keys.
+- Reader hardening: an incoming frame with an unknown `type` tag leaves an
+  `unknown frame type: <tag>` trace in the diagnostics log (`Ctrl+G`)
+  instead of vanishing silently; the request lifecycle is unaffected and
+  plain garbage lines are still dropped quietly.
 
 ## [0.1.0] - 2026-08-25
 

@@ -136,7 +136,7 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+F` | Find in the current thread (type to filter, `↑`/`↓` navigate matches, `Enter` jump to match, `Esc` close) |
 | `Ctrl+Shift+F` | Find in ALL threads (global search; same popup family with thread-title labels and total counts; `Enter` switches to the match's thread and jumps; requires the kitty keyboard protocol) |
 | `Ctrl+G` | Open the diagnostics log viewer (backend stderr + TUI lifecycle events; `PgUp`/`PgDn` or `↑`/`↓` scroll, `Esc` close — see the Diagnostics section) |
-| `Ctrl+O` | Toggle the status strip — a dim one-row `cwd: <workspace> · <model>` readout on the chat header's top border (hidden by default; see the Status strip section) |
+| `Ctrl+O` | Toggle the status strip: a dim one-row `cwd: <workspace> · <model>` readout on the chat header's top border, extended with a trailing `· ctx …` usage segment once the backend reports one (hidden by default; see the Status strip section) |
 | `Ctrl+S` | Toggle the dim reasoning (thoughts) block above the latest answer (on by default; session-only view state — flipping it never clears anything and reasoning is never saved to history) |
 | `Ctrl+M` | Open the model picker popup (`↑`/`↓` navigate · `Enter` switch · `Esc` close — see the Model picker section; requires the kitty keyboard protocol) |
 | `Enter` | Send message (or queue it while this chat is busy) |
@@ -342,7 +342,9 @@ A hideable one-row readout on the **chat header's top border**, toggled with
 default**; the toggle state is plain view state — it survives every modal
 open/close and never captures keys.
 
-- **Content** — `cwd: <workspace> · <model>`:
+- **Content**: `cwd: <workspace> · <model>`; when the backend reports
+  usage, a trailing `· ctx …` context-usage segment is appended (see
+  **Context usage** below):
   - `cwd` is the **basename of the workspace root** (the `--workspace` value
     the TUI passes to the backend; CLI-only today, read reactively so a
     future runtime change would show up on the next frame).
@@ -359,9 +361,46 @@ open/close and never captures keys.
   On narrow terminals it is truncated with an ellipsis to the space left of
   the title, and in a too-narrow chat pane it simply does not render.
 - **Styling** — dim (theme-driven), deliberately quiet: context, not content.
-- **Extensible** — the planned context-size segment (once the protocol
-  reports real usage) will extend the same readout; a local approximation
-  was rejected as dishonest.
+- **Context usage**: when a `result` frame carries the optional `usage`
+  object, the readout gains a trailing `· ctx 14% (18.4k/131.0k)` segment:
+  a floored percent of input tokens against the backend-reported context
+  window, both counts humanized (raw digits under 1000, `x.xk` under a
+  million, `x.xM` beyond; tenths are truncated, never rounded up). An
+  unknown or zero window falls back to the absolute count alone
+  (`· ctx 18.4k`), never an invented maximum. The segment is omitted
+  byte-for-byte until the first result reports usage, and it updates only
+  when a new result frame resolves: it shows the latest turn's numbers,
+  not a running estimate.
+
+### Reasoning display (thoughts)
+
+When the backend's `result` frame carries the optional `thoughts` field (the
+model's raw reasoning trace), chibi-tui renders it as a dim block ABOVE the
+latest answer. The block is static text: it appears together with the
+answer, there is no streaming. Traces longer than 64 KB arrive already
+truncated by the backend, with a visible
+`[... LLM reasoning truncated: 64 KB limit reached ...]` marker at the end.
+
+`Ctrl+S` toggles the block for the session, on by default. Flipping the
+toggle never discards anything, and reasoning is never saved to the history
+file: a restart restores messages only, without traces. Answers without
+reasoning, whitespace-only traces, or the toggle off render exactly as they
+did before the feature existed.
+
+chibi-tui advertises both wave-2 features at the version handshake
+(`{"thoughts": true, "subagents": true}`); the protocol version itself is
+unchanged and older backends simply tolerate the unknown keys.
+
+### Subagent counter
+
+While the active chat has a request in flight and the backend reports live
+subagent progress, the spinner line above the input gains a trailing
+`· subagents working: n` segment (n = currently active subagents). The
+segment follows the active chat only: background chats keep showing their
+work in the sidebar dot, and without live subagents the spinner line is
+byte-for-byte unchanged. The backend emits subagent progress only to
+clients that declared the `subagents` capability at the handshake, which
+chibi-tui always does.
 
 ### Model picker
 
