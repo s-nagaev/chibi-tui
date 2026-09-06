@@ -19,6 +19,27 @@ Optional behaviour flags (used by the integration tests):
 ``--result-without-model`` omit the optional ``model``/``provider`` fields on
                          result frames (feat_agent_model_label fallback: old
                          backend / fieldless variant)
+
+Wave-2 behaviour flags (frames added alongside the base behaviour; thoughts
+and subagent frames additionally require the matching client capability
+declared in the handshake):
+
+``--with-usage``         result frames gain ``usage`` {input_tokens,
+                         output_tokens, context_window: 131072}
+``--usage-windowless``   like ``--with-usage`` but ``context_window: null``
+                         (implies ``--with-usage``)
+``--with-thoughts``      result frames gain a ``thoughts`` string when the
+                         handshake declared ``capabilities.thoughts``
+``--thoughts-huge``      the thoughts payload is a >64KB trace capped to 64KB
+                         with the backend truncation marker (implies
+                         ``--with-thoughts``)
+``--with-subagents``     each request emits a mid-turn ``agent_event``
+                         sequence (started → started → finished → finished,
+                         active back to 0) when the handshake declared
+                         ``capabilities.subagents``
+``--with-unknown-frame`` one unknown-type frame is emitted mid-turn (drives
+                         the client's diag-warning path while the request
+                         still completes)
 """
 
 from __future__ import annotations
@@ -33,6 +54,53 @@ import time
 PRINT_LOCK = threading.Lock()
 
 RESULT_CONTENT = "This function `foo` returns the integer `42`."
+
+# Wave-2 thoughts contract: the backend caps reasoning at 64KB (UTF-8-safe)
+# and appends a truncation marker when the cap bites.
+MAX_THOUGHTS_BYTES = 64 * 1024
+THOUGHTS_TRUNCATION_MARKER = "\n[... LLM reasoning truncated: 64 KB limit reached ...]"
+
+THOUGHTS_TRACE = "\n".join(
+    [
+        "Weighing the request against protocol v1 constraints.",
+        "Checking protocol constraints: usage and thoughts ride on the result.",
+        "Drafting the answer: one sentence, deterministic.",
+    ]
+)
+
+# Usage payload riding on --with-usage result frames (deterministic values
+# chosen so the TUI's ctx segment maths is checkable in render assertions).
+USAGE_INPUT_TOKENS = 18432
+USAGE_OUTPUT_TOKENS = 512
+USAGE_CONTEXT_WINDOW = 131072
+
+
+def cap_thoughts(thoughts: str) -> str:
+    """Cap reasoning text at MAX_THOUGHTS_BYTES with a truncation marker.
+
+    UTF-8-safe: the byte cut never splits a code point, so the capped
+    payload stays a valid string on the wire.
+
+    Args:
+        thoughts: Full reasoning text produced for a request.
+
+    Returns:
+        The reasoning text, capped at the byte budget with the marker.
+    """
+    encoded = thoughts.encode("utf-8")
+    if len(encoded) <= MAX_THOUGHTS_BYTES:
+        return thoughts
+    budget = MAX_THOUGHTS_BYTES - len(THOUGHTS_TRUNCATION_MARKER.encode("utf-8"))
+    return encoded[:budget].decode("utf-8", errors="ignore") + THOUGHTS_TRUNCATION_MARKER
+
+
+def huge_thoughts_trace() -> str:
+    """Build a deterministic multi-line reasoning trace larger than 64KB.
+
+    Returns:
+        An ASCII trace of roughly 71KB, one numbered line per step.
+    """
+    return "\n".join(f"step {i:04d}: " + "d" * 60 for i in range(1000))
 
 
 def emit(obj):
@@ -79,9 +147,50 @@ def main() -> int:
         action="store_true",
         help="omit model/provider on result frames (fieldless fallback)",
     )
+    parser.add_argument(
+        "--with-usage",
+        action="store_true",
+        help="result frames carry usage {input_tokens, output_tokens, context_window}",
+    )
+    parser.add_argument(
+        "--usage-windowless",
+        action="store_true",
+        help="report context_window: null on result usage (implies --with-usage)",
+    )
+    parser.add_argument(
+        "--with-thoughts",
+        action="store_true",
+        help="result frames carry thoughts when the client opted in at handshake",
+    )
+    parser.add_argument(
+        "--thoughts-huge",
+        action="store_true",
+        help="thoughts payload exceeds 64KB and is capped with the truncation marker",
+    )
+    parser.add_argument(
+        "--with-subagents",
+        action="store_true",
+        help="mid-turn agent_event sequence when the client opted in at handshake",
+    )
+    parser.add_argument(
+        "--with-unknown-frame",
+        action="store_true",
+        help="emit one unknown-type frame mid-turn",
+    )
     args = parser.parse_args()
+    if args.usage_windowless:
+        args.with_usage = True
+    if args.thoughts_huge:
+        args.with_thoughts = True
+
+    thoughts_payload = ""
+    if args.with_thoughts:
+        trace = huge_thoughts_trace() if args.thoughts_huge else THOUGHTS_TRACE
+        thoughts_payload = cap_thoughts(trace)
 
     initialized = False
+    caps_thoughts = False
+    caps_subagents = False
     # request ids believed to be in flight (result timers may still fire)
     inflight = set()
     finish_timers = []
@@ -98,6 +207,14 @@ def main() -> int:
         if not args.result_without_model:
             result["model"] = "gpt-example"
             result["provider"] = "openai"
+        if args.with_usage:
+            result["usage"] = {
+                "input_tokens": USAGE_INPUT_TOKENS,
+                "output_tokens": USAGE_OUTPUT_TOKENS,
+                "context_window": None if args.usage_windowless else USAGE_CONTEXT_WINDOW,
+            }
+        if args.with_thoughts and caps_thoughts:
+            result["thoughts"] = thoughts_payload
         emit(result)
 
     def schedule_result(request_id: str, delay: float = 0.25) -> None:
@@ -107,7 +224,7 @@ def main() -> int:
         timer.start()
 
     def handle_initialize(obj) -> None:
-        nonlocal initialized
+        nonlocal initialized, caps_thoughts, caps_subagents
         version = obj.get("protocol_version")
         if version != 1:
             emit(
@@ -121,6 +238,12 @@ def main() -> int:
             )
             sys.stdout.flush()
             os._exit(42)
+
+        # Wave-2 gating: each capability turns on only via an explicit true,
+        # mirroring the real backend (absent/false fields mean "off").
+        caps = obj.get("capabilities") or {}
+        caps_thoughts = caps.get("thoughts") is True
+        caps_subagents = caps.get("subagents") is True
 
         emit(ready_frame())
         if args.garbage_on_start:
@@ -196,6 +319,32 @@ def main() -> int:
         if args.crash_after_running:
             sys.stdout.flush()
             os._exit(69)
+        if args.with_unknown_frame:
+            emit(
+                {
+                    "type": "holo_deck",
+                    "request_id": request_id,
+                    "payload": "beams",
+                }
+            )
+        if args.with_subagents and caps_subagents:
+            for event, active, total, name in (
+                ("started", 1, 1, "scout"),
+                ("started", 2, 2, "indexer"),
+                ("finished", 1, 2, None),
+                ("finished", 0, 2, None),
+            ):
+                frame = {
+                    "type": "agent_event",
+                    "request_id": request_id,
+                    "event": event,
+                    "active": active,
+                    "total": total,
+                }
+                if name is not None:
+                    frame["name"] = name
+                emit(frame)
+                time.sleep(0.05)
         schedule_result(request_id)
 
     def handle_cancel(obj) -> None:
