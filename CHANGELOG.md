@@ -114,6 +114,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   both readouts untouched, a model change shows up with the next labelled
   result, and a restart resets everything to `—` / plain headers (nothing
   new is persisted).
+- The log viewer colorizes the backend's custom log levels (`TOOL`, `THINK`,
+  `CALL`, `CHECK`, `MODERATOR`, `SUBAGENT`, `DELEGATE`) instead of leaving
+  them plain: each maps onto the theme slot mirroring its backend
+  registration color (light-blue → blue, light-magenta and magenta →
+  purple, light-red → red, cyan → cyan, blue → blue). Standard-level
+  coloring is untouched and unrecognized level names keep the default
+  foreground.
 
 ## [0.1.0] - 2026-08-25
 

@@ -87,6 +87,13 @@ impl Theme {
             log_match: Color::Rgb(158, 206, 106), // #9ece6a, same as green
         }
     }
+
+    /// Every bundled theme, in stable order. The log-viewer level table is
+    /// tested against this list, so a theme that leaves a level slot
+    /// unmapped fails in CI instead of shipping an uncolored tier.
+    pub fn bundled() -> Vec<Self> {
+        vec![Self::tokyo_night()]
+    }
 }
 
 /// Global syntect state (syntax definitions + dark color theme).

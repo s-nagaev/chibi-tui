@@ -953,9 +953,10 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// wrap off = compact truncated timeline, wrap on = full text chunked over
 /// rows at the content width. Levels parsed at ingestion colorize per the
 /// [`log_line_style`] table (`TRACE` very dim, `DEBUG` dim gray, `INFO` and
-/// `SUCCESS` green, `WARNING` yellow, `ERROR` red, `CRITICAL` bold red);
-/// lines without a recognizable level keep the default foreground and
-/// `[tui]` lifecycle events stay dimmed.
+/// `SUCCESS` green, `WARNING` yellow, `ERROR` red, `CRITICAL` bold red, the
+/// backend's custom levels per their registration colors); lines without a
+/// recognizable level keep the default foreground and `[tui]` lifecycle
+/// events stay dimmed.
 fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
     use ratatui::widgets::{Clear, Padding};
 
@@ -1176,10 +1177,16 @@ fn render_log_viewer(f: &mut Frame, app: &mut App, theme: &Theme) {
 /// Level to style table for diagnostics lines, driven by the level parsed
 /// at ingestion (see [`crate::diag::LogEntry::parse`]): `TRACE` very dim,
 /// `DEBUG` dim gray, `INFO` and `SUCCESS` green, `WARNING` yellow, `ERROR`
-/// red, `CRITICAL` bold red. Entries without a level (old backends,
-/// malformed lines, non-log stderr output) keep the default foreground;
-/// `[tui]` lifecycle events stay dim. No raw RGB here: everything routes
-/// through the theme slots.
+/// red, `CRITICAL` bold red. The backend's custom levels take the theme
+/// slots their backend registration colors mirror: `TOOL` light-blue →
+/// blue, `THINK` light-magenta → purple, `CALL` magenta → purple, `CHECK`
+/// and `MODERATOR` light-red → red, `SUBAGENT` cyan → cyan, `DELEGATE`
+/// blue → blue (the theme keeps one accent per color family, so the
+/// light/regular variants of one family share its slot). Entries without a
+/// level — old backends, malformed lines, non-log stderr output,
+/// unrecognized level names — keep the default foreground; `[tui]`
+/// lifecycle events stay dim. No raw RGB here: everything routes through
+/// the theme slots.
 fn log_line_style(entry: &crate::diag::LogEntry, theme: &Theme) -> ratatui::style::Style {
     if entry.text.starts_with(crate::diag::TUI_EVENT_PREFIX) {
         return Style::new().fg(theme.dim);
@@ -1193,6 +1200,13 @@ fn log_line_style(entry: &crate::diag::LogEntry, theme: &Theme) -> ratatui::styl
         Some(LogLevel::Error) => Style::new().fg(theme.red),
         Some(LogLevel::Critical) => Style::new().fg(theme.red).add_modifier(Modifier::BOLD),
         Some(LogLevel::Success) => Style::new().fg(theme.green),
+        Some(LogLevel::Tool) => Style::new().fg(theme.blue),
+        Some(LogLevel::Think) => Style::new().fg(theme.purple),
+        Some(LogLevel::Call) => Style::new().fg(theme.purple),
+        Some(LogLevel::Check) => Style::new().fg(theme.red),
+        Some(LogLevel::Moderator) => Style::new().fg(theme.red),
+        Some(LogLevel::Subagent) => Style::new().fg(theme.cyan),
+        Some(LogLevel::Delegate) => Style::new().fg(theme.blue),
         None => Style::new().fg(theme.fg),
     }
 }
@@ -4815,6 +4829,106 @@ mod tests {
                 cell.modifier.contains(Modifier::BOLD),
                 *bold,
                 "bold flag for {marker}"
+            );
+        }
+    }
+    /// The backend's custom levels colorize per their registration colors
+    /// routed through the theme slots: TOOL light-blue → blue, THINK
+    /// light-magenta / CALL magenta → purple, CHECK/MODERATOR light-red →
+    /// red, SUBAGENT cyan → cyan, DELEGATE blue → blue. Rendered-cell
+    /// check, same technique as the standard levels above.
+    #[test]
+    fn log_viewer_colors_custom_levels_per_mapping() {
+        let theme = Theme::tokyo_night();
+        let cases: [(&str, &str, ratatui::style::Color); 7] = [
+            ("LVC-TOOL", "TOOL", theme.blue),
+            ("LVC-THINK", "THINK", theme.purple),
+            ("LVC-CALL", "CALL", theme.purple),
+            ("LVC-CHECK", "CHECK", theme.red),
+            ("LVC-MODERATOR", "MODERATOR", theme.red),
+            ("LVC-SUBAGENT", "SUBAGENT", theme.cyan),
+            ("LVC-DELEGATE", "DELEGATE", theme.blue),
+        ];
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(marker, level, _)| {
+                format!("2026-09-01 10:00:00 | {level} | chibi.m:1 - body {marker}")
+            })
+            .collect();
+
+        let mut app = App::new(mock::initial_chats());
+        app.mode = Mode::LogViewer {
+            // Pinned to a middle line: the snapshot stays frozen.
+            state: viewer_state(3, false, lines),
+        };
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+
+        for (marker, _, expected) in &cases {
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(marker))
+                .unwrap_or_else(|| panic!("custom level line {marker} visible in the viewer"));
+            let col = col_of_sub(row, marker).expect("marker column");
+            let cell = &buf[(col as u16, y as u16)];
+            assert_eq!(cell.fg, *expected, "custom level color for {marker}");
+            assert!(
+                !cell.modifier.contains(Modifier::BOLD),
+                "custom levels carry no extra modifiers: {marker}"
+            );
+        }
+    }
+
+    /// DoD: every custom level resolves to a REAL theme slot — not the
+    /// level-less fallback — in EVERY bundled theme, so a future theme that
+    /// misses a slot fails here instead of shipping an uncolored tier.
+    #[test]
+    fn log_line_style_resolves_custom_levels_to_slots_in_every_bundled_theme() {
+        use crate::diag::LogLevel;
+        for theme in Theme::bundled() {
+            let cases = [
+                (LogLevel::Tool, theme.blue),
+                (LogLevel::Think, theme.purple),
+                (LogLevel::Call, theme.purple),
+                (LogLevel::Check, theme.red),
+                (LogLevel::Moderator, theme.red),
+                (LogLevel::Subagent, theme.cyan),
+                (LogLevel::Delegate, theme.blue),
+            ];
+            for (level, slot) in cases {
+                let entry = crate::diag::LogEntry {
+                    text: "t".to_owned(),
+                    level: Some(level),
+                };
+                let style = log_line_style(&entry, &theme);
+                assert_eq!(
+                    style.fg,
+                    Some(slot),
+                    "{level:?} must take its theme slot in every bundled theme"
+                );
+                assert_ne!(
+                    style.fg,
+                    Some(theme.fg),
+                    "{level:?} must not fall through to the level-less default"
+                );
+            }
+        }
+    }
+
+    /// Unknown level names stay graceful at the style-table level too: the
+    /// level parses to `None` and renders the default foreground — no
+    /// panic, no raw leak, no invented color.
+    #[test]
+    fn log_line_style_falls_back_to_default_fg_for_unknown_levels() {
+        let theme = Theme::tokyo_night();
+        for token in ["NOTALEVEL", "TOOOL", "tool2", ""] {
+            let entry =
+                crate::diag::LogEntry::parse(format!("2026-09-01 10:00:00 | {token} | body"));
+            assert_eq!(entry.level, None, "unknown token {token:?} parses to None");
+            assert_eq!(
+                log_line_style(&entry, &theme).fg,
+                Some(theme.fg),
+                "unknown level {token:?} keeps the default foreground"
             );
         }
     }

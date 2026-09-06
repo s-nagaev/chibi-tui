@@ -45,7 +45,10 @@ pub const FILE_SINK_ENV: &str = "CHIBI_TUI_LOG";
 pub const TUI_EVENT_PREFIX: &str = "[tui]";
 
 /// Log levels the viewer colorizes, in loguru spelling. Parsed from the
-/// ` | LEVEL | ` field of a backend stderr line at ingestion.
+/// ` | LEVEL | ` field of a backend stderr line at ingestion. Beyond the
+/// standard tiers this covers the backend's custom levels (registered in
+/// `chibi.config.app`), so tool calls, reasoning traces, checks, moderator
+/// activity and subagent/delegate chatter keep their colors in the viewer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogLevel {
     Trace,
@@ -55,11 +58,19 @@ pub enum LogLevel {
     Error,
     Critical,
     Success,
+    Tool,
+    Think,
+    Call,
+    Check,
+    Moderator,
+    Subagent,
+    Delegate,
 }
 
 impl LogLevel {
     /// Match one ` | LEVEL | ` field token, case-insensitively; `None` for
-    /// anything that is not a known level name.
+    /// anything that is not a known level name (unknown names degrade to
+    /// the default foreground at render time, never a crash).
     pub fn parse(token: &str) -> Option<Self> {
         match token.to_ascii_uppercase().as_str() {
             "TRACE" => Some(Self::Trace),
@@ -69,6 +80,13 @@ impl LogLevel {
             "ERROR" => Some(Self::Error),
             "CRITICAL" => Some(Self::Critical),
             "SUCCESS" => Some(Self::Success),
+            "TOOL" => Some(Self::Tool),
+            "THINK" => Some(Self::Think),
+            "CALL" => Some(Self::Call),
+            "CHECK" => Some(Self::Check),
+            "MODERATOR" => Some(Self::Moderator),
+            "SUBAGENT" => Some(Self::Subagent),
+            "DELEGATE" => Some(Self::Delegate),
             _ => None,
         }
     }
@@ -477,6 +495,28 @@ mod tests {
             assert_eq!(entry.level, Some(expected), "level for {name}");
             assert_eq!(entry.text, line, "raw text kept verbatim for {name}");
         }
+    }
+    #[test]
+    fn log_entry_parses_every_custom_level() {
+        for (name, expected) in [
+            ("TOOL", LogLevel::Tool),
+            ("THINK", LogLevel::Think),
+            ("CALL", LogLevel::Call),
+            ("CHECK", LogLevel::Check),
+            ("MODERATOR", LogLevel::Moderator),
+            ("SUBAGENT", LogLevel::Subagent),
+            ("DELEGATE", LogLevel::Delegate),
+        ] {
+            let line = format!("2026-09-06 10:00:00 | {name} | chibi.m:1 - body");
+            let entry = LogEntry::parse(line.clone());
+            assert_eq!(entry.level, Some(expected), "level for {name}");
+            assert_eq!(entry.text, line, "raw text kept verbatim for {name}");
+        }
+        // Case-insensitive, like the standard tiers.
+        assert_eq!(
+            LogEntry::parse("t | subagent | m").level,
+            Some(LogLevel::Subagent)
+        );
     }
 
     #[test]
