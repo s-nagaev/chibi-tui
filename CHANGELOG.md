@@ -7,6 +7,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Remember the last active thread across restarts: the thread id is recorded
+  in `last-thread.json` next to the threads directory on every activation
+  (write-on-activation, atomic temp-file + rename), so even a hard crash
+  remembers what the user was reading. On startup the app re-opens that
+  thread — selection and the sticky ctx/model display state restored exactly
+  as if the user had picked it — and falls back silently to the default
+  startup selection when the pointer is missing, unreadable, or points to a
+  thread whose history no longer exists. Honors `CHIBI_TUI_HOME` and
+  `--history-dir` like all history storage; no wire or history-file format
+  changes.
 - Model picker (`Ctrl+M`): `PgUp`/`PgDn` page the list by one viewport of
   visible rows instead of stepping item by item. The page size is the
   popup's rendered list height (the same render-fed seam the chat pane and

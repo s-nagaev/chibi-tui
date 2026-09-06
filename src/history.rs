@@ -1,13 +1,23 @@
 //! Local chat history: persist chats as JSON under the app config dir.
 //!
 //! Storage layout (one JSON document per chat, named by its stable thread
-//! id — never by user-visible title, so renames cannot orphan files):
+//! id — never by user-visible title, so renames cannot orphan files; plus a
+//! pointer recording the thread that was last on screen):
 //!
 //! ```text
-//! $XDG_DATA_HOME/chibi-tui/threads/   (default: ~/.local/share/chibi-tui/threads)
-//! └── <thread_uuid>.json
-//!     { "name": "...", "id": "<thread_uuid>", "messages": [ … ] }
+//! $XDG_DATA_HOME/chibi-tui/           (default: ~/.local/share/chibi-tui)
+//! ├── threads/
+//! │   └── <thread_uuid>.json
+//! │       { "name": "...", "id": "<thread_uuid>", "messages": [ … ] }
+//! └── last-thread.json
+//!     { "thread_id": "<thread_uuid>" }
 //! ```
+//!
+//! The pointer is rewritten atomically on every thread activation, so even
+//! a hard crash remembers what the user was reading. On startup the app
+//! re-opens that thread when both the pointer and the thread's snapshot
+//! survive; a missing, unreadable or dangling pointer silently falls back
+//! to the default startup selection.
 //!
 //! Threads also carry their last known turn usage and model label as the
 //! optional `last_usage` / `last_model` keys once a snapshot records them;
@@ -44,20 +54,24 @@ fn default_root() -> Option<PathBuf> {
     dirs::data_dir().map(|p| p.join("chibi-tui"))
 }
 
-/// Resolve the threads directory: explicit override → `$CHIBI_TUI_HOME` →
-/// platform data dir. Test seam via env var.
-fn resolve_dir(override_dir: Option<&Path>) -> PathBuf {
+/// Resolve the storage root: explicit override → `$CHIBI_TUI_HOME` →
+/// platform data dir. Test seam via env var. Everything the app persists
+/// (thread snapshots, the last-active-thread pointer) lives under this root.
+fn resolve_root(override_dir: Option<&Path>) -> PathBuf {
     if let Some(dir) = override_dir {
-        return dir.join("threads");
+        return dir.to_path_buf();
     }
     if let Ok(home) = std::env::var("CHIBI_TUI_HOME") {
         if !home.trim().is_empty() {
-            return PathBuf::from(home).join("threads");
+            return PathBuf::from(home);
         }
     }
-    default_root()
-        .map(|root| root.join("threads"))
-        .unwrap_or_else(|| PathBuf::from(".chibi-tui/threads"))
+    default_root().unwrap_or_else(|| PathBuf::from(".chibi-tui"))
+}
+
+/// Threads directory under the storage root.
+fn resolve_dir(override_dir: Option<&Path>) -> PathBuf {
+    resolve_root(override_dir).join("threads")
 }
 
 /// One persisted chat document (`<thread_id>.json`).
@@ -188,6 +202,63 @@ pub fn load_chats_from(override_dir: Option<&Path>) -> Vec<Chat> {
             }
         })
         .collect()
+}
+
+/// File name of the last-active-thread pointer inside the storage root.
+const LAST_THREAD_FILE: &str = "last-thread.json";
+
+/// One persisted last-active-thread pointer (`last-thread.json`).
+#[derive(Serialize, Deserialize)]
+struct LastThreadPointer {
+    thread_id: String,
+}
+
+/// Record the active thread id. Written on every activation — not only at
+/// shutdown — so a crash still remembers the thread the user was reading;
+/// the write is atomic (temp file + rename) so a torn write can never leave
+/// a half pointer. An empty id is a silent no-op: nothing to remember.
+pub fn save_last_thread(thread_id: &str) -> std::io::Result<()> {
+    save_last_thread_in(None, thread_id)
+}
+
+/// [`save_last_thread`] with an explicit directory override (tests / custom
+/// layout).
+pub fn save_last_thread_in(override_dir: Option<&Path>, thread_id: &str) -> std::io::Result<()> {
+    if thread_id.trim().is_empty() {
+        return Ok(());
+    }
+    let root = resolve_root(override_dir);
+    fs::create_dir_all(&root)?;
+    let json = serde_json::to_string(&LastThreadPointer {
+        thread_id: thread_id.to_owned(),
+    })
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let path = root.join(LAST_THREAD_FILE);
+    let tmp = root.join(format!(
+        ".{LAST_THREAD_FILE}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let stored = fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, &path));
+    if stored.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    stored
+}
+
+/// Load the last active thread id; `None` when the pointer is missing,
+/// unreadable, malformed, or empty. A bad pointer must never disturb the
+/// default startup behavior — restoration treats it as first-run silence.
+pub fn load_last_thread() -> Option<String> {
+    load_last_thread_in(None)
+}
+
+/// [`load_last_thread`] with an explicit directory override (tests / custom
+/// layout).
+pub fn load_last_thread_in(override_dir: Option<&Path>) -> Option<String> {
+    let raw = fs::read_to_string(resolve_root(override_dir).join(LAST_THREAD_FILE)).ok()?;
+    let pointer: LastThreadPointer = serde_json::from_str(&raw).ok()?;
+    let id = pointer.thread_id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
 }
 
 /// File-name-safe form of an id (defensive: ids are UUIDs today, but a stray
@@ -541,5 +612,78 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, keep.id, "keeper snapshot untouched");
         assert_eq!(loaded[0].name, "keeper");
+    }
+
+    // ---- remember_last_thread: last-active pointer -------------------------
+
+    /// The whole point of the pointer's persistence contract: the recorded
+    /// id round-trips through the state file, and every new activation
+    /// overwrites the previous one in place.
+    #[test]
+    fn last_thread_pointer_round_trips_and_overwrites() {
+        let root = temp_root("last-thread");
+        let a = new_thread_id();
+        let b = new_thread_id();
+
+        save_last_thread_in(Some(&root), &a).expect("save pointer");
+        assert_eq!(
+            load_last_thread_in(Some(&root)).as_deref(),
+            Some(a.as_str())
+        );
+
+        save_last_thread_in(Some(&root), &b).expect("resave pointer");
+        assert_eq!(
+            load_last_thread_in(Some(&root)).as_deref(),
+            Some(b.as_str()),
+            "the latest activation wins"
+        );
+
+        // One state file next to the threads directory — never one file per
+        // thread — and no temp-file leftovers after the atomic rename.
+        let entries: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["last-thread.json".to_owned()],
+            "pointer file only, nothing else: {entries:?}"
+        );
+    }
+
+    /// An empty id records nothing: there is no thread to remember, and a
+    /// later load must not invent one.
+    #[test]
+    fn empty_thread_id_save_is_a_silent_no_op() {
+        let root = temp_root("last-thread-empty");
+        save_last_thread_in(Some(&root), "   ").expect("no-op save");
+        assert!(load_last_thread_in(Some(&root)).is_none());
+        assert!(
+            !root.join("last-thread.json").exists(),
+            "nothing may be written"
+        );
+    }
+
+    /// Missing, corrupt, wrong-shaped, and empty-id pointers all degrade to
+    /// `None` — a bad pointer must be indistinguishable from a first run and
+    /// must never panic the startup path.
+    #[test]
+    fn missing_corrupt_or_empty_pointer_loads_as_none_without_panicking() {
+        let root = temp_root("last-thread-bad");
+        assert!(load_last_thread_in(Some(&root)).is_none(), "missing file");
+
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("last-thread.json"), "{not valid json")
+            .expect("write corrupt pointer");
+        assert!(load_last_thread_in(Some(&root)).is_none(), "corrupt JSON");
+
+        std::fs::write(root.join("last-thread.json"), r#"{"id":"nope"}"#)
+            .expect("write wrong-shape pointer");
+        assert!(load_last_thread_in(Some(&root)).is_none(), "wrong shape");
+
+        std::fs::write(root.join("last-thread.json"), r#"{"thread_id":"  "}"#)
+            .expect("write empty-id pointer");
+        assert!(load_last_thread_in(Some(&root)).is_none(), "empty id");
     }
 }

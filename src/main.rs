@@ -125,13 +125,7 @@ async fn main() -> io::Result<()> {
         app.connection = Connection::Connected; // mocks are always "up"
         Source::Mock(Box::new(chibi_tui::backend::MockBackend::new()))
     } else {
-        app = chibi_tui::app::App::new({
-            let mut chats = history::load_chats_from(restore_dir.as_deref());
-            if chats.is_empty() {
-                chats.push(chibi_tui::app::Chat::new("New chat 1"));
-            }
-            chats
-        });
+        app = bootstrap_app(restore_dir.as_deref());
         // Missing-backend setup screen loop: it runs before the main event
         // loop exists, so a retry (`r` on the screen) is just another
         // connect attempt. A quit from the screen leaves the app cleanly.
@@ -265,6 +259,11 @@ async fn run_loop(
     let mut reader = EventStream::new();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(100));
     spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Write-on-activation seam: the last-thread pointer is persisted whenever
+    // the active thread differs from the last observed one (the first
+    // observation is the startup selection), so even a hard crash records
+    // the thread the user was reading.
+    let mut tracked_thread: Option<String> = None;
 
     loop {
         // Resize events force a full repaint of the next frame anyway; the
@@ -535,6 +534,8 @@ async fn run_loop(
             }
         }
 
+        note_active_thread(&mut tracked_thread, &app, history_dir);
+
         if app.should_quit {
             return Ok(());
         }
@@ -598,6 +599,43 @@ fn persist_chat(chat: &chibi_tui::app::Chat, dir_override: Option<&std::path::Pa
     if let Err(e) = history::save_chat_in(dir_override, chat) {
         eprintln!("chibi-tui: could not save chat history: {e}");
     }
+}
+
+/// Build the live-mode startup app: persisted history (or one fresh chat on
+/// first run), then re-open the last active thread when both its pointer and
+/// the thread's snapshot survived. A missing, unreadable or dangling pointer
+/// leaves the default startup selection untouched — no error noise either way.
+fn bootstrap_app(dir_override: Option<&std::path::Path>) -> chibi_tui::app::App {
+    let mut chats = history::load_chats_from(dir_override);
+    if chats.is_empty() {
+        chats.push(chibi_tui::app::Chat::new("New chat 1"));
+    }
+    let mut app = chibi_tui::app::App::new(chats);
+    if let Some(id) = history::load_last_thread_in(dir_override) {
+        app.activate_thread(&id);
+    }
+    app
+}
+
+/// Persist the active thread pointer whenever activation changed since the
+/// previous observation; the first observation records the startup selection
+/// itself. Failures are non-fatal (stderr note only), like every other
+/// history write.
+fn note_active_thread(
+    tracked: &mut Option<String>,
+    app: &chibi_tui::app::App,
+    dir_override: Option<&std::path::Path>,
+) {
+    let current = app.active_thread_id().map(str::to_owned);
+    if current == *tracked {
+        return;
+    }
+    if let Some(id) = current.as_deref() {
+        if let Err(e) = history::save_last_thread_in(dir_override, id) {
+            eprintln!("chibi-tui: could not save last thread: {e}");
+        }
+    }
+    *tracked = current;
 }
 
 /// Paste text from the system clipboard into the input field at the cursor.
@@ -1273,6 +1311,130 @@ mod tests {
     }
 
     // ---- cancel hotkey -----------------------------------------------------
+
+    // ---- remember_last_thread: bootstrap restore + pointer updates --------
+
+    fn temp_history_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chibi-tui-last-thread-{tag}-{}-{}",
+            std::process::id(),
+            chibi_tui::history::new_thread_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn persisted_chat(
+        name: &str,
+        usage: Option<chibi_tui::protocol::Usage>,
+    ) -> chibi_tui::app::Chat {
+        let mut chat = Chat::new(name);
+        chat.messages.push(Message::user("question"));
+        chat.last_usage = usage;
+        chat
+    }
+
+    #[test]
+    fn bootstrap_reopens_the_last_active_thread_with_its_sticky_state() {
+        let dir = temp_history_dir("restore");
+        let first = persisted_chat("first", None);
+        let second = persisted_chat(
+            "second",
+            Some(chibi_tui::protocol::Usage {
+                input_tokens: 900_000,
+                output_tokens: 1,
+                context_window: Some(1_000_000),
+            }),
+        );
+        history::save_chat_in(Some(&dir), &first).expect("save first");
+        history::save_chat_in(Some(&dir), &second).expect("save second");
+        history::save_last_thread_in(Some(&dir), &second.id).expect("save pointer");
+
+        let app = bootstrap_app(Some(&dir));
+        assert_eq!(
+            app.active_thread_id(),
+            Some(second.id.as_str()),
+            "startup re-opens the remembered thread"
+        );
+        assert_eq!(app.chat_title(), "second");
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(900_000),
+            "sticky ctx state is seeded from the restored thread's snapshot"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bootstrap_with_missing_dangling_or_corrupt_pointer_uses_default_startup() {
+        // Missing pointer: plain default startup (first sorted snapshot).
+        let dir = temp_history_dir("no-pointer");
+        let a = persisted_chat("a", None);
+        let b = persisted_chat("b", None);
+        history::save_chat_in(Some(&dir), &a).expect("save a");
+        history::save_chat_in(Some(&dir), &b).expect("save b");
+        let app = bootstrap_app(Some(&dir));
+        assert_eq!(app.active, 0, "no pointer: default startup selection");
+        assert_eq!(app.chats.len(), 2, "nothing lost either");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Dangling pointer: the remembered id has no thread file.
+        let dir = temp_history_dir("dangling");
+        let only = persisted_chat("only", None);
+        history::save_chat_in(Some(&dir), &only).expect("save only");
+        history::save_last_thread_in(Some(&dir), &chibi_tui::history::new_thread_id())
+            .expect("dangling pointer");
+        let app = bootstrap_app(Some(&dir));
+        assert_eq!(app.active, 0, "dangling pointer: default startup");
+        assert_eq!(app.active_thread_id(), Some(only.id.as_str()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Corrupt pointer: unreadable JSON must never panic or disturb the
+        // startup selection.
+        let dir = temp_history_dir("corrupt");
+        let only = persisted_chat("only", None);
+        history::save_chat_in(Some(&dir), &only).expect("save only");
+        std::fs::write(dir.join("last-thread.json"), "{broken").expect("corrupt pointer");
+        let app = bootstrap_app(Some(&dir));
+        assert_eq!(app.active, 0, "corrupt pointer: default startup");
+        assert_eq!(app.active_thread_id(), Some(only.id.as_str()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn switching_threads_updates_the_persisted_pointer() {
+        let dir = temp_history_dir("switch");
+        let app = app_with_chats(2);
+        let first_id = app.chats[0].id.clone();
+        let second_id = app.chats[1].id.clone();
+
+        // The run loop's exact seam: observe, then switch, then observe.
+        let mut tracked: Option<String> = None;
+        note_active_thread(&mut tracked, &app, Some(&dir));
+        assert_eq!(
+            history::load_last_thread_in(Some(&dir)).as_deref(),
+            Some(first_id.as_str()),
+            "the startup selection is recorded"
+        );
+
+        let mut app = app;
+        app.select_next();
+        note_active_thread(&mut tracked, &app, Some(&dir));
+        assert_eq!(
+            history::load_last_thread_in(Some(&dir)).as_deref(),
+            Some(second_id.as_str()),
+            "a thread switch rewrites the pointer"
+        );
+
+        app.select_prev();
+        note_active_thread(&mut tracked, &app, Some(&dir));
+        assert_eq!(
+            history::load_last_thread_in(Some(&dir)).as_deref(),
+            Some(first_id.as_str()),
+            "switching back is recorded too"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn ctrl_c_while_busy_requests_cancel_instead_of_quit() {

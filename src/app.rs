@@ -787,6 +787,22 @@ impl App {
         self.select_chat(self.active.saturating_sub(1));
     }
 
+    /// Restore seam (remember-last-thread): open the app on a specific
+    /// thread id exactly as if the user had picked it — the same selection
+    /// semantics as [`App::select_chat`] plus the sticky ctx-segment seeding
+    /// from that thread's snapshot (the readout is seeded from the initially
+    /// selected chat, so a restored thread that is not the first must reseed
+    /// it here; the per-thread panel model is already staged for every
+    /// restored chat by [`App::new`]). An unknown id is a silent no-op: a
+    /// dangling pointer must never disturb the default startup selection.
+    pub fn activate_thread(&mut self, thread_id: &str) {
+        let Some(index) = self.chats.iter().position(|c| c.id == thread_id) else {
+            return;
+        };
+        self.select_chat(index);
+        self.last_turn_usage = self.chats[index].last_usage;
+    }
+
     /// feat_focus_panes: toggle which pane owns the keyboard — Ctrl+T flips
     /// [`Focus::Chat`] ↔ [`Focus::Sidebar`] (twice round-trips). No chat-list
     /// side effects: the selection, scroll and lifecycle are untouched; with
@@ -3251,6 +3267,59 @@ mod tests {
                 .all(|m| m.model_label().is_none()),
             "restore never backfills per-message annotations"
         );
+    }
+
+    // ---- remember_last_thread: restore activation -------------------------
+
+    /// A restored pointer must behave exactly like the user picking the
+    /// thread: the selection moves, and the sticky ctx segment is re-seeded
+    /// from THAT thread's snapshot (not the first chat's). A dangling id
+    /// changes nothing at all.
+    #[test]
+    fn activate_thread_opens_restored_thread_and_seeds_its_sticky_state() {
+        let mut alpha = Chat::new("alpha");
+        alpha.last_usage = Some(Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            context_window: Some(100_000),
+        });
+        let mut beta = Chat::new("beta");
+        beta.last_usage = Some(Usage {
+            input_tokens: 900_000,
+            output_tokens: 1,
+            context_window: Some(1_000_000),
+        });
+        beta.last_model = Some("glm-5.2".to_owned());
+
+        let mut app = App::new(vec![alpha, beta]);
+        assert_eq!(app.active, 0, "default startup selects the first chat");
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(10),
+            "ctx segment seeded from the first chat"
+        );
+
+        let restored_id = app.chats[1].id.clone();
+        app.activate_thread(&restored_id);
+        assert_eq!(app.active_thread_id(), Some(restored_id.as_str()));
+        assert_eq!(app.chat_title(), "beta");
+        assert_eq!(
+            app.last_turn_usage.map(|u| u.input_tokens),
+            Some(900_000),
+            "ctx segment re-seeded from the restored thread's snapshot"
+        );
+        assert_eq!(
+            app.active_model_label(),
+            Some("glm-5.2"),
+            "panel model staged for the restored thread"
+        );
+
+        // A dangling pointer is a silent no-op: selection and sticky state
+        // are untouched.
+        app.activate_thread(&crate::history::new_thread_id());
+        assert_eq!(app.active_thread_id(), Some(restored_id.as_str()));
+        assert_eq!(app.chat_title(), "beta");
+        assert_eq!(app.last_turn_usage.map(|u| u.input_tokens), Some(900_000));
     }
 
     #[test]
