@@ -21,8 +21,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `last_model` keys in the thread's history file and are only written once a
   turn or a model switch actually reports them; existing history files parse
   unchanged, threads without recorded data display exactly as before, and
-  per-answer model annotations remain session-scoped (no backfill, restored
-  answers keep plain headers).
+  per-answer model annotations remain session-scoped (no backfill). Restored
+  answers keep unlabeled messages but name the thread's last-known model in
+  their header — the same readout the panel shows.
 - Status strip (`Ctrl+O`): a hideable dim one-row `cwd: <workspace> · <model>`
   readout on the chat header's top border — right-aligned, zero vertical cost,
   truncated with an ellipsis on narrow terminals, hidden by default. The model
@@ -34,10 +35,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Model label in the assistant header: when the backend's `result` frame
   carries the optional `model`/`provider` fields, the answer's header renders
   as `● Chibi (model)` with a dim parenthetical (model preferred, provider as
-  fallback); fieldless frames and restored history keep the plain `● Chibi`.
-  Labels attach per message; a long model name wraps safely with the
-  row-accurate scroll math. The label is session-scoped — the history file
-  format is unchanged.
+  fallback). A header without its own label falls back to the thread's
+  last-known model — the readout the status strip shows — so restored history
+  keeps naming the model beside the bot name, and a thread with no known
+  model keeps the plain `● Chibi`. Labels attach per message; a long model
+  name wraps safely with the row-accurate scroll math. The label is
+  session-scoped — the history file format is unchanged.
 - Growing input block: the editor area now expands from 1 up to 20 rows with
   the multiline draft (`Shift+Enter`), squeezing the chat pane; past 20 lines
   the view auto-follows the caret. The `⏎ send` chip moves to the first row of

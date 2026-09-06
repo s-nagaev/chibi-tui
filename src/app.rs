@@ -877,6 +877,10 @@ impl App {
     /// [`App::picker_model_labels`]) that this getter prefers; the chat's
     /// next visible labeled reply retires it and message-derived truth
     /// resumes.
+    ///
+    /// The transcript renderer reuses this readout as the fallback for
+    /// header lines without their own label, so the status strip and the
+    /// in-chat `● Chibi (model)` annotation never disagree for a chat.
     pub fn active_model_label(&self) -> Option<&str> {
         let chat = self.chats.get(self.active)?;
         // feat_model_picker_lite: a hidden `/model <n>` switch updates the

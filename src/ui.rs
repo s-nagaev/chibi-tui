@@ -296,9 +296,15 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// feat_agent_model_label: the assistant role header line.
 ///
 /// `Some(label)` appends a DIM parenthetical — `● Chibi (glm-5.2)` — via
-/// [`Theme::dim`]; `None` keeps the plain `● Chibi` (historical rows, old
-/// backend or fieldless frames: never a placeholder like "(unknown)").
-/// The name itself stays hardcoded `Chibi` (B2/BOT_NAME is a later task).
+/// [`Theme::dim`]; `None` keeps the plain `● Chibi` — never a placeholder
+/// like "(unknown)". The name itself stays hardcoded `Chibi` (B2/BOT_NAME
+/// is a later task).
+///
+/// The transcript call site decides the argument: a message's own label
+/// first, then the chat's sticky last-known model (the same readout the
+/// status strip shows). Restored rows carry no per-message label — the
+/// history layer strips them — so the sticky fallback is what keeps the
+/// model named beside the bot name after a restart.
 ///
 /// Returns a single logical line: a long model name simply wraps within it,
 /// and the row-accurate scroll math counts display rows, so nothing else
@@ -389,6 +395,11 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     let Some(chat) = app.chats.get(app.active) else {
         return;
     };
+    // Headers without their own per-message label (restored rows, fieldless
+    // frames) fall back to the chat's sticky last-known model — the same
+    // readout the status strip shows — so a restart keeps the model named
+    // beside the bot name without backfilling message metadata.
+    let sticky = app.active_model_label();
 
     // Render every message into lines. `msg_ranges` records each message's
     // `[start, end)` span of LOGICAL lines (role header + content + trailing
@@ -426,7 +437,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
                 )));
             }
             Role::Assistant => {
-                lines.push(assistant_header_line(msg.model_label(), theme));
+                lines.push(assistant_header_line(msg.model_label().or(sticky), theme));
             }
         }
         if msg.pending {
@@ -4403,6 +4414,55 @@ mod tests {
         assert!(
             lines_with_label >= 2,
             "both assistant headers must render: {flat}"
+        );
+    }
+
+    /// Restart seam: restored rows carry no per-message label (the history
+    /// layer strips them), yet the header must still name the model. The
+    /// transcript falls back to the thread's sticky last-known model — the
+    /// readout the status strip shows — seeded by `App::new` from the
+    /// persisted snapshot.
+    #[test]
+    fn restored_last_model_seeds_chat_annotation() {
+        let mut chat = Chat::new("restored");
+        chat.messages.push(Message::assistant("old answer"));
+        chat.last_model = Some("some/model".to_string());
+
+        let dir = std::env::temp_dir().join(format!(
+            "chibi-tui-annotation-{}-{}",
+            std::process::id(),
+            crate::history::new_thread_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        crate::history::save_chat_in(Some(&dir), &chat).expect("save");
+        let restored = crate::history::load_chats_from(Some(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            restored[0].last_model.as_deref(),
+            Some("some/model"),
+            "last-known model persists with the thread"
+        );
+        assert!(
+            restored[0]
+                .messages
+                .iter()
+                .all(|m| m.model_label().is_none()),
+            "restore never backfills per-message annotations"
+        );
+
+        let mut app = App::new(restored);
+        assert_eq!(
+            app.active_model_label(),
+            Some("some/model"),
+            "status strip source seeded from the snapshot"
+        );
+
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.lines()
+                .any(|r| r.contains("\u{25cf} Chibi") && r.contains("(some/model)")),
+            "restored header must carry the persisted model:\n{flat}"
         );
     }
 
