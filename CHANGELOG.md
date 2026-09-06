@@ -64,6 +64,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of vanishing silently; the request lifecycle is unaffected and
   plain garbage lines are still dropped quietly.
 
+### Fixed
+- Sticky last-known display state: the `ctx` usage segment no longer loses
+  its value. It used to be wiped at every request start and overwritten by
+  every terminal frame, so a frame without usage (a command result or a
+  hidden model-picker exchange between two answers) made the readout vanish
+  until the next LLM turn. It now updates only when a frame actually reports
+  usage and keeps the previous value otherwise; a fresh session still starts
+  with no segment. The status strip's model readout and the per-answer
+  `(model)` header annotation already followed the same last-known rules and
+  are now pinned by tests: a command answer renders no annotation and leaves
+  both readouts untouched, a model change shows up with the next labelled
+  result, and a restart resets everything to `—` / plain headers (nothing
+  new is persisted).
+
 ## [0.1.0] - 2026-08-25
 
 Initial release.

@@ -579,10 +579,15 @@ pub struct App {
     /// correlation, held between staging and the backend ack. An error
     /// resolution drops it, so a failed clone leaves no orphan thread.
     pending_clone: Option<PendingClone>,
-    /// Wave-2 latest-turn metadata from the most recent `result` frame:
-    /// token usage and raw LLM reasoning. Set on every terminal result,
-    /// cleared when a new request starts; consumed by later wave-2 tasks
-    /// (no rendering in the protocol-base task).
+    /// Wave-2 latest-turn metadata from the most recent `result` frames.
+    ///
+    /// Usage is the sticky last-known token count: a terminal frame updates
+    /// it only when the frame actually carries usage, and a new request never
+    /// clears it, so command results and hidden exchanges between answers
+    /// keep the previous readout alive and the ctx segment disappears only
+    /// when no usage has arrived this session. Thoughts keep the per-turn
+    /// contract: every terminal result replaces them and a new request start
+    /// clears them.
     pub last_turn_usage: Option<Usage>,
     pub last_turn_thoughts: Option<String>,
     /// tui_thoughts_b1: session-only visibility of the dim reasoning block
@@ -1914,7 +1919,6 @@ impl App {
     /// loop needs it for background chats) and swaps the queued marker in
     /// place rather than appending a duplicate user bubble.
     pub fn begin_request(&mut self, submitted: &Submitted) {
-        self.last_turn_usage = None;
         self.last_turn_thoughts = None;
         if let Some(chat) = self.chats.get_mut(self.active) {
             chat.messages.push(Message::user(submitted.prompt.clone()));
@@ -1946,7 +1950,6 @@ impl App {
     /// Note: unlike [`App::begin_request`] this works on ANY chat — the event
     /// loop uses it after terminal events, including for background chats.
     pub fn dequeue_next_for(&mut self, thread_id: &str) -> Option<Submitted> {
-        self.last_turn_usage = None;
         self.last_turn_thoughts = None;
         let chat = self.chats.iter_mut().find(|c| c.id == thread_id)?;
         let prompt = chat.queue.pop_front()?;
@@ -2413,9 +2416,13 @@ impl App {
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
                     // Wave-2: retain the latest-turn protocol metadata before
-                    // any resolution path runs (hidden exchanges included);
-                    // nothing here renders it.
-                    self.last_turn_usage = usage;
+                    // any resolution path runs (hidden exchanges included).
+                    // Usage is sticky last-known: a frame without usage
+                    // (command results, hidden exchanges) must not wipe the
+                    // previous value. Thoughts are replaced every frame.
+                    if usage.is_some() {
+                        self.last_turn_usage = usage;
+                    }
                     self.last_turn_thoughts = thoughts;
                     // feat_model_picker_lite: a terminal result whose tracked
                     // id is a hidden exchange is suppressed from the
@@ -2933,7 +2940,7 @@ mod tests {
     }
 
     #[test]
-    fn fieldless_result_drops_stale_turn_metadata() {
+    fn fieldless_result_keeps_usage_and_drops_thoughts() {
         let mut app = app_with_chats(1);
         let submitted = submit_text(&mut app, "hello");
         app.apply_backend_event(BackendEvent::Result {
@@ -2953,12 +2960,16 @@ mod tests {
             thread_id: submitted.thread_id,
             model: None,
         });
-        assert_eq!(app.last_turn_usage, None);
-        assert_eq!(app.last_turn_thoughts, None);
+        assert_eq!(
+            app.last_turn_usage,
+            Some(sample_usage()),
+            "usage is sticky last-known: a usage-less frame must not wipe it"
+        );
+        assert_eq!(app.last_turn_thoughts, None, "thoughts stay per-turn");
     }
 
     #[test]
-    fn new_request_start_clears_latest_turn_metadata() {
+    fn new_request_start_keeps_usage_and_clears_thoughts() {
         let mut app = app_with_chats(1);
         let submitted = submit_text(&mut app, "hello");
         app.apply_backend_event(BackendEvent::Result {
@@ -2971,12 +2982,16 @@ mod tests {
         });
         assert!(app.last_turn_usage.is_some());
         submit_text(&mut app, "next prompt");
-        assert_eq!(app.last_turn_usage, None, "cleared on new request start");
+        assert_eq!(
+            app.last_turn_usage,
+            Some(sample_usage()),
+            "usage survives a new request start"
+        );
         assert_eq!(app.last_turn_thoughts, None, "cleared on new request start");
     }
 
     #[test]
-    fn dequeued_prompt_clears_latest_turn_metadata() {
+    fn dequeued_prompt_keeps_usage_and_clears_thoughts() {
         let mut app = app_with_chats(1);
         let submitted = submit_text(&mut app, "hello");
         let thread_id = submitted.thread_id.clone();
@@ -2998,8 +3013,149 @@ mod tests {
         let thread_id = app.chats[0].id.clone();
         app.dequeue_next_for(&thread_id)
             .expect("queued prompt drained");
-        assert_eq!(app.last_turn_usage, None, "cleared on dequeued start");
+        assert_eq!(
+            app.last_turn_usage,
+            Some(sample_usage()),
+            "usage survives a dequeued request start"
+        );
         assert_eq!(app.last_turn_thoughts, None, "cleared on dequeued start");
+    }
+
+    // ---- sticky last-known display state (ctx + model) --------------------
+
+    /// Submit a prompt on the ACTIVE chat and resolve it with a labelled LLM
+    /// answer carrying usage (the full wave-2 metadata a real chat turn
+    /// brings).
+    fn finish_llm_turn(app: &mut App, model: &str, usage: Usage) {
+        let submitted = submit_text(app, "turn prompt");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: Some(usage),
+            thoughts: None,
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "**answer**".into(),
+            thread_id: submitted.thread_id,
+            model: Some(model.to_owned()),
+        });
+    }
+
+    #[test]
+    fn command_frame_keeps_last_known_ctx_and_model() {
+        let mut app = app_with_chats(1);
+        finish_llm_turn(&mut app, "glm-5.2", sample_usage());
+
+        // A visible command exchange: the answer frame carries neither usage
+        // nor model (command results are backend plumbing, not LLM turns).
+        let command = submit_text(&mut app, "/help");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: None,
+            request_id: event_id_of(&command.request_id),
+            markdown: "available commands: /help /reset".into(),
+            thread_id: command.thread_id,
+            model: None,
+        });
+
+        assert_eq!(
+            app.last_turn_usage,
+            Some(sample_usage()),
+            "ctx keeps the last known usage across the command frame"
+        );
+        assert_eq!(
+            app.active_model_label(),
+            Some("glm-5.2"),
+            "panel keeps the last known model across the command frame"
+        );
+        let messages = &app.chats[0].messages;
+        assert_eq!(
+            messages[messages.len() - 1].model_label(),
+            None,
+            "the command answer carries no annotation"
+        );
+        assert_eq!(
+            messages[messages.len() - 3].model_label(),
+            Some("glm-5.2"),
+            "the LLM answer keeps its own annotation"
+        );
+    }
+
+    #[test]
+    fn model_change_mid_session_updates_panel_on_next_result() {
+        let mut app = app_with_chats(1);
+        finish_llm_turn(&mut app, "glm-5.2", sample_usage());
+        assert_eq!(app.active_model_label(), Some("glm-5.2"));
+
+        let switched = Usage {
+            input_tokens: 900,
+            output_tokens: 10,
+            context_window: Some(131_072),
+        };
+        finish_llm_turn(&mut app, "kimi-k2.7", switched);
+
+        assert_eq!(
+            app.active_model_label(),
+            Some("kimi-k2.7"),
+            "panel follows the next frame that carries a model"
+        );
+        assert_eq!(
+            app.last_turn_usage,
+            Some(switched),
+            "ctx follows the next frame that carries usage"
+        );
+    }
+
+    #[test]
+    fn fresh_session_starts_with_unknown_ctx_and_model() {
+        let app = app_with_chats(1);
+        assert_eq!(app.last_turn_usage, None, "no usage before any frame");
+        assert_eq!(
+            app.active_model_label(),
+            None,
+            "no model label before any frame"
+        );
+        assert!(
+            app.chats[0]
+                .messages
+                .iter()
+                .all(|m| m.model_label().is_none()),
+            "no annotation anywhere in a fresh session"
+        );
+    }
+
+    #[test]
+    fn restart_resets_sticky_display_state() {
+        let mut app = app_with_chats(1);
+        finish_llm_turn(&mut app, "glm-5.2", sample_usage());
+        assert!(app.last_turn_usage.is_some());
+        assert_eq!(app.active_model_label(), Some("glm-5.2"));
+
+        // Restart seam: the event loop persists the chat and a new App loads
+        // it. Labels are session-scoped and stripped by the history layer.
+        let dir = std::env::temp_dir().join(format!(
+            "chibi-tui-sticky-restart-{}-{}",
+            std::process::id(),
+            crate::history::new_thread_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        crate::history::save_chat_in(Some(&dir), &app.chats[0]).expect("save");
+        let restored = crate::history::load_chats_from(Some(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(restored.len(), 1, "one snapshot file");
+        assert!(
+            restored[0]
+                .messages
+                .iter()
+                .all(|m| m.model_label().is_none()),
+            "restored answers carry no annotation"
+        );
+
+        let fresh = App::new(restored);
+        assert_eq!(fresh.last_turn_usage, None, "usage is not persisted");
+        assert_eq!(
+            fresh.active_model_label(),
+            None,
+            "model label is not persisted"
+        );
     }
 
     /// [`finish_chat`] with a model label (feat_agent_model_label).

@@ -512,8 +512,9 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
 
 /// feat_status_line: the strip's text — `cwd: <path tail> · <model>` with
 /// `—` placeholders for an unwired workspace root / a chat without a known
-/// model yet, plus the v11_02 `ctx` usage segment when the last turn
-/// reported usage. The tail is squeezed into the columns the strip can
+/// model yet, plus the v11_02 `ctx` usage segment rendered from the sticky
+/// last-known turn usage: present once any frame this session reported
+/// usage, absent until then. The tail is squeezed into the columns the strip can
 /// host: cut from the LEFT with a leading `…`, so a long workspace path
 /// never pushes the model readout out of the row and the working
 /// directory itself stays visible. Deliberately a plain formatting seam:
@@ -5028,6 +5029,38 @@ mod tests {
         assert!(
             rows[0].contains("\u{00b7} \u{2014}"),
             "unlabelled chat must show the placeholder: {:?}",
+            rows[0]
+        );
+    }
+
+    /// Sticky display state at render level: an unlabelled answer (command
+    /// result) appended AFTER a labelled one must not change the strip, and
+    /// the ctx segment rides on the sticky last-known usage.
+    #[test]
+    fn status_strip_keeps_last_known_model_and_ctx_after_command_answer() {
+        let mut app = App::new(mock::initial_chats());
+        app.chats[0]
+            .messages
+            .push(Message::assistant_with_model("labelled answer", "glm-5.2"));
+        app.last_turn_usage = Some(Usage {
+            input_tokens: 18432,
+            output_tokens: 512,
+            context_window: Some(131_072),
+        });
+        app.toggle_status_strip();
+
+        // A command answer arrives: model-less message, no new usage.
+        app.chats[0].messages.push(Message::assistant("done"));
+
+        let rows = render_grid(&mut app);
+        assert!(
+            rows[0].contains("cwd: \u{2014} \u{00b7} glm-5.2"),
+            "model must stay last-known: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[0].contains(" \u{00b7} ctx 14% (18.4k/131.0k)"),
+            "ctx must stay last-known: {:?}",
             rows[0]
         );
     }
