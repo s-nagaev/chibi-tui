@@ -3763,11 +3763,11 @@ mod tests {
     fn ctrl_s_toggles_thoughts_round_trip() {
         let mut app = app_with_chats(1);
         assert!(app.thoughts_visible, "thoughts must start visible (ON)");
-        app.last_turn_thoughts = Some("chain of thought".into());
+        app.chats[0].last_thoughts = Some("chain of thought".into());
         press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert!(!app.thoughts_visible);
         assert_eq!(
-            app.last_turn_thoughts.as_deref(),
+            app.chats[0].last_thoughts.as_deref(),
             Some("chain of thought"),
             "toggle must not clear the retained thoughts"
         );

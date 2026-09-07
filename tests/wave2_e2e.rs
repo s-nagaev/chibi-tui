@@ -160,7 +160,7 @@ async fn result_carries_usage_and_thoughts_end_to_end() {
 
     assert_eq!(app.last_turn_usage, usage, "usage retained in App state");
     assert_eq!(
-        app.last_turn_thoughts.as_deref(),
+        app.chats[0].last_thoughts.as_deref(),
         Some(thoughts.as_str()),
         "thoughts retained in App state"
     );
@@ -446,7 +446,7 @@ async fn thoughts_never_persist_across_restart_or_replay() {
     let submitted = submitted_for(&app, "think hard");
     let events = submit_and_fold(&live, &mut app, submitted).await;
     assert!(
-        app.last_turn_thoughts.is_some(),
+        app.chats[0].last_thoughts.is_some(),
         "precondition: thoughts retained during the session"
     );
     let _ = live.shutdown().await;
@@ -473,7 +473,10 @@ async fn thoughts_never_persist_across_restart_or_replay() {
         fresh.last_turn_usage, usage,
         "ctx segment is seeded from the persisted thread usage"
     );
-    assert_eq!(fresh.last_turn_thoughts, None, "thoughts are session-only");
+    assert_eq!(
+        fresh.chats[0].last_thoughts, None,
+        "thoughts are session-only"
+    );
 
     let flat = render_grid(&mut fresh).join("\n");
     assert!(
@@ -494,7 +497,7 @@ async fn thoughts_never_persist_across_restart_or_replay() {
         .expect("terminal Result present");
     fresh.apply_backend_event(replay);
     assert_eq!(
-        fresh.last_turn_thoughts, None,
+        fresh.chats[0].last_thoughts, None,
         "replay must not resurrect thoughts"
     );
     assert_eq!(

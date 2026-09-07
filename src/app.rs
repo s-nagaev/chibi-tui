@@ -442,6 +442,16 @@ pub struct Chat {
     /// model and hidden `/model <n>` switches both refresh it. `None` for
     /// fresh chats and for snapshots recorded before the field existed.
     pub last_model: Option<String>,
+    /// This thread's own latest reasoning trace, rendered as the dim block
+    /// above the chat's last assistant message. Written ONLY by a visible
+    /// terminal result of THIS chat that carries thoughts — hidden
+    /// model-picker exchanges and fieldless command results never touch it —
+    /// and cleared when a new visible request starts in THIS chat only. The
+    /// renderer reads the ACTIVE chat's field, so a background reply lands
+    /// in its own chat and the view can never show another thread's
+    /// reasoning. Session-only: never persisted (reasoning is heavy and the
+    /// contract keeps the block restart-fresh).
+    pub last_thoughts: Option<String>,
     /// tui_subagents_b5: live subagent progress for THIS thread, keyed by
     /// the numeric protocol request id → (active, total). Populated from
     /// mid-turn `agent_event` frames via [`Chat::apply_subagent_event`]
@@ -465,6 +475,7 @@ impl Chat {
             unread: false,
             last_usage: None,
             last_model: None,
+            last_thoughts: None,
             subagent_counts: HashMap::new(),
         }
     }
@@ -683,16 +694,17 @@ pub struct App {
     /// keep the previous readout alive. The ctx segment is empty only while
     /// no usage has arrived this session AND the initially selected chat's
     /// snapshot carried no persisted usage (startup restore seeds this field
-    /// from [`Chat::last_usage`]). Thoughts keep the per-turn
-    /// contract: every terminal result replaces them and a new request start
-    /// clears them.
+    /// from [`Chat::last_usage`]). The reasoning trace is NOT mirrored here:
+    /// it lives per chat on [`Chat::last_thoughts`] and the renderer reads
+    /// the active chat's own value, so no cross-thread routing exists to
+    /// break.
     pub last_turn_usage: Option<Usage>,
-    pub last_turn_thoughts: Option<String>,
     /// tui_thoughts_b1: session-only visibility of the dim reasoning block
-    /// rendered above the latest answer from [`Self::last_turn_thoughts`].
-    /// Default ON; ^S flips it. Pure VIEW state like [`Focus`] and the
-    /// status strip — never a [`Mode`], never persisted, and flipping it
-    /// never touches the retained thoughts (render-only switch).
+    /// rendered above the latest answer from the active chat's
+    /// [`Chat::last_thoughts`]. Default ON; ^S flips it. Pure VIEW state like
+    /// [`Focus`] and the status strip — never a [`Mode`], never persisted,
+    /// and flipping it never touches the retained thoughts (render-only
+    /// switch).
     pub thoughts_visible: bool,
 }
 
@@ -814,7 +826,6 @@ impl App {
             clone_submission: None,
             pending_clone: None,
             last_turn_usage,
-            last_turn_thoughts: None,
             thoughts_visible: true,
         }
     }
@@ -838,8 +849,10 @@ impl App {
     /// chat being entered, and re-seeds the sticky ctx segment from the
     /// entered chat's last-known usage — the status readout always follows
     /// the thread being entered (neutral when it has none), never the one
-    /// left behind. Every selection mutation (arrows, ^N, search jump,
-    /// delete/clone ack, restore activation) goes through here.
+    /// left behind. The reasoning block needs no re-seed: the renderer reads
+    /// the entered chat's own [`Chat::last_thoughts`], so the view follows
+    /// the thread by construction. Every selection mutation (arrows, ^N,
+    /// search jump, delete/clone ack, restore activation) goes through here.
     fn select_chat(&mut self, index: usize) {
         self.active = index.min(self.chats.len().saturating_sub(1));
         if let Some(chat) = self.chats.get_mut(self.active) {
@@ -901,8 +914,8 @@ impl App {
     /// tui_thoughts_b1: toggle the dim reasoning block above the latest
     /// answer with ^S. Render-only session view state (default ON): nothing
     /// is cleared, the flip just changes whether the renderer draws the
-    /// [`Self::last_turn_thoughts`] block; the retained reasoning itself is
-    /// untouched and still lives only in memory.
+    /// active chat's [`Chat::last_thoughts`] block; the retained reasoning
+    /// itself is untouched and still lives only in memory.
     pub fn toggle_thoughts(&mut self) {
         self.thoughts_visible = !self.thoughts_visible;
     }
@@ -2124,8 +2137,10 @@ impl App {
     /// loop needs it for background chats) and swaps the queued marker in
     /// place rather than appending a duplicate user bubble.
     pub fn begin_request(&mut self, submitted: &Submitted) {
-        self.last_turn_thoughts = None;
         if let Some(chat) = self.chats.get_mut(self.active) {
+            // A new VISIBLE request starts in THIS chat: its previous turn's
+            // reasoning leaves the view. Other chats' thoughts are untouched.
+            chat.last_thoughts = None;
             chat.messages.push(Message::user(submitted.prompt.clone()));
             chat.messages.push(Message::assistant_pending());
             chat.lifecycle = ChatLifecycle::Awaiting {
@@ -2155,9 +2170,11 @@ impl App {
     /// Note: unlike [`App::begin_request`] this works on ANY chat — the event
     /// loop uses it after terminal events, including for background chats.
     pub fn dequeue_next_for(&mut self, thread_id: &str) -> Option<Submitted> {
-        self.last_turn_thoughts = None;
         let chat = self.chats.iter_mut().find(|c| c.id == thread_id)?;
         let prompt = chat.queue.pop_front()?;
+        // A dequeued prompt is a VISIBLE request start for THIS chat only:
+        // its previous reasoning leaves the view, other chats keep theirs.
+        chat.last_thoughts = None;
         let submitted = Submitted {
             request_id: crate::history::new_request_id(),
             thread_id: chat.id.clone(),
@@ -2629,24 +2646,32 @@ impl App {
                 ..
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
-                    // Wave-2: retain the latest-turn protocol metadata before
-                    // any resolution path runs (hidden exchanges included).
-                    // Usage is sticky last-known: a frame without usage
-                    // (command results, hidden exchanges) must not wipe the
-                    // previous value. Thoughts are replaced every frame.
-                    // The owning chat mirrors the usage so the thread
-                    // snapshot persisted right after this event carries it.
-                    if let Some(u) = usage {
-                        self.chats[chat_index].last_usage = Some(u);
-                        self.last_turn_usage = Some(u);
-                    }
-                    self.last_turn_thoughts = thoughts;
                     // feat_model_picker_lite: a terminal result whose tracked
                     // id is a hidden exchange is suppressed from the
                     // transcript and resolved into the picker/toast state
                     // instead. The lifecycle still returns to Idle so the
                     // busy rules (and the FIFO drain) keep working.
                     let purpose = self.hidden_requests.remove(&tracked_request_id);
+                    // Wave-2: retain the latest-turn protocol metadata before
+                    // any resolution path runs. Usage is sticky last-known: a
+                    // frame without usage (command results, hidden exchanges)
+                    // must not wipe the previous value. The owning chat
+                    // mirrors the usage so the thread snapshot persisted
+                    // right after this event carries it.
+                    if let Some(u) = usage {
+                        self.chats[chat_index].last_usage = Some(u);
+                        self.last_turn_usage = Some(u);
+                    }
+                    // Thoughts are sticky per chat: only a VISIBLE result
+                    // carrying reasoning replaces the owning chat's trace —
+                    // hidden exchanges (model picker) and fieldless frames
+                    // (command results) never touch it, so the block survives
+                    // the plumbing between two LLM answers.
+                    if purpose.is_none() {
+                        if let Some(t) = thoughts {
+                            self.chats[chat_index].last_thoughts = Some(t);
+                        }
+                    }
                     self.chats[chat_index].lifecycle = ChatLifecycle::Idle;
                     match purpose {
                         Some(HiddenPurpose::FetchListing) => {
@@ -3157,36 +3182,7 @@ mod tests {
             model: None,
         });
         assert_eq!(app.last_turn_usage, Some(sample_usage()));
-        assert_eq!(app.last_turn_thoughts.as_deref(), Some("thinking..."));
-    }
-
-    #[test]
-    fn fieldless_result_keeps_usage_and_drops_thoughts() {
-        let mut app = app_with_chats(1);
-        let submitted = submit_text(&mut app, "hello");
-        app.apply_backend_event(BackendEvent::Result {
-            usage: Some(sample_usage()),
-            thoughts: Some("thinking...".into()),
-            request_id: event_id_of(&submitted.request_id),
-            markdown: "answer".into(),
-            thread_id: submitted.thread_id,
-            model: None,
-        });
-        let submitted = submit_text(&mut app, "again");
-        app.apply_backend_event(BackendEvent::Result {
-            usage: None,
-            thoughts: None,
-            request_id: event_id_of(&submitted.request_id),
-            markdown: "answer 2".into(),
-            thread_id: submitted.thread_id,
-            model: None,
-        });
-        assert_eq!(
-            app.last_turn_usage,
-            Some(sample_usage()),
-            "usage is sticky last-known: a usage-less frame must not wipe it"
-        );
-        assert_eq!(app.last_turn_thoughts, None, "thoughts stay per-turn");
+        assert_eq!(app.chats[0].last_thoughts.as_deref(), Some("thinking..."));
     }
 
     #[test]
@@ -3208,7 +3204,10 @@ mod tests {
             Some(sample_usage()),
             "usage survives a new request start"
         );
-        assert_eq!(app.last_turn_thoughts, None, "cleared on new request start");
+        assert_eq!(
+            app.chats[0].last_thoughts, None,
+            "cleared on new request start"
+        );
     }
 
     #[test]
@@ -3239,7 +3238,144 @@ mod tests {
             Some(sample_usage()),
             "usage survives a dequeued request start"
         );
-        assert_eq!(app.last_turn_thoughts, None, "cleared on dequeued start");
+        assert_eq!(
+            app.chats[0].last_thoughts, None,
+            "cleared on dequeued start"
+        );
+    }
+
+    // ---- thoughts_per_chat: sticky per-thread reasoning -------------------
+
+    /// Deliver a terminal Result carrying reasoning to a chat's tracked
+    /// request (the full thoughts payload a real LLM turn brings).
+    fn finish_turn_with_thoughts(app: &mut App, index: usize, thoughts: &str) {
+        app.select_chat(index);
+        let submitted = submit_text(app, "turn prompt");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: Some(thoughts.to_owned()),
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "answer".into(),
+            thread_id: submitted.thread_id,
+            model: None,
+        });
+    }
+
+    /// A result frame routed to a BACKGROUND chat lands in that chat's own
+    /// reasoning mirror only — the chat the user is reading keeps its own
+    /// (stale) state, and no global field exists for a background reply to
+    /// pollute.
+    #[test]
+    fn background_result_routes_thoughts_to_the_owning_chat() {
+        let mut app = app_with_chats(2);
+        finish_turn_with_thoughts(&mut app, 0, "alpha reasoning");
+
+        app.select_next();
+        let background = submit_text(&mut app, "background question");
+        app.select_prev();
+        app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: Some("beta reasoning".into()),
+            request_id: event_id_of(&background.request_id),
+            markdown: "beta answer".into(),
+            thread_id: background.thread_id,
+            model: None,
+        });
+
+        assert_eq!(
+            app.chats[1].last_thoughts.as_deref(),
+            Some("beta reasoning"),
+            "the owning chat mirrors its own reasoning"
+        );
+        assert_eq!(
+            app.chats[0].last_thoughts.as_deref(),
+            Some("alpha reasoning"),
+            "the viewed chat must not show a background chat's thoughts"
+        );
+    }
+
+    /// A visible request start clears THIS chat's reasoning only — another
+    /// chat mid-turn (or holding its last trace) is untouched.
+    #[test]
+    fn new_visible_request_clears_only_the_owning_chats_thoughts() {
+        let mut app = app_with_chats(2);
+        finish_turn_with_thoughts(&mut app, 0, "alpha reasoning");
+        finish_turn_with_thoughts(&mut app, 1, "beta reasoning");
+
+        app.select_chat(0);
+        submit_text(&mut app, "second question");
+
+        assert_eq!(
+            app.chats[0].last_thoughts, None,
+            "a new request start clears the requesting chat's thoughts"
+        );
+        assert_eq!(
+            app.chats[1].last_thoughts.as_deref(),
+            Some("beta reasoning"),
+            "other chats' thoughts are not the requester's business"
+        );
+    }
+
+    /// A dequeued prompt is a visible request start for ITS chat only.
+    #[test]
+    fn dequeued_prompt_clears_only_that_chats_thoughts() {
+        let mut app = app_with_chats(2);
+        finish_turn_with_thoughts(&mut app, 0, "alpha reasoning");
+
+        app.select_chat(1);
+        let first = submit_text(&mut app, "first");
+        type_in(&mut app, "queued behind it");
+        assert!(app.take_input().is_none(), "busy chat enqueues");
+        app.select_prev();
+        app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: Some("beta reasoning".into()),
+            request_id: event_id_of(&first.request_id),
+            markdown: "beta answer".into(),
+            thread_id: first.thread_id,
+            model: None,
+        });
+
+        let background_thread = app.chats[1].id.clone();
+        let drained = app
+            .dequeue_next_for(&background_thread)
+            .expect("queued prompt drained");
+        assert_eq!(drained.prompt, "queued behind it");
+        assert_eq!(
+            app.chats[1].last_thoughts, None,
+            "the dequeued start clears that chat's thoughts"
+        );
+        assert_eq!(
+            app.chats[0].last_thoughts.as_deref(),
+            Some("alpha reasoning"),
+            "the other chat keeps its trace"
+        );
+    }
+
+    /// A hidden exchange (model-picker listing) resolves through the same
+    /// request pipeline but must not touch the chat's sticky thoughts — not
+    /// even when the frame hypothetically carries a thoughts field.
+    #[test]
+    fn hidden_exchange_never_touches_sticky_thoughts() {
+        let mut app = app_with_chats(1);
+        finish_turn_with_thoughts(&mut app, 0, "alpha reasoning");
+
+        app.begin_model_picker();
+        let bundle = app.take_picker_submission().expect("fetch staged");
+        app.apply_backend_event(BackendEvent::Result {
+            usage: None,
+            thoughts: Some("picker reasoning leak".into()),
+            request_id: event_id_of(&bundle.request_id),
+            markdown: "1. glm-5.2\n2. kimi-k2.7".into(),
+            thread_id: bundle.thread_id,
+            model: None,
+        });
+
+        assert_eq!(
+            app.chats[0].last_thoughts.as_deref(),
+            Some("alpha reasoning"),
+            "a hidden exchange must never touch the visible thoughts"
+        );
     }
 
     // ---- sticky last-known display state (ctx + model) --------------------
@@ -4237,11 +4373,11 @@ mod tests {
     fn thoughts_toggle_defaults_on_and_round_trips() {
         let mut app = app_with_chats(1);
         assert!(app.thoughts_visible, "thoughts must start visible (ON)");
-        app.last_turn_thoughts = Some("step by step".into());
+        app.chats[0].last_thoughts = Some("step by step".into());
         app.toggle_thoughts();
         assert!(!app.thoughts_visible);
         assert_eq!(
-            app.last_turn_thoughts.as_deref(),
+            app.chats[0].last_thoughts.as_deref(),
             Some("step by step"),
             "toggle is render-only: thoughts must survive it"
         );

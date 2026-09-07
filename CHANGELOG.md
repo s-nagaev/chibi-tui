@@ -124,6 +124,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keep their roles, and reconnect respawns the same new command.
 
 ### Fixed
+- Thoughts now belong to their thread: the dim reasoning block above the
+  latest answer was a single app-global field that ANY chat's terminal frame
+  wrote and ANY request start wiped, so a hidden model-picker exchange (or a
+  background reply) erased the trace the user was reading, and switching
+  threads leaked one chat's reasoning into another's view. The trace now
+  lives per chat, is written only by a visible result of the owning chat
+  that actually carries reasoning, is cleared only when a new visible
+  request starts in THAT chat, and the renderer reads the active chat's own
+  value — switching threads shows the entered chat's trace, never a
+  neighbor's. Still session-only: nothing is persisted and a restart starts
+  every thread without traces. Ctrl+S gained visible feedback: a `^S on/off`
+  state token joined the status hints row (to pay for it the self-evident
+  `⇧↵` newline hint retired and `^⇧F all` compacted to `^⇧F`; README
+  documents both, and the F1 modal lists everything).
 - Model-switch backfill: changing the model in the chat (`Ctrl+M`) re-labeled
   every past answer with the newly selected model, and the restore-time
   header fallback did the same for unlabeled history. Per-answer labels are

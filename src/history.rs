@@ -128,6 +128,10 @@ impl From<StoredChat> for Chat {
             unread: false,
             last_usage: stored.last_usage,
             last_model: stored.last_model,
+            // The reasoning trace is session-only view state: a restored
+            // thread never carries thoughts, whatever it reasoned about
+            // before the restart.
+            last_thoughts: None,
             // tui_subagents_b5: live subagent counters are session-only —
             // a restart starts every thread with an empty counter map.
             subagent_counts: std::collections::HashMap::new(),
@@ -298,6 +302,34 @@ mod tests {
         chat.messages.push(Message::user("question"));
         chat.messages.push(Message::assistant("**answer**"));
         chat
+    }
+
+    /// The reasoning trace is session-only view state: a snapshot of a chat
+    /// holding thoughts carries neither the trace text nor any thoughts key,
+    /// and a fresh session loads with none.
+    #[test]
+    fn chat_thoughts_never_reach_storage() {
+        let root = temp_root("thoughts-storage");
+        let mut chat = sample_chat("thinker");
+        chat.last_thoughts = Some("very private reasoning".into());
+
+        let path = save_chat_in(Some(&root), &chat).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read snapshot");
+        assert!(
+            !raw.contains("very private reasoning"),
+            "the trace text must not reach the snapshot: {raw}"
+        );
+        assert!(
+            !raw.contains("thoughts"),
+            "no thoughts key may exist in the format: {raw}"
+        );
+
+        let loaded = load_chats_from(Some(&root));
+        assert_eq!(loaded.len(), 1, "round trip preserves the thread");
+        assert_eq!(
+            loaded[0].last_thoughts, None,
+            "a restored thread never carries thoughts"
+        );
     }
 
     #[test]

@@ -86,8 +86,8 @@ session-scoped). Fix the README when touching those areas.
   message carrying a label). A result resolution stamps the label onto the
   new message; a Ctrl+M picker confirmation stages the override (and
   stamps `last_model`) immediately. A new request (or a dequeue) keeps ctx
-  and model but clears thoughts; on restart both restore from the
-  snapshot's optional `last_usage` / `last_model` keys (no backfill —
+  and model but clears THAT chat's thoughts; on restart both restore from
+  the snapshot's optional `last_usage` / `last_model` keys (no backfill —
   older snapshots stay omitted.
 - **Thread activation is the sole selection/activation seam.** Every path
   that selects a thread must go through the same seam (`select_chat`, or
@@ -107,9 +107,16 @@ session-scoped). Fix the README when touching those areas.
   at the handshake; the protocol version stays `1`. Unknown fields inside
   known frames are ignored; unknown frame kinds are tolerated and traced
   to the diag log.
-- **Thoughts are session-only view state.** The dim reasoning block above
-  the latest answer is toggled with Ctrl+S, never persisted, and a 64 KB
-  truncation marker arrives pre-truncated from the backend.
+- **Thoughts are per-chat, session-only view state.** The dim reasoning
+  block lives on the chat that produced it (`Chat::last_thoughts`): a
+  VISIBLE result of the owning chat carrying thoughts is the only writer,
+  hidden model-picker exchanges and fieldless command frames never touch
+  it, a new visible request start clears only that chat's block, and the
+  renderer reads the ACTIVE chat's field — a background reply can never
+  leak its reasoning into the viewed chat. Toggled with Ctrl+S (a `^S
+  on/off` token on the status hints row mirrors the state), never
+  persisted, and a 64 KB truncation marker arrives pre-truncated from the
+  backend.
 - **Storage.** Platform data dir via `dirs::data_dir()`: on Linux
   `$XDG_DATA_HOME/chibi-tui` when set, else `~/.local/share/chibi-tui`;
   `~/Library/Application Support/chibi-tui` (macOS); `%APPDATA%\chibi-tui`

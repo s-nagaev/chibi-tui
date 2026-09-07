@@ -385,12 +385,17 @@ open/close and never captures keys.
 
 When the backend's `result` frame carries the optional `thoughts` field (the
 model's raw reasoning trace), chibi-tui renders it as a dim block ABOVE the
-latest answer. The block is static text: it appears together with the
-answer, there is no streaming. Traces longer than 64 KB arrive already
-truncated by the backend, with a visible
+latest answer of the chat that produced it. The block is static text: it
+appears together with the answer, there is no streaming. Traces longer than
+64 KB arrive already truncated by the backend, with a visible
 `[... LLM reasoning truncated: 64 KB limit reached ...]` marker at the end.
 
-`Ctrl+S` toggles the block for the session, on by default. Flipping the
+The trace belongs to its thread: a background reply updates its own chat
+only, hidden model-picker exchanges and command answers never wipe it, and
+switching threads shows the entered chat's own trace — never another chat's.
+A new request in a chat clears that chat's block until its next answer.
+`Ctrl+S` toggles the block for the session, on by default; the status hints
+row carries a `^S on/off` token so the state is always visible. Flipping the
 toggle never discards anything, and reasoning is never saved to the history
 file: a restart restores messages only, without traces. Answers without
 reasoning, whitespace-only traces, or the toggle off render exactly as they

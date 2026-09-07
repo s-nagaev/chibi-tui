@@ -352,7 +352,8 @@ fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::
 const THOUGHTS_DISPLAY_LINES: usize = 10;
 
 /// tui_thoughts_b1: the dim reasoning block rendered ABOVE the latest
-/// assistant answer, sourced from the session-only `App::last_turn_thoughts`.
+/// assistant answer, sourced from the active chat's session-only
+/// `Chat::last_thoughts`.
 ///
 /// Static plain text (no streaming, no markdown interpretation, no
 /// interactivity, no scrolling UI): every line paints in the [`Theme::dim`]
@@ -435,7 +436,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         .rposition(|m| m.role == Role::Assistant);
     let thoughts = app
         .thoughts_visible
-        .then_some(app.last_turn_thoughts.as_deref())
+        .then_some(chat.last_thoughts.as_deref())
         .flatten()
         .map(str::trim)
         .filter(|t| !t.is_empty());
@@ -910,6 +911,17 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // base 82 → 81, 86 with the clone token, so the `log*` worst case
     // (86 + 7 marker + 2 separator + 24 longest label = 119 ≤ 120) still
     // holds. ^C cancel is never dropped.
+    // thoughts_per_chat: a `^S on/off` state token joins the row — the
+    // reasoning toggle's visible feedback AND its hint in one compact
+    // readout (the F1 modal spells the action out; both states render, so
+    // the line answers "will the block show?" at a glance). To pay the +9
+    // cols the self-evident `⇧↵` newline hint retired (Shift+Enter is the
+    // universal chat-app newline convention, README-documented) and
+    // `^⇧F all` compacted to `^⇧F` (the shifted find next to `^F` reads as
+    // the global search; README documents it). Net width change: base 72,
+    // so the `log*` worst case (77 hints+clone, + 9 thoughts token off, + 7
+    // marker + 2 separator + 24 longest label = 119 ≤ 120) still holds.
+    // ^C cancel is never dropped.
     let spans = if let Some((message, _)) = &app.status_message {
         // Transient status toast (busy-delete refusal): replaces the hint
         // block while visible. Short message + connection label always fit
@@ -921,7 +933,7 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ]
     } else {
         let mut spans = vec![Span::styled(
-            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T \u{00b7} ^O \u{00b7} F1 help",
+            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} ^D \u{00b7} ^F \u{00b7} ^\u{21e7}F \u{00b7} ^T \u{00b7} ^O \u{00b7} F1 help",
             Style::new().fg(theme.selection),
         )];
         // feat_thread_clone: the clone chord is advertised only when the
@@ -931,6 +943,20 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             spans.push(Span::styled(
                 " \u{00b7} ^P",
                 Style::new().fg(theme.selection),
+            ));
+        }
+        // thoughts_per_chat: the reasoning toggle's state — the visible
+        // Ctrl+S feedback and the row's ^S hint in one token. Both states
+        // render (the line answers "will the block show?" at a glance); dim
+        // like the log* readout it sits next to. Hidden while a modal owns
+        // the keyboard, same transient-state rule as log*.
+        if app.mode.is_normal() {
+            spans.push(Span::styled(
+                format!(
+                    " \u{00b7} ^S {}",
+                    if app.thoughts_visible { "on" } else { "off" }
+                ),
+                Style::new().fg(theme.dim),
             ));
         }
         // feat_stderr_log_modal: subtle dim `log*` token when unseen
@@ -3059,8 +3085,8 @@ mod tests {
             "chip must not repeat on later rows: {second_row:?}"
         );
 
-        // Exactly ONE chip glyph sequence anywhere in the frame (hints bar
-        // uses ⇧↵, never ⏎ send).
+        // Exactly ONE chip glyph sequence anywhere in the frame (the hints
+        // bar spells no send chip at all).
         let total: usize = rows.iter().map(|r| r.matches("⏎ send").count()).sum();
         assert_eq!(total, 1, "chip must appear exactly once per frame");
     }
@@ -3695,18 +3721,14 @@ mod tests {
         assert_eq!(hint_end, 119, "hint not flush with the panel edge");
     }
 
-    /// Status hints line lists the thread tools AND the multi-line hint;
-    /// `^C cancel` stays readable next to the longest connection label.
-    /// feat_ctrl_arrows_nav: `^↑↓ chats` documents Ctrl-arrow thread
-    /// switching; the plain-arrow caret hint it carried was later retired
-    /// (feat_hotkey_help_modal: plain arrows moving the caret is the
-    /// universal editor convention, and the F1 modal is the full reference).
-    /// feat_thread_delete: `^D del` joined, later compacted to bare `^D`
-    /// (feat_status_line: the confirm popup is self-explanatory).
-    /// feat_focus_panes: `^T panel` documents the pane-focus toggle, later
-    /// compacted to bare `^T` (same reason); the rename token compacted to
-    /// bare `^R` (compact `^N`/`⇧↵`/`^R` tokens per the fit budget; README
-    /// documents the full names).
+    /// Status hints line lists the thread tools AND the thoughts state
+    /// token; `^C cancel` stays readable next to the longest connection
+    /// label. thoughts_per_chat: `^S on/off` joined (the reasoning toggle's
+    /// visible feedback + hint); to pay for it the self-evident `⇧↵`
+    /// newline hint retired and `^⇧F all` compacted to `^⇧F` (Shift+Enter
+    /// is the universal chat-app newline convention and the shifted find
+    /// next to `^F` reads as the global search — README documents both, and
+    /// the F1 modal is the full on-screen reference).
     #[test]
     fn status_line_lists_rename_and_newline_hints() {
         let mut app = App::new(mock::initial_chats());
@@ -3715,7 +3737,6 @@ mod tests {
 
         for needle in [
             "^R",
-            "\u{21e7}\u{21b5}",
             "^C cancel",
             "^/\u{2325}\u{2191}\u{2193} chats",
             "F1 help",
@@ -3723,6 +3744,7 @@ mod tests {
             "^F",
             "^T",
             "^O",
+            "^S on",
         ] {
             assert!(last.contains(needle), "{needle} missing from {last:?}");
         }
@@ -3733,6 +3755,14 @@ mod tests {
         assert!(
             !last.contains("caret"),
             "retired caret hint must be gone: {last:?}"
+        );
+        assert!(
+            !last.contains("\u{21e7}\u{21b5}"),
+            "retired newline hint must be gone: {last:?}"
+        );
+        assert!(
+            !last.contains("^S off"),
+            "default state must read on: {last:?}"
         );
     }
 
@@ -3993,7 +4023,7 @@ mod tests {
         let mut app = App::new(vec![Chat::new("t")]);
         app.chats[0].messages.push(Message::user("question"));
         app.chats[0].messages.push(Message::assistant("the answer"));
-        app.last_turn_thoughts = Some("reasoning trace line".into());
+        app.chats[0].last_thoughts = Some("reasoning trace line".into());
 
         let (rows, buf) = render_grid_with_buffer(&mut app);
         let thought_row = rows
@@ -4030,26 +4060,31 @@ mod tests {
 
     /// Absent or whitespace-only thoughts render NOTHING: the transcript is
     /// byte-identical to the no-thoughts baseline (zero layout impact), and
-    /// toggle OFF reproduces that baseline even with thoughts retained.
+    /// toggle OFF reproduces that baseline even with thoughts retained. The
+    /// STATUS line is excluded from the comparison: the `^S on/off` state
+    /// token legitimately tracks the toggle there.
     #[test]
     fn thoughts_block_absent_or_blank_renders_nothing() {
         let mut app = App::new(vec![Chat::new("t")]);
         app.chats[0].messages.push(Message::assistant("answer"));
 
-        assert_eq!(app.last_turn_thoughts, None);
-        let baseline = render_grid(&mut app).join("\n");
+        assert_eq!(app.chats[0].last_thoughts, None);
+        let baseline = render_grid(&mut app);
+        let baseline = baseline[..baseline.len() - 1].join("\n");
         assert!(baseline.contains("answer"));
 
-        app.last_turn_thoughts = Some("  \n  ".into());
-        let blank = render_grid(&mut app).join("\n");
+        app.chats[0].last_thoughts = Some("  \n  ".into());
+        let blank = render_grid(&mut app);
+        let blank = blank[..blank.len() - 1].join("\n");
         assert_eq!(
             blank, baseline,
             "whitespace-only thoughts must not change the transcript"
         );
 
         app.toggle_thoughts();
-        app.last_turn_thoughts = Some("reasoning trace line".into());
-        let hidden = render_grid(&mut app).join("\n");
+        app.chats[0].last_thoughts = Some("reasoning trace line".into());
+        let hidden = render_grid(&mut app);
+        let hidden = hidden[..hidden.len() - 1].join("\n");
         assert_eq!(
             hidden, baseline,
             "toggle OFF must reproduce the no-thoughts layout exactly"
@@ -4062,7 +4097,7 @@ mod tests {
     fn thoughts_block_caps_last_ten_lines_with_ellipsis_head() {
         let mut app = App::new(vec![Chat::new("t")]);
         app.chats[0].messages.push(Message::assistant("answer"));
-        app.last_turn_thoughts = Some(
+        app.chats[0].last_thoughts = Some(
             (1..=15)
                 .map(|i| format!("thought line {i:02}"))
                 .collect::<Vec<_>>()
@@ -4090,7 +4125,7 @@ mod tests {
         );
 
         // Exactly 10 lines: everything visible, no marker.
-        app.last_turn_thoughts = Some(
+        app.chats[0].last_thoughts = Some(
             (1..=10)
                 .map(|i| format!("thought line {i:02}"))
                 .collect::<Vec<_>>()
@@ -4101,6 +4136,79 @@ mod tests {
         assert!(
             !flat.contains("\u{2026}thought line 01"),
             "no marker when untruncated"
+        );
+    }
+
+    /// Each chat renders its OWN reasoning: switching threads swaps the
+    /// block to the entered chat's trace and never leaks the other chat's
+    /// reasoning into the view (the renderer reads the active chat's
+    /// `Chat::last_thoughts` directly).
+    #[test]
+    fn thoughts_follow_the_active_chat_across_thread_switches() {
+        let mut app = App::new(vec![Chat::new("alpha"), Chat::new("beta")]);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("alpha answer"));
+        app.chats[1]
+            .messages
+            .push(Message::assistant("beta answer"));
+        app.chats[0].last_thoughts = Some("alpha reasoning line".into());
+        app.chats[1].last_thoughts = Some("beta reasoning line".into());
+
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.contains("alpha reasoning line"),
+            "the active chat's own trace renders: {flat:?}"
+        );
+        assert!(
+            !flat.contains("beta reasoning line"),
+            "another chat's reasoning must not leak into the view"
+        );
+
+        app.select_next();
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.contains("beta reasoning line"),
+            "switching threads shows the entered chat's trace"
+        );
+        assert!(
+            !flat.contains("alpha reasoning line"),
+            "the chat left behind must not bleed into the new view"
+        );
+
+        app.select_prev();
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.contains("alpha reasoning line"),
+            "switching back restores the chat's own sticky trace"
+        );
+        assert!(!flat.contains("beta reasoning line"));
+    }
+
+    /// feat_thoughts_indicator: the status line carries the toggle state —
+    /// `^S on` by default, `^S off` after the toggle — so Ctrl+S always has
+    /// visible feedback (the chord doubles as the row's hint; the F1 modal
+    /// spells the action out).
+    #[test]
+    fn status_line_shows_the_thoughts_toggle_state() {
+        let mut app = App::new(vec![Chat::new("t")]);
+
+        let last = render_grid(&mut app).last().unwrap().clone();
+        assert!(
+            last.contains("^S on"),
+            "default state must show on the status line: {last:?}"
+        );
+        assert!(!last.contains("^S off"));
+
+        app.toggle_thoughts();
+        let last = render_grid(&mut app).last().unwrap().clone();
+        assert!(
+            last.contains("^S off"),
+            "the toggle must flip the status indicator: {last:?}"
+        );
+        assert!(
+            !last.contains("^S on"),
+            "the stale state must not linger next to the new one: {last:?}"
         );
     }
 
@@ -4619,8 +4727,8 @@ mod tests {
         let last = render_grid(&mut app).last().unwrap().clone();
 
         assert!(
-            last.contains("^\u{21e7}F all"),
-            "^⇧F all missing from hints: {last:?}"
+            last.contains("^\u{21e7}F"),
+            "^⇧F missing from hints: {last:?}"
         );
         assert!(last.contains("^F"), "^F missing: {last:?}");
         assert!(
