@@ -1,4 +1,4 @@
-//! Backend process lifecycle for `chibi ide --stdio` (protocol v1).
+//! Backend process lifecycle for `chibi stdio --tui` (protocol v1).
 //!
 //! [`BackendClient`] owns the child process: it spawns the backend binary,
 //! pipes JSONL frames over stdin/stdout, performs the mandatory
@@ -119,7 +119,7 @@ impl std::fmt::Display for ExitStatusDisplay {
     }
 }
 
-/// Owns the `chibi ide --stdio` child process and its JSONL pipes.
+/// Owns the `chibi stdio --tui` child process and its JSONL pipes.
 ///
 /// Construct via [`BackendClient::spawn`], then call
 /// [`BackendClient::handshake`] before session traffic; end with
@@ -134,7 +134,7 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
-    /// Spawn `chibi ide --stdio --workspace <root>` with piped stdio/stderr.
+    /// Spawn `chibi stdio --tui --workspace <root>` with piped stdio/stderr.
     ///
     /// `workspace_root` is stored for later `request` frames; this task only
     /// carries it. Stderr is drained by a background task so a chatty backend
@@ -554,13 +554,13 @@ impl Ready {
     }
 }
 
-/// Production spawn argv: `<program> ide --stdio --workspace <root>`, where
+/// Production spawn argv: `<program> stdio --tui --workspace <root>`, where
 /// `<program>` comes from `CHIBI_BACKEND_BIN` (fallback `"chibi"`).
 fn default_argv() -> Vec<std::ffi::OsString> {
     vec![
         backend_program().into(),
-        "ide".into(),
-        "--stdio".into(),
+        "stdio".into(),
+        "--tui".into(),
         "--workspace".into(),
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -579,6 +579,15 @@ mod tests {
 
     // --- spawn ---------------------------------------------------------------
 
+    #[test]
+    fn default_argv_launches_chibi_stdio_tui_with_workspace() {
+        let argv = default_argv();
+        assert_eq!(argv.len(), 5, "unexpected default argv shape: {argv:?}");
+        assert_eq!(argv[1], std::ffi::OsString::from("stdio"));
+        assert_eq!(argv[2], std::ffi::OsString::from("--tui"));
+        assert_eq!(argv[3], std::ffi::OsString::from("--workspace"));
+    }
+
     #[tokio::test]
     async fn spawn_starts_process_with_pipes() {
         let mut client = BackendClient::spawn_script("read line")
@@ -594,8 +603,8 @@ mod tests {
             ".",
             &[
                 "/nonexistent/chibi-binary-xyz".into(),
-                "ide".into(),
-                "--stdio".into(),
+                "stdio".into(),
+                "--tui".into(),
             ],
         )
         .await;

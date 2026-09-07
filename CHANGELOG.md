@@ -101,6 +101,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   output) render exactly as before, `[tui]` lifecycle events stay dim, and
   the `CHIBI_TUI_LOG` file mirror stays plain text with no ANSI codes.
 
+### Changed
+- Backend launch command: live mode now spawns the backend as
+  `chibi stdio --tui` instead of `chibi ide --stdio` (the backend removed the
+  `ide` subcommand). The JSONL protocol v1 handshake, capability exchange and
+  the in-frame workspace root are unchanged; the `CHIBI_FAKE_BACKEND` (test
+  seam) and `CHIBI_BACKEND_BIN` (setup-screen hint gate) environment variables
+  keep their roles, and reconnect respawns the same new command.
+
 ### Fixed
 - Sticky last-known display state: the `ctx` usage segment no longer loses
   its value. It used to be wiped at every request start and overwritten by

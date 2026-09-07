@@ -135,7 +135,7 @@ def ready_frame():
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fake chibi ide --stdio backend.")
+    parser = argparse.ArgumentParser(description="Fake chibi stdio --tui backend.")
     parser.add_argument("--workspace", default=".", help="accepted for parity, ignored")
     parser.add_argument(
         "--garbage-on-start",

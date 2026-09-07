@@ -35,7 +35,7 @@ use crate::backend_client::BackendError;
 use crate::protocol::{AgentEventKind, ServerMessage, StatusState};
 use crate::request_pipeline::{PipelineResult, RequestArgs, RequestPipeline};
 
-/// Real backend: one child process (`chibi ide --stdio`-compatible JSONL
+/// Real backend: one child process (`chibi stdio --tui`-compatible JSONL
 /// peer) plus per-request glue tasks.
 ///
 /// `Clone` gives the event loop cheap owned handles for spawned tasks

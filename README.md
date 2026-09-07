@@ -18,7 +18,7 @@ More screenshots: [spinner](docs/02_spinner.png) ·
 ## Requirements
 
 - A terminal with 24-bit color support.
-- The `chibi` binary in `PATH` (the TUI spawns it as `chibi ide --stdio`).
+- The `chibi` binary in `PATH` (the TUI spawns it as `chibi stdio --tui`).
 - For building: a Rust toolchain (edition 2021).
 
 ## Installation
@@ -60,9 +60,10 @@ backend (Python, installable from PyPI) and talks IDE protocol v1 over stdio:
 pip install chibi
 ```
 
-The default transport spawns `chibi ide --stdio --workspace <root>` (root =
-your `--workspace` value, the current directory by default). To point the TUI
-at a custom backend executable instead of the `chibi` found on `PATH`, set
+The default transport spawns `chibi stdio --tui`; the workspace root travels
+inside each request frame (your `--workspace` value, the current directory by
+default), never on the backend command line. To point the TUI at a custom
+backend executable instead of the `chibi` found on `PATH`, set
 `CHIBI_BACKEND_BIN=/path/to/backend`.
 
 ### Build from source
@@ -76,7 +77,7 @@ cargo build --release
 ## Usage
 
 ```bash
-chibi-tui --workspace /path/to/project   # live mode: talks to `chibi ide --stdio`
+chibi-tui --workspace /path/to/project   # live mode: talks to `chibi stdio --tui`
 chibi-tui --mock                         # demo mode: static mocks, no backend needed
 ```
 

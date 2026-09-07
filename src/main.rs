@@ -2,7 +2,7 @@
 //!
 //! Backend selection:
 //! * default — [`chibi_tui::LiveBackend`]: spawns the real JSONL peer
-//!   (`chibi ide --stdio`-compatible), handshakes, streams real answers;
+//!   (`chibi stdio --tui`-compatible), handshakes, streams real answers;
 //!   chats persist under the platform data dir (`<data>/chibi-tui/threads/`)
 //!   and are restored on startup.
 //! * `--mock` — [`chibi_tui::backend::MockBackend`] with pre-filled demo

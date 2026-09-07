@@ -1,4 +1,4 @@
-//! Serde types for Chibi IDE protocol v1 (`chibi ide --stdio`, JSONL frames).
+//! Serde types for Chibi IDE protocol v1 (`chibi stdio --tui`, JSONL frames).
 //!
 //! One JSON object per line; every message carries a string `type` tag
 //! (serde internally-tagged enums, matching the canonical fixtures).

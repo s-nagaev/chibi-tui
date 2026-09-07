@@ -297,9 +297,7 @@ impl RequestPipeline {
             std::env::var("CHIBI_FAKE_BACKEND").unwrap_or_else(|_| "chibi".to_owned());
 
         let mut argv: Vec<std::ffi::OsString> = if script_path == "chibi" {
-            // Real backend: chibi ide --stdio (no extra CLI flags: workspace_root
-            // travels inside request frames, not on the command line).
-            vec!["chibi".into(), "ide".into(), "--stdio".into()]
+            real_backend_argv()
         } else {
             // Fake backend (tests): python3 tests/fake_backend.py --workspace <root>
             vec![
@@ -579,6 +577,13 @@ async fn handle_shutdown(state: &mut ActorState) -> Result<(), BackendError> {
     }
 }
 
+/// Real-backend spawn argv: `chibi stdio --tui`, nothing else — the workspace
+/// root travels inside request frames, never on the command line. Shared by
+/// the initial spawn and reconnect so the two never diverge.
+fn real_backend_argv() -> Vec<std::ffi::OsString> {
+    vec!["chibi".into(), "stdio".into(), "--tui".into()]
+}
+
 /// `Command::Reconnect`: tear down whatever is left, respawn + re-handshake a
 /// fresh backend, replace pipes, start a new reader.
 async fn handle_reconnect(
@@ -593,7 +598,7 @@ async fn handle_reconnect(
 
     let argv: Vec<std::ffi::OsString> = if config.script_path == "chibi" {
         // Reconnect to real backend: same argv as initial spawn (no --workspace).
-        vec!["chibi".into(), "ide".into(), "--stdio".into()]
+        real_backend_argv()
     } else {
         // Reconnect to fake backend: python3 <script> --workspace <root>.
         vec![
@@ -775,6 +780,21 @@ fn spawn_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real-backend spawn command line is exactly `chibi stdio --tui`:
+    /// both the initial spawn and a reconnect build their argv from
+    /// [`real_backend_argv`], so one exact-argv assertion pins both paths.
+    #[test]
+    fn real_backend_spawn_argv_is_exactly_chibi_stdio_tui() {
+        assert_eq!(
+            real_backend_argv(),
+            vec![
+                std::ffi::OsString::from("chibi"),
+                std::ffi::OsString::from("stdio"),
+                std::ffi::OsString::from("--tui"),
+            ]
+        );
+    }
 
     /// Reader hardening: a frame with an unknown `type` tag must not vanish
     /// silently — a `[tui]` diagnostics line names the tag, and the reader

@@ -4,7 +4,7 @@
 
 `chibi-tui` is a Rust terminal UI client for [Chibi](https://github.com/s-nagaev/chibi) —
 an AI assistant. It is a pure client: it spawns the Python backend as
-`chibi ide --stdio` and talks IDE protocol v1 (JSONL over stdio); the
+`chibi stdio --tui` and talks IDE protocol v1 (JSONL over stdio); the
 workspace root travels inside each request frame
 (`ClientMessage::Request.workspace_root`), never on the backend command
 line. Stack: ratatui + crossterm + tokio, MIT.
@@ -27,7 +27,7 @@ cargo build --release                          # binary at target/release/chibi-
 - Live run: `cargo run -- --workspace <dir>` (optional, defaults to the
   process cwd) — `--workspace` is the TUI's own flag, its value only sent
   to the backend inside request frames; the spawned command is plain
-  `chibi ide --stdio`. Backend-binary seam: the pipeline spawns
+  `chibi stdio --tui`. Backend-binary seam: the pipeline spawns
   `CHIBI_FAKE_BACKEND` if set, else `chibi` from `$PATH` — do not confuse
   it with `CHIBI_BACKEND_BIN`, which only gates the setup screen's
   override hint. Demo run: `cargo run -- --mock` (no backend process;

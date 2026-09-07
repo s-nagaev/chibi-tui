@@ -3,8 +3,8 @@
 //! The picker popup has NO protocol support — it reuses the plain chat
 //! pipeline: a bare `/model` request answers with a line-per-model listing in
 //! `result.content`, and `/model <n>` answers with a one-line confirmation.
-//! Both formats are captured from the REAL backend (`chibi ide --stdio`,
-//! 2026-08-28) and committed as the parser's test fixture
+//! Both formats are captured from the REAL backend (2026-08-28) and committed
+//! as the parser's test fixture
 //! (`tests/fixtures/model_listing_captured.txt`):
 //!
 //! ```text
