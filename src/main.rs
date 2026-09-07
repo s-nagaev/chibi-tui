@@ -256,6 +256,28 @@ async fn connect_live(
     }
 }
 
+/// Consume the one-shot ^L wipe intent (bugfix_ctrl_l_screen_clear) and emit
+/// the real terminal wipe. Generic over the backend so tests can drive the
+/// consume-emit step with a recording backend instead of a live terminal.
+///
+/// Returns whether an intent was pending. When it was, `Terminal::clear()`
+/// emits the backend's full clear — OUTSIDE ratatui's diff-based draw — and
+/// also resets ratatui's cached back buffer, so the immediately-following
+/// draw repaints every cell and nothing stale lingers. `App::request_clear_
+/// screen` already snapped the chat view to follow-bottom before this fires.
+fn perform_screen_wipe_if_requested<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut chibi_tui::app::App,
+    theme: &theme::Theme,
+) -> std::io::Result<bool> {
+    if !app.take_clear_screen_request() {
+        return Ok(false);
+    }
+    terminal.clear()?;
+    terminal.draw(|f| ui::draw(f, app, theme))?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     terminal: &mut Tui,
@@ -484,17 +506,17 @@ async fn run_loop(
                             }
 
                             // bugfix_ctrl_l_screen_clear: ^L wipes the VISIBLE
-                            // screen. Crossterm's Clear(All) is emitted HERE,
-                            // outside ratatui's diff-based draw; Terminal::
-                            // clear() also resets ratatui's cached back buffer,
-                            // so the immediately-following draw repaints every
-                            // cell and nothing stale lingers. App::request_
-                            // clear_screen already snapped the chat view to
-                            // follow-bottom before this fires.
-                            if app.take_clear_screen_request() {
-                                terminal.clear()?;
-                                terminal.draw(|f| ui::draw(f, &mut app, theme))?;
-                            }
+                            // screen. The consume-emit step lives in
+                            // perform_screen_wipe_if_requested (unit-tested
+                            // against a recording backend): the backend clear
+                            // is emitted HERE, outside ratatui's diff-based
+                            // draw; Terminal::clear() also resets ratatui's
+                            // cached back buffer, so the immediately-following
+                            // draw repaints every cell and nothing stale
+                            // lingers. App::request_clear_screen already
+                            // snapped the chat view to follow-bottom before
+                            // this fires.
+                            perform_screen_wipe_if_requested(terminal, &mut app, theme)?;
                         }
                     }
                     Some(Ok(CtEvent::Resize(_, _))) => {
@@ -1686,7 +1708,170 @@ mod tests {
         assert!(!app.clear_screen_requested, "Esc must not request a wipe");
     }
 
-    // ---- should_submit -------------------------------------------------------
+    // ---- ^L wipe consumer (perform_screen_wipe_if_requested) ----------------
+    //
+    // The handler-side intent (press → request_clear_screen) is pinned above;
+    // these tests pin the OTHER half of the lifecycle: the event-loop consumer
+    // that turns the one-shot intent into a real backend clear + full repaint,
+    // OUTSIDE ratatui's diff-based draw.
+
+    /// Recording backend: counts the commands ratatui issues to the terminal
+    /// layer without touching a real terminal. `clear()` is the hook ratatui's
+    /// `Terminal::clear()` drives for a full wipe; `cell_writes` counts every
+    /// cell update pushed through `draw`, which makes a diff-based partial
+    /// repaint distinguishable from a full-frame repaint (a cold draw and a
+    /// post-wipe draw both diff against a reset back buffer, so both push the
+    /// same full-frame count).
+    struct WipeProbeBackend {
+        area: ratatui::layout::Size,
+        cell_writes: usize,
+        clear_all: usize,
+        flushes: usize,
+    }
+
+    impl WipeProbeBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                area: ratatui::layout::Size::new(width, height),
+                cell_writes: 0,
+                clear_all: 0,
+                flushes: 0,
+            }
+        }
+    }
+
+    impl ratatui::backend::Backend for WipeProbeBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.cell_writes += content.count();
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            Ok(ratatui::layout::Position::ORIGIN)
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            _position: P,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.clear_all += 1;
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            Ok(self.area)
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            Ok(ratatui::backend::WindowSize {
+                columns_rows: self.area,
+                pixels: ratatui::layout::Size::ZERO,
+            })
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    fn wipe_probe_terminal(width: u16, height: u16) -> Terminal<WipeProbeBackend> {
+        Terminal::new(WipeProbeBackend::new(width, height)).expect("probe terminal")
+    }
+
+    #[test]
+    fn screen_wipe_consumes_intent_emits_clear_and_full_repaint_exactly_once() {
+        let theme = theme::Theme::tokyo_night();
+        let mut app = app_with_chats(1);
+        let mut terminal = wipe_probe_terminal(80, 24);
+        terminal
+            .draw(|f| ui::draw(f, &mut app, &theme))
+            .expect("initial frame");
+        let (base_clears, base_writes, base_flushes) = {
+            let b = terminal.backend();
+            (b.clear_all, b.cell_writes, b.flushes)
+        };
+        // The cold first draw diffs against a reset back buffer, so it pushes
+        // the entire frame — the exact count a post-wipe draw must match.
+        let frame_writes = base_writes;
+
+        app.request_clear_screen();
+        let wiped =
+            perform_screen_wipe_if_requested(&mut terminal, &mut app, &theme).expect("wipe call");
+        assert!(wiped, "pending wipe intent consumed by the loop-side unit");
+        {
+            let b = terminal.backend();
+            assert_eq!(
+                b.clear_all - base_clears,
+                1,
+                "exactly one backend clear per wipe, never zero, never two"
+            );
+            assert_eq!(
+                b.cell_writes - base_writes,
+                frame_writes,
+                "post-clear draw repaints the FULL frame (diff against the \
+                 reset back buffer), not a partial diff"
+            );
+            assert!(b.flushes > base_flushes, "frame actually flushed");
+        }
+
+        // One-shot: the next unrelated cycle consumes nothing and emits nothing.
+        let (clears, writes, flushes) = {
+            let b = terminal.backend();
+            (b.clear_all, b.cell_writes, b.flushes)
+        };
+        let again =
+            perform_screen_wipe_if_requested(&mut terminal, &mut app, &theme).expect("re-call");
+        assert!(!again, "intent is one-shot: no sticky re-clear");
+        {
+            let b = terminal.backend();
+            assert_eq!(b.clear_all, clears, "no Clear(All) spam after the wipe");
+            assert_eq!(b.cell_writes, writes, "no stray cell writes");
+            assert_eq!(b.flushes, flushes);
+        }
+    }
+
+    #[test]
+    fn screen_wipe_without_pending_intent_never_touches_the_terminal() {
+        let theme = theme::Theme::tokyo_night();
+        let mut app = app_with_chats(1);
+        let mut terminal = wipe_probe_terminal(80, 24);
+        terminal
+            .draw(|f| ui::draw(f, &mut app, &theme))
+            .expect("initial frame");
+        let (clears, writes, flushes) = {
+            let b = terminal.backend();
+            (b.clear_all, b.cell_writes, b.flushes)
+        };
+
+        let wiped =
+            perform_screen_wipe_if_requested(&mut terminal, &mut app, &theme).expect("no-op");
+        assert!(!wiped, "no intent -> no wipe");
+        let b = terminal.backend();
+        assert_eq!(
+            b.clear_all, clears,
+            "Clear(All) is emitted ONLY on the ^L intent, never routinely"
+        );
+        assert_eq!(b.cell_writes, writes);
+        assert_eq!(b.flushes, flushes);
+    }
+
+    // ---- should_submit -------------------------------------------------------    // ---- should_submit -------------------------------------------------------
 
     #[test]
     fn should_submit_enter_returns_true() {
