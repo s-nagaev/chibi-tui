@@ -94,6 +94,41 @@ impl LiveBackend {
     pub async fn shutdown(&self) -> Result<(), BackendError> {
         self.pipeline.shutdown().await
     }
+
+    /// Forward out-of-band continuation answers into the shared UI event
+    /// channel for the lifetime of this connection.
+    ///
+    /// `message` frames are session-scoped (no request id), so they cannot
+    /// ride the per-request glue tasks: a continuation may arrive while NO
+    /// request is in flight, or while another chat's request is. The spawned
+    /// pump subscribes once and translates every broadcast update into a
+    /// [`BackendEvent::BackgroundMessage`]; it retires itself when the
+    /// channel closes (backend dropped / replaced by a reconnect pump).
+    pub fn pump_background_messages(&self, tx: mpsc::Sender<BackendEvent>) {
+        let mut rx = self.pipeline.subscribe_background_messages();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(update) => {
+                        let event = BackendEvent::BackgroundMessage {
+                            wire_thread_id: update.thread_id,
+                            markdown: update.content,
+                            model: resolve_model_label(
+                                update.model.as_deref(),
+                                update.provider.as_deref(),
+                            ),
+                            thoughts: update.thoughts,
+                        };
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
 }
 
 impl Backend for LiveBackend {
@@ -793,6 +828,7 @@ mod tests {
                 | BackendEvent::AgentProgress { .. }
                 | BackendEvent::QueueDrain { .. } => continue,
                 BackendEvent::Result { .. } => panic!("cancelled request must not yield Result"),
+                BackendEvent::BackgroundMessage { .. } => continue,
                 BackendEvent::Disconnected => continue,
             }
         }

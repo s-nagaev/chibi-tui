@@ -98,6 +98,20 @@ pub struct AgentEventUpdate {
     pub name: Option<String>,
 }
 
+/// Out-of-band continuation answer delivered from a `message` frame (opt-in
+/// via `capabilities.background_messages` at handshake). Session-scoped like
+/// [`AgentEventUpdate`]: it correlates to NO request — the parent request
+/// that spawned the background work ended with its own result frame, so
+/// routing happens by wire `thread_id` on the consumer side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundMessageUpdate {
+    pub thread_id: i64,
+    pub content: String,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub thoughts: Option<String>,
+}
+
 /// A fully-formed protocol request ready for
 /// [`RequestPipeline::send_request`].
 ///
@@ -268,6 +282,7 @@ pub struct RequestPipeline {
     cmd_tx: mpsc::Sender<Command>,
     status_tx: broadcast::Sender<StatusUpdate>,
     agent_tx: broadcast::Sender<AgentEventUpdate>,
+    background_tx: broadcast::Sender<BackgroundMessageUpdate>,
     /// Slash commands the backend advertised in the handshake `ready` frame
     /// (feat_thread_clone consumers). Captured once at connect; a reconnect
     /// spawns the same program, so the set stays valid for the handle's life.
@@ -317,12 +332,14 @@ impl RequestPipeline {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (status_tx, _) = broadcast::channel(status_channel_capacity.max(1));
         let (agent_tx, _) = broadcast::channel(status_channel_capacity.max(1));
+        let (background_tx, _) = broadcast::channel(status_channel_capacity.max(1));
 
         tokio::spawn(actor_loop(
             parts,
             cmd_rx,
             status_tx.clone(),
             agent_tx.clone(),
+            background_tx.clone(),
             ActorConfig {
                 workspace_root: workspace_root.display().to_string(),
                 script_path,
@@ -333,6 +350,7 @@ impl RequestPipeline {
             cmd_tx,
             status_tx,
             agent_tx,
+            background_tx,
             commands,
         })
     }
@@ -399,6 +417,15 @@ impl RequestPipeline {
         self.agent_tx.subscribe()
     }
 
+    /// Subscribe to out-of-band continuation answers (`message` frames,
+    /// emitted only for clients that declared `capabilities.background_messages`).
+    /// Same broadcast semantics as [`RequestPipeline::subscribe_status`]:
+    /// session-scoped updates that are structurally unable to touch any
+    /// request's lifecycle.
+    pub fn subscribe_background_messages(&self) -> broadcast::Receiver<BackgroundMessageUpdate> {
+        self.background_tx.subscribe()
+    }
+
     /// Respawn the backend after a broken pipe / premature exit and restore
     /// handshake state. Pending requests were already failed with
     /// [`BackendError::Broken`] at breakage time.
@@ -438,6 +465,7 @@ async fn actor_loop(
     mut cmd_rx: mpsc::Receiver<Command>,
     status_tx: broadcast::Sender<StatusUpdate>,
     agent_tx: broadcast::Sender<AgentEventUpdate>,
+    background_tx: broadcast::Sender<BackgroundMessageUpdate>,
     config: ActorConfig,
 ) {
     let mut state = ActorState {
@@ -481,7 +509,7 @@ async fn actor_loop(
             }
             event = event_rx.recv() => match event {
                 Some(ActorEvent::Frame(msg)) => {
-                    dispatch_frame(&mut state, &status_tx, &agent_tx, msg).await;
+                    dispatch_frame(&mut state, &status_tx, &agent_tx, &background_tx, msg).await;
                 }
                 Some(ActorEvent::Died(reason)) => {
                     // feat_stderr_log_modal: pipe death is a diagnostic lifecycle event too:
@@ -640,6 +668,7 @@ async fn dispatch_frame(
     state: &mut ActorState,
     status_tx: &broadcast::Sender<StatusUpdate>,
     agent_tx: &broadcast::Sender<AgentEventUpdate>,
+    background_tx: &broadcast::Sender<BackgroundMessageUpdate>,
     msg: ServerMessage,
 ) {
     match msg {
@@ -669,6 +698,24 @@ async fn dispatch_frame(
                 active,
                 total,
                 name,
+            });
+        }
+        // Out-of-band continuation answer: fan out to the background-message
+        // channel and leave every pending entry untouched — the frame carries
+        // no request id and must never resolve any request's lifecycle.
+        ServerMessage::Message {
+            thread_id,
+            content,
+            model,
+            provider,
+            thoughts,
+        } => {
+            let _ = background_tx.send(BackgroundMessageUpdate {
+                thread_id,
+                content,
+                model,
+                provider,
+                thoughts,
             });
         }
         ServerMessage::Result {
@@ -886,6 +933,7 @@ mod tests {
     async fn agent_event_dispatch_never_resolves_pending() {
         let (status_tx, _status_rx) = broadcast::channel(4);
         let (agent_tx, mut agent_rx) = broadcast::channel(4);
+        let (background_tx, _background_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
             stdin: None,
@@ -899,7 +947,7 @@ mod tests {
             r#"{"type":"agent_event","request_id":"r1","event":"started","active":2,"total":5}"#,
         )
         .expect("agent_event frame parses");
-        dispatch_frame(&mut state, &status_tx, &agent_tx, frame).await;
+        dispatch_frame(&mut state, &status_tx, &agent_tx, &background_tx, frame).await;
 
         assert!(
             state.pending.contains_key("r1"),
@@ -918,6 +966,53 @@ mod tests {
                 active: 2,
                 total: 5,
                 name: None,
+            }
+        );
+    }
+
+    /// Non-terminal lifecycle: a `message` frame (background continuation
+    /// answer) fans out to the background-message channel and must NEVER
+    /// resolve any request's pending final-outcome receiver — it carries no
+    /// request id at all.
+    #[tokio::test]
+    async fn background_message_dispatch_never_resolves_pending() {
+        let (status_tx, _status_rx) = broadcast::channel(4);
+        let (agent_tx, _agent_rx) = broadcast::channel(4);
+        let (background_tx, mut background_rx) = broadcast::channel(4);
+        let (result_tx, mut result_rx) = oneshot::channel();
+        let mut state = ActorState {
+            stdin: None,
+            reaper: None,
+            pending: HashMap::new(),
+            broken_reason: None,
+        };
+        state.pending.insert("r1".to_owned(), result_tx);
+
+        let frame: ServerMessage = serde_json::from_str(
+            r#"{"type":"message","thread_id":42,"content":"done","model":"gpt-example","provider":"openai","thoughts":"why"}"#,
+        )
+        .expect("message frame parses");
+        dispatch_frame(&mut state, &status_tx, &agent_tx, &background_tx, frame).await;
+
+        assert!(
+            state.pending.contains_key("r1"),
+            "request-less frame must not consume the pending entry"
+        );
+        assert!(
+            result_rx.try_recv().is_err(),
+            "final-outcome receiver must stay unresolved"
+        );
+        let update = background_rx
+            .try_recv()
+            .expect("background message fanned out");
+        assert_eq!(
+            update,
+            BackgroundMessageUpdate {
+                thread_id: 42,
+                content: "done".to_owned(),
+                model: Some("gpt-example".to_owned()),
+                provider: Some("openai".to_owned()),
+                thoughts: Some("why".to_owned()),
             }
         );
     }

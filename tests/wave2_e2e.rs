@@ -624,6 +624,18 @@ fn fake_backend_gates_wave2_frames_on_client_capabilities() {
 /// parsed frame in arrival order. Reading runs on a helper thread with a
 /// deadline so a protocol bug fails the test instead of hanging the suite.
 fn raw_fake_session(caps: Option<serde_json::Value>) -> Vec<serde_json::Value> {
+    raw_fake_session_with(caps, &[], None)
+}
+
+/// [`raw_fake_session`] with extra fake-backend behaviour flags (e.g.
+/// `--with-background-message`) and an optional frame kind to wait for
+/// AFTER the result (the session stays open until it arrives, so timers
+/// get their chance to fire before the shutdown).
+fn raw_fake_session_with(
+    caps: Option<serde_json::Value>,
+    extra_flags: &[&str],
+    wait_after_result: Option<&str>,
+) -> Vec<serde_json::Value> {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -633,6 +645,7 @@ fn raw_fake_session(caps: Option<serde_json::Value>) -> Vec<serde_json::Value> {
         .arg("--workspace")
         .arg(".")
         .args(["--with-usage", "--with-thoughts", "--with-subagents"])
+        .args(extra_flags)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -689,9 +702,165 @@ fn raw_fake_session(caps: Option<serde_json::Value>) -> Vec<serde_json::Value> {
     )
     .expect("request written");
     expect(&mut frames, "result");
+    if let Some(kind) = wait_after_result {
+        expect(&mut frames, kind);
+    }
 
     writeln!(stdin, r#"{{"type":"shutdown"}}"#).expect("shutdown written");
     drop(stdin);
     let _ = child.wait();
     frames
+}
+
+/// Post-subagent continuation: the background tool result comes back after
+/// the parent request's result frame, and the model's follow-up answer must
+/// render as a NEW assistant message in the owning chat (owner live test
+/// 2026-09-07: backend logs proved the answer was produced, yet it never
+/// appeared). The fake backend delivers it as an out-of-band `message`
+/// frame gated on `capabilities.background_messages`; the session pump
+/// forwards it and the chat folds it without touching the request
+/// lifecycle, sticky ctx state, or the per-chat thoughts rules.
+#[tokio::test]
+async fn background_message_frame_renders_continuation_answer() {
+    let live = connect(&["--with-background-message", "--with-thoughts"]).await;
+    let mut app = app_with_one_chat();
+    let (bg_tx, mut bg_rx) = tokio::sync::mpsc::channel(16);
+    live.pump_background_messages(bg_tx);
+
+    let submitted = submitted_for(&app, "launch 3 subagents that sleep and report back");
+    let events = submit_and_fold(&live, &mut app, submitted).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::Result { .. })),
+        "parent turn must complete normally first"
+    );
+    assert!(
+        app.chats[0].lifecycle.request_id().is_none(),
+        "parent turn must be fully resolved before the continuation"
+    );
+
+    // The continuation arrives ~0.4 s after the request, well after the
+    // parent result: the pump must still deliver it to an IDLE chat.
+    let bg = tokio::time::timeout(TIMEOUT, bg_rx.recv())
+        .await
+        .expect("continuation event in time")
+        .expect("background pump alive");
+    let (markdown, model, thoughts) = match &bg {
+        BackendEvent::BackgroundMessage {
+            markdown,
+            model,
+            thoughts,
+            ..
+        } => (markdown.clone(), model.clone(), thoughts.clone()),
+        other => panic!("expected BackgroundMessage, got {other:?}"),
+    };
+    assert_eq!(
+        markdown, "Subagents finished: all three reports are in.",
+        "continuation content passes through verbatim"
+    );
+    assert_eq!(
+        model.as_deref(),
+        Some("gpt-example"),
+        "continuation label resolves from the frame's model field"
+    );
+    let thoughts = thoughts.expect("continuation thoughts present");
+    assert!(
+        thoughts.contains("Continuation reasoning trace"),
+        "continuation reasoning arrives: {thoughts}"
+    );
+
+    let messages_before = app.chats[0].messages.len();
+    app.apply_backend_event(bg);
+
+    // A NEW assistant bubble (the parent answer stays untouched), the
+    // per-chat thoughts block replaced by the continuation's reasoning, the
+    // model label stamped, and NO lifecycle or sticky-usage side effects.
+    assert_eq!(
+        app.chats[0].messages.len(),
+        messages_before + 1,
+        "continuation must append a new message, not resolve the old bubble"
+    );
+    assert_eq!(
+        app.chats[0].messages.last().unwrap().markdown,
+        "Subagents finished: all three reports are in."
+    );
+    assert_eq!(
+        app.chats[0].last_thoughts.as_deref(),
+        Some(thoughts.as_str()),
+        "continuation reasoning writes the owning chat's thoughts block"
+    );
+    assert_eq!(app.chats[0].last_model.as_deref(), Some("gpt-example"));
+    assert_eq!(
+        app.last_turn_usage, None,
+        "no usage on the frame: ctx untouched"
+    );
+    assert_eq!(
+        app.chats[0].lifecycle.request_id(),
+        None,
+        "continuation must never resurrect a request lifecycle"
+    );
+
+    let flat = render_grid(&mut app).join("\n");
+    assert!(
+        flat.contains("Subagents finished"),
+        "continuation answer must render as a new assistant message:\n{flat}"
+    );
+    assert!(
+        flat.contains("Continuation reasoning trace"),
+        "continuation reasoning must render dim above the answer"
+    );
+
+    let _ = live.shutdown().await;
+}
+
+/// The `message` frame is opt-in: absent without
+/// `capabilities.background_messages`, delivered after the result when the
+/// capability is declared.
+#[test]
+fn background_message_frame_is_gated_on_client_capability() {
+    let off = raw_fake_session_with(
+        Some(serde_json::json!({"thoughts": true, "subagents": true})),
+        &["--with-background-message"],
+        None,
+    );
+    assert!(
+        !off.iter().any(|f| f["type"] == "message"),
+        "no message frame without capabilities.background_messages: {off:?}"
+    );
+
+    let on = raw_fake_session_with(
+        Some(serde_json::json!({
+            "thoughts": true,
+            "subagents": true,
+            "background_messages": true
+        })),
+        &["--with-background-message"],
+        Some("message"),
+    );
+    let msg = on
+        .iter()
+        .find(|f| f["type"] == "message")
+        .expect("message frame with the capability declared");
+    assert_eq!(
+        msg["thread_id"], 42,
+        "frame routes by the request's thread id"
+    );
+    assert_eq!(
+        msg["content"],
+        "Subagents finished: all three reports are in."
+    );
+    assert_eq!(msg["model"], "gpt-example");
+    assert_eq!(msg["provider"], "openai");
+    assert!(
+        msg["thoughts"].is_string(),
+        "continuation thoughts ride when thoughts are opted in"
+    );
+    // Wire order: the continuation strictly follows the parent result frame.
+    let result_pos = on.iter().position(|f| f["type"] == "result").unwrap();
+    let msg_pos = on.iter().position(|f| f["type"] == "message").unwrap();
+    assert!(
+        result_pos < msg_pos,
+        "continuation must arrive after the parent result"
+    );
 }

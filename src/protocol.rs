@@ -101,6 +101,10 @@ pub struct ClientCapabilities {
     pub thoughts: bool,
     /// Opts in to mid-turn `agent_event` frames (subagent progress).
     pub subagents: bool,
+    /// Opts in to out-of-band `message` frames: continuation answers the
+    /// backend produces after a background tool result arrives (the parent
+    /// request's lifecycle is already over, so there is no request id).
+    pub background_messages: bool,
 }
 
 /// Kind of a mid-turn `agent_event` frame: a subagent spawn began or ended
@@ -252,6 +256,24 @@ pub enum ServerMessage {
         usage: Option<Usage>,
         /// Raw LLM reasoning for the turn (wave-2, ≤64KB backend-capped);
         /// missing → `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thoughts: Option<String>,
+    },
+    /// Out-of-band continuation answer for a background tool task (opt-in via
+    /// `capabilities.background_messages` at handshake). It carries no request
+    /// id: the parent request that spawned the background work has already
+    /// ended with its own `result` frame, so this frame routes by `thread_id`
+    /// alone and must never touch any request lifecycle. `model`/`provider`
+    /// label the reply when the continuation model is known; `thoughts`
+    /// carries the continuation turn's reasoning when the backend captured
+    /// it (both optional, absent → `None`).
+    Message {
+        thread_id: i64,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thoughts: Option<String>,
     },
@@ -455,8 +477,8 @@ mod tests {
     }
 
     /// Wave-2 handshake: the client's initialize frame carries
-    /// `capabilities: {"thoughts": true, "subagents": true}` on the wire,
-    /// protocol_version 1.
+    /// `capabilities: {"thoughts": true, "subagents": true,
+    /// "background_messages": true}` on the wire, protocol_version 1.
     #[test]
     fn initialize_serializes_client_capabilities() {
         let msg = ClientMessage::Initialize {
@@ -468,6 +490,7 @@ mod tests {
             capabilities: Some(ClientCapabilities {
                 thoughts: true,
                 subagents: true,
+                background_messages: true,
             }),
         };
         let line = serde_json::to_string(&msg).expect("initialize serializes");
@@ -475,6 +498,7 @@ mod tests {
         assert_eq!(value["protocol_version"], 1);
         assert_eq!(value["capabilities"]["thoughts"], true);
         assert_eq!(value["capabilities"]["subagents"], true);
+        assert_eq!(value["capabilities"]["background_messages"], true);
 
         // Deserializing it back keeps the capabilities (round-trip sanity).
         match serde_json::from_str::<ClientMessage>(&line).expect("round-trips") {
@@ -484,11 +508,75 @@ mod tests {
                     Some(ClientCapabilities {
                         thoughts: true,
                         subagents: true,
+                        background_messages: true,
                     })
                 );
             }
             other => panic!("expected Initialize, got {other:?}"),
         }
+    }
+
+    /// The out-of-band continuation frame parses leniently: only
+    /// `thread_id` and `content` are required, optional fields default to
+    /// `None`, and serialization round-trips with `message` as the type tag.
+    #[test]
+    fn background_message_frame_parses_and_round_trips() {
+        let full = r#"{"type":"message","thread_id":7,"content":"done","model":"m","provider":"p","thoughts":"t"}"#;
+        match serde_json::from_str::<ServerMessage>(full).expect("full message frame parses") {
+            ServerMessage::Message {
+                thread_id,
+                content,
+                model,
+                provider,
+                thoughts,
+            } => {
+                assert_eq!(thread_id, 7);
+                assert_eq!(content, "done");
+                assert_eq!(model.as_deref(), Some("m"));
+                assert_eq!(provider.as_deref(), Some("p"));
+                assert_eq!(thoughts.as_deref(), Some("t"));
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+
+        let bare = r#"{"type":"message","thread_id":9,"content":"hi"}"#;
+        match serde_json::from_str::<ServerMessage>(bare).expect("bare message frame parses") {
+            ServerMessage::Message {
+                thread_id,
+                content,
+                model,
+                provider,
+                thoughts,
+            } => {
+                assert_eq!(thread_id, 9);
+                assert_eq!(content, "hi");
+                assert_eq!(model, None);
+                assert_eq!(provider, None);
+                assert_eq!(thoughts, None);
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+
+        let msg = ServerMessage::Message {
+            thread_id: 11,
+            content: "answer".into(),
+            model: None,
+            provider: Some("openai".into()),
+            thoughts: None,
+        };
+        let line = serde_json::to_string(&msg).expect("message serializes");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["thread_id"], 11);
+        assert_eq!(value["provider"], "openai");
+        assert!(
+            value.get("model").is_none(),
+            "None optionals stay off the wire"
+        );
+        assert!(
+            value.get("thoughts").is_none(),
+            "None optionals stay off the wire"
+        );
     }
 
     /// An old fixture initialize without capabilities still parses.

@@ -55,6 +55,19 @@ pub enum BackendEvent {
         message: String,
         thread_id: Option<String>,
     },
+    /// Out-of-band continuation answer from a `message` frame (opt-in via
+    /// `capabilities.background_messages`): the backend produced an answer
+    /// AFTER a background tool result arrived, when the parent request's
+    /// lifecycle is already over. Carries the WIRE thread id (i64 hash) —
+    /// the consumer maps it to the owning chat; no request id exists.
+    /// NON-terminal by construction: it must never resolve any request
+    /// lifecycle, spinner or queue state.
+    BackgroundMessage {
+        wire_thread_id: i64,
+        markdown: String,
+        model: Option<String>,
+        thoughts: Option<String>,
+    },
     /// The event source itself reported the transport link down (no
     /// particular request to blame). Flips the connection indicator; never
     /// opens the popup by itself.

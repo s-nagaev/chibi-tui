@@ -171,6 +171,13 @@ async fn main() -> io::Result<()> {
     // Single channel: backend tasks push progress events, UI consumes.
     let (event_tx, mut event_rx) = mpsc::channel::<BackendEvent>(64);
 
+    // Out-of-band continuation answers (background tool results) are
+    // session-scoped: pump them into the shared channel for the initial
+    // connection (a reconnect spawns its own pump in `connect_live`).
+    if let Source::Live(live) = &source {
+        live.pump_background_messages(event_tx.clone());
+    }
+
     let res = run_loop(
         &mut terminal,
         app,
@@ -223,6 +230,7 @@ async fn connect_live(
     source: &mut Source,
     app: &mut chibi_tui::app::App,
     workspace: &std::path::Path,
+    event_tx: mpsc::Sender<BackendEvent>,
 ) {
     if let Source::Live(old) = source {
         let _ = old.shutdown().await;
@@ -236,6 +244,9 @@ async fn connect_live(
             // reconnect too, the new session re-handshakes.
             app.set_backend_commands(live.backend_commands().to_vec());
             app.dismiss_error();
+            // Session-scoped continuation answers ride the new connection's
+            // own pump; the old pump retired with its closed channel.
+            live.pump_background_messages(event_tx);
             *source = Source::Live(live);
         }
         Err(e) => {
@@ -397,7 +408,7 @@ async fn run_loop(
                             // Popup-requested reconnect (R).
                             if let Some(ReconnectRequest {}) = app.reconnect_requested.take() {
                                 if !cli_mock_source(source) {
-                                    connect_live(source, &mut app, workspace).await;
+                                    connect_live(source, &mut app, workspace, event_tx.clone()).await;
                                 } else {
                                     // Mocks never go down; treat R as dismiss.
                                     app.dismiss_error();
@@ -502,11 +513,27 @@ async fn run_loop(
             Some(evt) = event_rx.recv() => {
                 // Per-thread async: after a chat's terminal event, start its
                 // next queued prompt (FIFO), including for background chats.
+                let background_wire_id = match &evt {
+                    BackendEvent::BackgroundMessage { wire_thread_id, .. } => Some(*wire_thread_id),
+                    _ => None,
+                };
                 let drain_thread_id = match &evt {
                     BackendEvent::QueueDrain { thread_id } => Some(thread_id.clone()),
                     _ => None,
                 };
-                if let Some(thread_id) = drain_thread_id {
+                if let Some(wire_id) = background_wire_id {
+                    app.apply_backend_event(evt);
+                    // Persist the chat the continuation belongs to (routed by
+                    // the wire thread id; the active-chat default below misses
+                    // background threads).
+                    if let Some(chat) = app
+                        .chats
+                        .iter()
+                        .find(|c| chibi_tui::live::wire_thread_id(&c.id) == wire_id)
+                    {
+                        persist_chat(chat, history_dir);
+                    }
+                } else if let Some(thread_id) = drain_thread_id {
                     if let Some(next) = app.dequeue_next_for(&thread_id) {
                         send_submitted(source, &next, event_tx.clone());
                     }

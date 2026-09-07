@@ -75,6 +75,14 @@ THOUGHTS_TRACE = "\n".join(
 
 # Usage payload riding on --with-usage result frames (deterministic values
 # chosen so the TUI's ctx segment maths is checkable in render assertions).
+# Out-of-band continuation answer (--with-background-message): the text the
+# model produces AFTER a background tool result came back, delivered on a
+# request-less message frame.
+BACKGROUND_MESSAGE_CONTENT = "Subagents finished: all three reports are in."
+BACKGROUND_MESSAGE_THOUGHTS = (
+    "Continuation reasoning trace: aggregating the background tool results."
+)
+
 USAGE_INPUT_TOKENS = 18432
 USAGE_OUTPUT_TOKENS = 512
 USAGE_CONTEXT_WINDOW = 131072
@@ -188,6 +196,13 @@ def main() -> int:
         action="store_true",
         help="emit one unknown-type frame mid-turn",
     )
+    parser.add_argument(
+        "--with-background-message",
+        action="store_true",
+        help="after the result frame, emit one out-of-band background "
+        "message frame (continuation answer) when the client opted in "
+        "via capabilities.background_messages",
+    )
     args = parser.parse_args()
     if args.usage_windowless:
         args.with_usage = True
@@ -204,6 +219,10 @@ def main() -> int:
     initialized = False
     caps_thoughts = False
     caps_subagents = False
+    caps_background_messages = False
+    # thread id of the latest request, used by the --with-background-message
+    # continuation timer (the frame carries no request id, only the thread)
+    last_request_thread = None
     # request ids believed to be in flight (result timers may still fire)
     inflight = set()
     # request ids whose result frame actually went out on the wire; the
@@ -271,8 +290,24 @@ def main() -> int:
             finish_timers.append(timer)
             timer.start()
 
+    def emit_background_message() -> None:
+        if last_request_thread is None:
+            return
+        if not caps_background_messages:
+            return
+        frame = {
+            "type": "message",
+            "thread_id": last_request_thread,
+            "content": BACKGROUND_MESSAGE_CONTENT,
+            "model": "gpt-example",
+            "provider": "openai",
+        }
+        if caps_thoughts:
+            frame["thoughts"] = BACKGROUND_MESSAGE_THOUGHTS
+        emit(frame)
+
     def handle_initialize(obj) -> None:
-        nonlocal initialized, caps_thoughts, caps_subagents
+        nonlocal initialized, caps_thoughts, caps_subagents, caps_background_messages
         version = obj.get("protocol_version")
         if version != 1:
             emit(
@@ -292,6 +327,7 @@ def main() -> int:
         caps = obj.get("capabilities") or {}
         caps_thoughts = caps.get("thoughts") is True
         caps_subagents = caps.get("subagents") is True
+        caps_background_messages = caps.get("background_messages") is True
 
         emit(ready_frame())
         if args.garbage_on_start:
@@ -299,6 +335,7 @@ def main() -> int:
         initialized = True
 
     def handle_request(obj) -> None:
+        nonlocal last_request_thread
         if not initialized:
             emit(
                 {
@@ -401,7 +438,13 @@ def main() -> int:
                     frame["name"] = name
                 emit(frame)
                 time.sleep(0.05)
+        last_request_thread = obj["thread_id"]
         schedule_result(request_id)
+        if args.with_background_message and caps_background_messages:
+            timer = threading.Timer(0.40, emit_background_message)
+            timer.daemon = True
+            finish_timers.append(timer)
+            timer.start()
         if args.late_finish and caps_subagents:
             schedule_late_finishes(request_id)
 

@@ -2492,6 +2492,8 @@ impl App {
             }
             // Not clone-related (or no lifecycle frame at all).
             BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => false,
+            // Unreachable: handled by the early return in apply_backend_event.
+            BackendEvent::BackgroundMessage { .. } => false,
         }
     }
 
@@ -2575,6 +2577,21 @@ impl App {
             return;
         }
 
+        // Out-of-band continuation answer: session-scoped, keyed by the wire
+        // thread id, never by a request. It must not pass through the
+        // request-lifecycle routing below (the parent request is long over,
+        // so the owning chat is usually Idle and would silently drop it).
+        if let BackendEvent::BackgroundMessage {
+            wire_thread_id,
+            markdown,
+            model,
+            thoughts,
+        } = event
+        {
+            self.apply_background_message(wire_thread_id, markdown, model, thoughts);
+            return;
+        }
+
         // Route to the owning chat by thread id (empty → active chat).
         let route_thread_id: Option<String> = match &event {
             BackendEvent::Queued { thread_id, .. } => Some(thread_id.clone()),
@@ -2584,6 +2601,8 @@ impl App {
             BackendEvent::Error { thread_id, .. } => thread_id.clone(),
             // Internal pump signal: handled by the event loop, never here.
             BackendEvent::QueueDrain { .. } => return,
+            // Unreachable: handled by the early return above.
+            BackendEvent::BackgroundMessage { .. } => return,
             BackendEvent::Disconnected => None,
         };
         let target = match route_thread_id {
@@ -2769,7 +2788,65 @@ impl App {
             BackendEvent::AgentProgress { .. }
             | BackendEvent::QueueDrain { .. }
             | BackendEvent::Disconnected => {}
+            // Unreachable: handled by the early return above.
+            BackendEvent::BackgroundMessage { .. } => {}
         }
+    }
+
+    /// Apply an out-of-band continuation answer (`message` frame) to the
+    /// chat that owns the wire thread id.
+    ///
+    /// The continuation is a NEW assistant message: it never resolves the
+    /// chat's pending placeholder (that belongs to whichever request, if
+    /// any, is still in flight), never touches the sticky ctx/usage state
+    /// (the frame carries no usage), and never changes the lifecycle. A
+    /// model label stamps the message AND the chat's last-known model (the
+    /// continuation really was produced by that model); reasoning writes the
+    /// chat's per-chat thoughts block like any other visible answer of the
+    /// owning chat. Empty/pure-ACK continuations are absorbed invisibly,
+    /// same as results.
+    fn apply_background_message(
+        &mut self,
+        wire_thread_id: i64,
+        markdown: String,
+        model: Option<String>,
+        thoughts: Option<String>,
+    ) {
+        let Some(chat_index) = self
+            .chats
+            .iter()
+            .position(|c| crate::live::wire_thread_id(&c.id) == wire_thread_id)
+        else {
+            return; // unknown thread: not ours
+        };
+        if is_invisible_result(&markdown) {
+            return;
+        }
+        let stamped = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned);
+        let thread_id = self.chats[chat_index].id.clone();
+        {
+            let chat = &mut self.chats[chat_index];
+            let message = match &stamped {
+                Some(label) => Message::assistant_with_model(markdown, label.clone()),
+                None => Message::assistant(markdown),
+            };
+            chat.messages.push(message);
+            // Per-chat thoughts: a visible answer of the owning chat
+            // carrying reasoning is a legitimate writer of its block.
+            if let Some(t) = thoughts {
+                chat.last_thoughts = Some(t);
+            }
+        }
+        if let Some(label) = stamped {
+            self.chats[chat_index].last_model = Some(label);
+            self.picker_model_labels.remove(&thread_id);
+        }
+        self.mark_unread_if_background(chat_index);
+        self.scroll = 0;
     }
 
     /// feat_model_picker_lite: resolve a hidden bare-`/model` result.
