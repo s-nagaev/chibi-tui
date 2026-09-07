@@ -37,6 +37,11 @@ declared in the handshake):
                          sequence (started → started → finished → finished,
                          active back to 0) when the handshake declared
                          ``capabilities.subagents``
+``--late-finish``        background-subagent variant (implies
+                         ``--with-subagents``): the two ``finished`` frames
+                         move AFTER the result frame (subagents outliving
+                         their turn), guarded on the result having actually
+                         been emitted
 ``--with-unknown-frame`` one unknown-type frame is emitted mid-turn (drives
                          the client's diag-warning path while the request
                          still completes)
@@ -173,6 +178,12 @@ def main() -> int:
         help="mid-turn agent_event sequence when the client opted in at handshake",
     )
     parser.add_argument(
+        "--late-finish",
+        action="store_true",
+        help="move the finished agent_event frames after the result frame "
+        "(implies --with-subagents)",
+    )
+    parser.add_argument(
         "--with-unknown-frame",
         action="store_true",
         help="emit one unknown-type frame mid-turn",
@@ -182,6 +193,8 @@ def main() -> int:
         args.with_usage = True
     if args.thoughts_huge:
         args.with_thoughts = True
+    if args.late_finish:
+        args.with_subagents = True
 
     thoughts_payload = ""
     if args.with_thoughts:
@@ -193,12 +206,17 @@ def main() -> int:
     caps_subagents = False
     # request ids believed to be in flight (result timers may still fire)
     inflight = set()
+    # request ids whose result frame actually went out on the wire; the
+    # --late-finish timers fire only for these (cancelled requests never
+    # get a result, so their late finishes must stay silent too)
+    results_emitted = set()
     finish_timers = []
 
     def emit_result(request_id: str) -> None:
         if request_id not in inflight:
             return  # cancelled (or crash raced): never answer twice
         inflight.discard(request_id)
+        results_emitted.add(request_id)
         result = {
             "type": "result",
             "request_id": request_id,
@@ -222,6 +240,36 @@ def main() -> int:
         timer.daemon = True
         finish_timers.append(timer)
         timer.start()
+
+    def schedule_late_finishes(request_id: str) -> None:
+        """Schedule the two finished frames strictly AFTER the result timer.
+
+        Delays guarantee wire order result → finished(1,2) → finished(0,2);
+        each timer is a no-op unless the result was actually emitted (a
+        cancelled request produces neither result nor late finishes).
+
+        Args:
+            request_id: The request whose background subagents outlive it.
+        """
+
+        def emit_late(active: int) -> None:
+            if request_id not in results_emitted:
+                return
+            emit(
+                {
+                    "type": "agent_event",
+                    "request_id": request_id,
+                    "event": "finished",
+                    "active": active,
+                    "total": 2,
+                }
+            )
+
+        for delay, active in ((0.40, 1), (0.55, 0)):
+            timer = threading.Timer(delay, emit_late, args=(active,))
+            timer.daemon = True
+            finish_timers.append(timer)
+            timer.start()
 
     def handle_initialize(obj) -> None:
         nonlocal initialized, caps_thoughts, caps_subagents
@@ -328,12 +376,20 @@ def main() -> int:
                 }
             )
         if args.with_subagents and caps_subagents:
-            for event, active, total, name in (
-                ("started", 1, 1, "scout"),
-                ("started", 2, 2, "indexer"),
-                ("finished", 1, 2, None),
-                ("finished", 0, 2, None),
-            ):
+            # --late-finish: the finishes ride post-result timers instead of
+            # the inline mid-turn sequence (background subagents outlive the
+            # turn), so the inline run emits only the two started frames.
+            events = (
+                (("started", 1, 1, "scout"), ("started", 2, 2, "indexer"))
+                if args.late_finish
+                else (
+                    ("started", 1, 1, "scout"),
+                    ("started", 2, 2, "indexer"),
+                    ("finished", 1, 2, None),
+                    ("finished", 0, 2, None),
+                )
+            )
+            for event, active, total, name in events:
                 frame = {
                     "type": "agent_event",
                     "request_id": request_id,
@@ -346,6 +402,8 @@ def main() -> int:
                 emit(frame)
                 time.sleep(0.05)
         schedule_result(request_id)
+        if args.late_finish and caps_subagents:
+            schedule_late_finishes(request_id)
 
     def handle_cancel(obj) -> None:
         request_id = obj.get("request_id")

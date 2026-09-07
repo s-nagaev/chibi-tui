@@ -17,8 +17,12 @@
 //! while the TUI needs stable, persistable identity — hashing bridges both
 //! without touching the frozen protocol types.
 //!
-//! One spawned glue task per submitted request; it terminates right after the
-//! terminal event is forwarded (the status pump is aborted, never leaked).
+//! One spawned glue task per submitted request; it terminates right after
+//! the terminal event is forwarded (the status pump is aborted, never
+//! leaked). The subagent pump outlives the terminal event on purpose:
+//! background subagents finish after the result frame, so it keeps draining
+//! until the backend retires the request's counter (zero-active `finished`)
+//! or the agent channel closes.
 
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -28,7 +32,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::app::Submitted;
 use crate::backend::{Backend, BackendEvent};
 use crate::backend_client::BackendError;
-use crate::protocol::{ServerMessage, StatusState};
+use crate::protocol::{AgentEventKind, ServerMessage, StatusState};
 use crate::request_pipeline::{PipelineResult, RequestArgs, RequestPipeline};
 
 /// Real backend: one child process (`chibi ide --stdio`-compatible JSONL
@@ -126,7 +130,11 @@ pub fn wire_thread_id(chat_uuid: &str) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Glue task for one submitted prompt: send, pump statuses, await the final
-/// outcome, deliver exactly one terminal event, stop.
+/// outcome, deliver exactly one terminal event, stop. The status pump dies
+/// with the request; the subagent pump is never aborted — it outlives the
+/// terminal event so post-result `agent_event` frames (background subagents
+/// finishing after the answer) still reach the UI, and retires itself on the
+/// backend's zero-active retirement frame or when the channel closes.
 async fn forward_one_request(
     pipeline: RequestPipeline,
     submitted: Submitted,
@@ -170,7 +178,10 @@ async fn forward_one_request(
         event_id,
         tx.clone(),
     ));
-    let agent_pump = tokio::spawn(pump_agent_events(
+    // Deliberately not aborted with the status pump: the pump owns its
+    // retirement (zero-active finished / channel close) so subagent frames
+    // that arrive after the result below still flow.
+    tokio::spawn(pump_agent_events(
         agent_rx,
         submitted.request_id.clone(),
         submitted.thread_id.clone(),
@@ -180,7 +191,6 @@ async fn forward_one_request(
 
     let event = terminal_event(result_rx.await, event_id, submitted.thread_id.clone());
     pump.abort();
-    agent_pump.abort();
 
     // Per-thread async: after THIS chat's terminal event the event loop may
     // need to start the next queued prompt of that chat. `send().await`
@@ -302,10 +312,18 @@ async fn pump_statuses(
     }
 }
 
-/// Forward mid-turn `agent_event` frames for `request_id` as UI events until
-/// aborted (same shape as [`pump_statuses`]): filter by request id, stamp the
+/// Forward mid-turn `agent_event` frames for `request_id` as UI events
+/// (same shape as [`pump_statuses`]): filter by request id, stamp the
 /// owning chat's thread id, never terminal. The frame's `name` field is
 /// parsed upstream but not carried — nothing displays it in v1.
+///
+/// Lifecycle: outlives the request's result frame so background subagents
+/// finishing after the answer still update the counter. Retirement points:
+/// the backend's zero-active `finished` for this request (its authoritative
+/// end-of-stream — the counter state is retired exactly there and no
+/// further frame for the request can follow), the agent channel closing
+/// (backend gone / shutdown), or the UI receiver dropping. Idle pumps cost
+/// one broadcast receiver each; the channel itself stays capacity-bounded.
 async fn pump_agent_events(
     mut agent_rx: broadcast::Receiver<crate::request_pipeline::AgentEventUpdate>,
     request_id: String,
@@ -328,6 +346,9 @@ async fn pump_agent_events(
                 };
                 if tx.send(event).await.is_err() {
                     return; // UI receiver dropped
+                }
+                if update.event == AgentEventKind::Finished && update.active == 0 {
+                    return; // backend retired this request's counter: end-of-stream
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => continue, // best effort

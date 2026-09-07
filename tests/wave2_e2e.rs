@@ -334,6 +334,105 @@ async fn subagent_counter_appears_on_spinner_line_and_clears_after_result() {
     let _ = live.shutdown().await;
 }
 
+/// Background subagents outliving their turn (`--late-finish`): the two
+/// `finished` frames arrive strictly AFTER the result frame and must still
+/// reach the per-chat counter through the real glue path — decrements per
+/// finish, hidden at zero — while the request lifecycle stays terminal.
+/// Folds every event as it arrives, continuing past the drain signal (what
+/// the event loop does for late frames).
+#[tokio::test]
+async fn post_result_subagent_finishes_update_the_counter() {
+    let live = connect(&["--late-finish"]).await;
+    let mut app = app_with_one_chat();
+    let submitted = submitted_for(&app, "background helpers");
+    app.begin_request(&submitted);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    live.submit_encoded(submitted, tx);
+
+    let mut tags: Vec<String> = Vec::new();
+    let mut finished_count = 0usize;
+    let mut drained = false;
+    while !drained || finished_count < 2 {
+        let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+            .await
+            .expect("event in time")
+            .expect("channel alive");
+        match evt.clone() {
+            BackendEvent::Queued { .. } => tags.push("queued".into()),
+            BackendEvent::Running { .. } => tags.push("running".into()),
+            BackendEvent::AgentProgress {
+                event: AgentEventKind::Started,
+                active,
+                ..
+            } => {
+                tags.push("started".into());
+                app.apply_backend_event(evt);
+                let line = spinner_line(&mut app);
+                assert!(
+                    line.contains(&format!("subagents working: {active}")),
+                    "started frames surface the live counter ({active}): {line}"
+                );
+            }
+            BackendEvent::AgentProgress {
+                event: AgentEventKind::Finished,
+                active,
+                ..
+            } => {
+                finished_count += 1;
+                tags.push(format!("finished:{active}"));
+                app.apply_backend_event(evt);
+                let line = spinner_line(&mut app);
+                if active == 1 {
+                    assert!(
+                        line.contains("subagents working: 1"),
+                        "counter must decrement on the post-result finish: {line}"
+                    );
+                } else {
+                    assert!(
+                        !line.contains("subagents"),
+                        "counter must hide at zero after the last post-result finish: {line}"
+                    );
+                    assert_eq!(
+                        app.active_chat_subagents(),
+                        None,
+                        "zero-active finish removes the counter entry"
+                    );
+                }
+            }
+            BackendEvent::Result { markdown, .. } => {
+                tags.push("result".into());
+                app.apply_backend_event(evt);
+                assert_eq!(markdown, ANSWER, "request completes with its answer");
+            }
+            BackendEvent::QueueDrain { .. } => {
+                tags.push("drain".into());
+                drained = true;
+            }
+            other => app.apply_backend_event(other),
+        }
+    }
+
+    // The finishes are genuinely post-result: strictly after the terminal
+    // frame AND after the per-thread drain signal.
+    assert_eq!(
+        tags,
+        [
+            "queued",
+            "running",
+            "started",
+            "started",
+            "result",
+            "drain",
+            "finished:1",
+            "finished:0"
+        ],
+        "late finished frames must flow in wire order after the result"
+    );
+    assert!(matches!(app.chats[0].lifecycle, ChatLifecycle::Idle));
+
+    let _ = live.shutdown().await;
+}
+
 /// Thoughts are session-only: a full live turn with reasoning, saved and
 /// reloaded as a fresh session (restart), shows the answer but never the
 /// reasoning — and replaying the same result frame into the fresh app
