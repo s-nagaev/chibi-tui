@@ -44,7 +44,7 @@ use crate::request_pipeline::{PipelineResult, RequestArgs, RequestPipeline};
 #[derive(Clone)]
 pub struct LiveBackend {
     pipeline: RequestPipeline,
-    /// Slash commands the backend advertised at handshake (feat_thread_clone
+    /// Slash commands the backend advertised at handshake (clone
     /// feature gate). Copied out of the pipeline handle because a
     /// reconnect respawns the same program and keeps the set valid.
     commands: Vec<String>,
@@ -285,7 +285,7 @@ fn terminal_event(
     }
 }
 
-/// feat_agent_model_label: pick the display label from a `result` frame.
+/// pick the display label from a `result` frame.
 ///
 /// The backend sends `model`/`provider` when it knows them. If both are
 /// present, `model` wins (short display name); a `provider`-only frame still
@@ -468,7 +468,7 @@ mod tests {
         }
     }
 
-    // ---- feat_agent_model_label: result-frame model label -----------------
+    // result-frame model label -----------------
 
     /// Both fields present → the short `model` display name wins.
     #[test]
@@ -687,7 +687,7 @@ mod tests {
         let _ = live.shutdown().await;
     }
 
-    /// feat_agent_model_label fallback, end-to-end: a backend variant that
+    /// Model-label fallback, end-to-end: a backend variant that
     /// omits `model`/`provider` on the result frame must yield `None` on the
     /// terminal event — the UI then keeps the plain `● Chibi` header.
     #[tokio::test]
@@ -836,7 +836,7 @@ mod tests {
         let _ = live.shutdown().await;
     }
 
-    // ---- feat_thread_clone: command round trip on the fake peer ------------
+    // command round trip on the fake peer ------------
 
     /// The clone command rides ON the destination thread: the fake peer
     /// echoes the received frame inside the ack, so this asserts the wire

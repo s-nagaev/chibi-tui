@@ -1,4 +1,4 @@
-//! Integration tests for the request pipeline (task 3b) against the
+//! Integration tests for the request pipeline against the
 //! deterministic fake backend (`tests/fake_backend.py`).
 //!
 //! Every await step is wrapped in a generous timeout so a protocol deadlock
@@ -322,7 +322,7 @@ async fn status_channel_is_broadcast_not_oneshot() {
     pipeline.shutdown().await.unwrap();
 }
 
-// ---- feat_agent_model_label: fieldless result frame -----------------------
+// fieldless result frame -----------------------
 
 /// A backend variant that omits the optional `model`/`provider` fields on
 /// the result frame (old backend / fallback) must parse leniently into

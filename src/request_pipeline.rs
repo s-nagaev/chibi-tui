@@ -1,6 +1,6 @@
-//! Request pipeline for the real backend client (task 3b).
+//! Request pipeline for the real backend client.
 //!
-//! Sits on top of [`crate::backend_client`] (task 3a) and adds what 3a
+//! Sits on top of [`crate::backend_client`] and adds what it
 //! deliberately left out:
 //!
 //! * **Correlation** — every [`ClientMessage::Request`] gets a
@@ -284,7 +284,7 @@ pub struct RequestPipeline {
     agent_tx: broadcast::Sender<AgentEventUpdate>,
     background_tx: broadcast::Sender<BackgroundMessageUpdate>,
     /// Slash commands the backend advertised in the handshake `ready` frame
-    /// (feat_thread_clone consumers). Captured once at connect; a reconnect
+    ///. Captured once at connect; a reconnect
     /// spawns the same program, so the set stays valid for the handle's life.
     commands: Vec<String>,
 }
@@ -512,7 +512,7 @@ async fn actor_loop(
                     dispatch_frame(&mut state, &status_tx, &agent_tx, &background_tx, msg).await;
                 }
                 Some(ActorEvent::Died(reason)) => {
-                    // feat_stderr_log_modal: pipe death is a diagnostic lifecycle event too:
+                    // pipe death is a diagnostic lifecycle event too:
                     // one unified stream with stderr.
                     diag::append_tui(format!("pipe closed: {reason}"));
                     state.broken_pipe(reason);

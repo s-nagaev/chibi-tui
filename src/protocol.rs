@@ -159,7 +159,7 @@ pub enum ClientMessage {
         protocol_version: ProtocolVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client: Option<ClientInfo>,
-        /// Wave-2 feature flags ({"thoughts": true, "subagents": true}). Old
+        /// Feature flags ({"thoughts": true, "subagents": true}). Old
         /// backends tolerate unknown handshake fields; a missing field
         /// parses as `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,10 +251,10 @@ pub enum ServerMessage {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
-        /// Token accounting for the turn (wave-2); missing → `None`.
+        /// Token accounting for the turn; missing → `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
-        /// Raw LLM reasoning for the turn (wave-2, ≤64KB backend-capped);
+        /// Raw LLM reasoning for the turn (≤64KB backend-capped);
         /// missing → `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thoughts: Option<String>,
@@ -320,7 +320,7 @@ pub enum ErrorCode {
 mod tests {
     use super::*;
 
-    /// feat_thread_clone: the frontend-facing codes the real backend emits
+    /// the frontend-facing codes the real backend emits
     /// for slash-command failures must parse, or the reader drops the frame
     /// and the request never terminates.
     #[test]
@@ -359,7 +359,7 @@ mod tests {
         }
     }
 
-    /// Wave-2 result frame: every field present parses with exact values.
+    /// Result frame: every field present parses with exact values.
     #[test]
     fn result_usage_thoughts_full_parse() {
         let frame = r#"{
@@ -369,7 +369,7 @@ mod tests {
             "usage": {"input_tokens": 120, "output_tokens": 45, "context_window": 200000},
             "thoughts": "step by step..."
         }"#;
-        match serde_json::from_str::<ServerMessage>(frame).expect("full wave-2 result parses") {
+        match serde_json::from_str::<ServerMessage>(frame).expect("full result parses") {
             ServerMessage::Result {
                 usage, thoughts, ..
             } => {
@@ -387,7 +387,7 @@ mod tests {
         }
     }
 
-    /// Wave-2 result frame: partial shapes. `context_window` may be null and
+    /// Result frame: partial shapes. `context_window` may be null and
     /// `thoughts` may be present without `usage` (and vice versa).
     #[test]
     fn result_usage_thoughts_partial_parse() {
@@ -431,12 +431,12 @@ mod tests {
         }
     }
 
-    /// Wave-2 result frame: absent usage/thoughts keep parsing (old backend).
+    /// Result frame: absent usage/thoughts keep parsing (old backend).
     #[test]
     fn result_usage_thoughts_absent_parse() {
         let frame =
             r#"{"type":"result","request_id":"r1","content":"a","model":"m","provider":"p"}"#;
-        match serde_json::from_str::<ServerMessage>(frame).expect("absent wave-2 fields parse") {
+        match serde_json::from_str::<ServerMessage>(frame).expect("absent fields parse") {
             ServerMessage::Result {
                 usage, thoughts, ..
             } => {
@@ -447,7 +447,7 @@ mod tests {
         }
     }
 
-    /// Wave-2 result frame: unknown extra fields are ignored.
+    /// Result frame: unknown extra fields are ignored.
     #[test]
     fn result_extra_unknown_fields_ignored() {
         let frame = r#"{
@@ -476,7 +476,7 @@ mod tests {
         }
     }
 
-    /// Wave-2 handshake: the client's initialize frame carries
+    /// Handshake: the client's initialize frame carries
     /// `capabilities: {"thoughts": true, "subagents": true,
     /// "background_messages": true}` on the wire, protocol_version 1.
     #[test]

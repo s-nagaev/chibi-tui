@@ -1,4 +1,4 @@
-//! Diagnostics log (feat_stderr_log_modal): one unified, in-memory diagnostic
+//! Diagnostics log: one unified, in-memory diagnostic
 //! stream built from two sources:
 //!
 //! * the backend's **stderr** — pumped line by line by

@@ -296,7 +296,7 @@ fn status_state_serializes_to_lowercase_tags() {
     assert_eq!(StatusState::Queued.to_string(), "queued");
 }
 
-// ---- feat_agent_model_label: optional model/provider on result frames -----
+// optional model/provider on result frames -----
 
 /// Backward compatibility at the type level: a `result` frame WITHOUT the
 /// optional `model`/`provider` keys (old backend, fieldless variant) parses

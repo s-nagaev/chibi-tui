@@ -27,7 +27,7 @@ pub enum Connection {
     Disconnected,
 }
 
-/// One search hit inside a message's rendered text (feat_search_thread).
+/// One search hit inside a message's rendered text.
 ///
 /// `message_index` addresses [`App::chats`] active chat's `messages`;
 /// `line_index` is the 0-based index of the RENDERED markdown line (as
@@ -47,7 +47,7 @@ pub struct SearchMatch {
     pub col: usize,
 }
 
-/// State of the open in-thread search popup (feat_search_thread).
+/// State of the open in-thread search popup.
 ///
 /// Lives in [`Mode::Searching`] — deliberately OUT of the chat mutation
 /// paths: `query` is the popup's own single-line buffer, `matches` the
@@ -62,7 +62,7 @@ pub struct SearchState {
     pub matches: Vec<SearchMatch>,
 }
 
-/// One search hit across ALL threads (feat_search_all_threads).
+/// One search hit across ALL threads.
 ///
 /// Extends [`SearchMatch`] with the owning chat: `chat_index` addresses
 /// [`App::chats`] and `chat_title` is the thread-title snapshot shown as
@@ -86,7 +86,7 @@ pub struct GlobalSearchMatch {
     pub col: usize,
 }
 
-/// State of the open ALL-threads search popup (feat_search_all_threads).
+/// State of the open ALL-threads search popup.
 ///
 /// Lives in [`Mode::SearchingAll`] — the same shape as [`SearchState`], but
 /// `matches` spans every chat, so each entry carries its own
@@ -101,8 +101,8 @@ pub struct GlobalSearchState {
     pub matches: Vec<GlobalSearchMatch>,
 }
 
-/// State of the open diagnostics-log viewer modal (feat_stderr_log_modal,
-/// interaction core rebuilt by feat_log_viewer_core).
+/// State of the open diagnostics-log viewer modal (its interaction
+/// core shared with the renderer).
 ///
 /// Read position management is deliberately simple, snapshot-copy based:
 /// the modal holds a COPY of the ring buffer taken at the last refresh, so
@@ -132,7 +132,7 @@ pub struct LogViewerState {
     /// here so a pinned view scrolls minimally instead of re-anchoring on
     /// every frame). Rows, not logical lines: wrap changes the grid.
     pub row_offset: usize,
-    /// Buffer of the open `/` search prompt (feat_log_viewer_search_copy).
+    /// Buffer of the open `/` search prompt.
     /// `None` while the prompt is closed; while it holds a value the prompt
     /// owns the keyboard completely (Enter commits, Esc cancels).
     pub search_buf: Option<String>,
@@ -148,7 +148,7 @@ pub struct LogViewerState {
     pub copy_note_at: Option<std::time::Instant>,
 }
 
-/// One committed log-viewer search (feat_log_viewer_search_copy).
+/// One committed log-viewer search.
 ///
 /// `matches` holds LOGICAL line indices, so navigation stays correct in both
 /// wrap modes: the cursor jumps whole lines, never rows. One entry per line
@@ -282,7 +282,7 @@ pub fn wrapped_row_count(line: &str, width: usize) -> usize {
     wrap_line(line, width).len()
 }
 
-/// Phase of the open model-picker popup (feat_model_picker_lite).
+/// Phase of the open model-picker popup.
 ///
 /// The popup opens IMMEDIATELY on ^M (modal isolation is active from the
 /// first keystroke) while the `/model` listing request travels the normal
@@ -297,7 +297,7 @@ pub enum ModelPickerPhase {
     Ready,
 }
 
-/// State of the open model-picker popup (feat_model_picker_lite).
+/// State of the open model-picker popup.
 ///
 /// Same modal-family shape as the search popups: the popup owns its own
 /// state, the chat draft is untouched, and there is no text input here —
@@ -312,7 +312,7 @@ pub struct ModelPickerState {
     pub selected: usize,
 }
 
-/// State of the open keybindings help modal (feat_hotkey_help_modal).
+/// State of the open keybindings help modal.
 ///
 /// The content is static — the renderer reads `ui::HOTKEY_ROWS` directly —
 /// so the only per-open state is the scroll offset of the row window, fed
@@ -340,48 +340,48 @@ pub enum Mode {
     /// The ACTIVE chat's title is being edited inline. `buf` holds the raw
     /// untrimmed draft; commit applies trimming and rejects empty results.
     Renaming { buf: String },
-    /// The Ctrl+D delete-confirmation popup is open for the ACTIVE chat
-    /// (feat_thread_delete). Enter/`y` confirm, Esc/`n` cancel; every other
+    /// The Ctrl+D delete-confirmation popup is open for the ACTIVE chat.
+    /// Enter/`y` confirm, Esc/`n` cancel; every other
     /// key is swallowed by the modal branch in `main.rs` so nothing leaks
     /// into the textarea or triggers a global binding.
     ConfirmDelete,
     /// The ^L / ⇧^L stop-reset confirmation popup is open
-    /// (ctrl_l_stop_reset_hotkeys). `action` selects which destructive
+    ///. `action` selects which destructive
     /// command the confirmation stages: stop the running request (/stop) or
     /// reset the thread (/reset + local dialog clear). Enter/`y` confirm,
     /// Esc/`n` cancel; every other key is swallowed by the modal branch in
     /// `main.rs` — same grammar and isolation as [`Mode::ConfirmDelete`].
     ConfirmStopReset { action: StopResetAction },
-    /// The Ctrl+F in-thread search popup is open (feat_search_thread):
+    /// The Ctrl+F in-thread search popup is open:
     /// `state` holds the query buffer, cached match list and selection.
     /// Modal-ish isolation mirrors ConfirmDelete — keystrokes go to the
     /// popup only (see `main.rs`), the chat view is read-only, and Enter
     /// jumps the chat scroll to the selected match via
     /// [`App::pending_search_jump`] before closing.
     Searching { state: SearchState },
-    /// The Ctrl+Shift+F ALL-threads search popup is open
-    /// (feat_search_all_threads): `state` holds the query buffer, cached
+    /// The Ctrl+Shift+F ALL-threads search popup is open:
+    /// `state` holds the query buffer, cached
     /// match list (spanning every chat, each entry labeled with its thread
     /// title) and selection. Same modal-ish isolation as [`Mode::Searching`]
     /// — one popup at a time — but Enter ACTIVATES the match's thread
     /// (same selection mechanics as Ctrl+↑/↓ switching) and records a
     /// pending wrapped-row jump via [`App::pending_global_search_jump`].
     SearchingAll { state: GlobalSearchState },
-    /// The ^G diagnostics-log viewer modal is open (feat_stderr_log_modal):
+    /// The ^G diagnostics-log viewer modal is open:
     /// a monospace view of the unified backend-stderr + `[tui]` lifecycle
     /// ring buffer. Modal isolation like the search popups — PgUp/PgDn (and
     /// ↑/↓) scroll, Esc closes, every other key is swallowed. Opening
     /// resets the unseen-lines counter; live-tail at the bottom, frozen
     /// snapshot with a `+K new lines` footer while scrolled up.
     LogViewer { state: LogViewerState },
-    /// The ^M model-picker popup is open (feat_model_picker_lite). Modal
+    /// The ^M model-picker popup is open. Modal
     /// isolation like the search family: ↑/↓ navigate, PgUp/PgDn page the
     /// selection by one viewport of visible rows, Enter selects,
     /// Esc closes, everything else is swallowed. The listing arrives through
     /// the NORMAL request pipeline as a hidden exchange — see
     /// [`HiddenPurpose`] and [`App::begin_model_picker`].
     ModelPicking { state: ModelPickerState },
-    /// The F1 keybindings help modal is open (feat_hotkey_help_modal).
+    /// The F1 keybindings help modal is open.
     /// Modal isolation like the popup family: ↑/↓ (and PgUp/PgDn) scroll the
     /// static `ui::HOTKEY_ROWS` table, F1 or Esc closes, everything else is
     /// swallowed. The table is a const in `ui.rs` next to the render; a
@@ -397,7 +397,7 @@ impl Mode {
         matches!(self, Mode::Normal)
     }
 }
-/// feat_focus_panes: which pane owns the keyboard. NOT an [`AppMode`] —
+/// which pane owns the keyboard. NOT an [`AppMode`] —
 /// the rename/delete/search modals remain [`Mode`]s layered above focus:
 /// opening one never changes focus, and closing one always resets it to
 /// [`Focus::Chat`] so the editor regains typing immediately.
@@ -433,7 +433,7 @@ pub struct Chat {
     /// Prompts submitted while a request was already in flight; sent FIFO as
     /// soon as the current request reaches a terminal event.
     pub queue: VecDeque<String>,
-    /// feat_sidebar_unread_marker: a visible reply (or an inline error)
+    /// a visible reply (or an inline error)
     /// landed in this chat while it was NOT the selected one. Cleared the
     /// moment the chat is selected (see [`App::select_chat`]). Session-only:
     /// never persisted, a restart starts every thread clean.
@@ -459,7 +459,7 @@ pub struct Chat {
     /// reasoning. Session-only: never persisted (reasoning is heavy and the
     /// contract keeps the block restart-fresh).
     pub last_thoughts: Option<String>,
-    /// tui_subagents_b5: live subagent progress for THIS thread, keyed by
+    /// live subagent progress for THIS thread, keyed by
     /// the numeric protocol request id → (active, total). Populated from
     /// mid-turn `agent_event` frames via [`Chat::apply_subagent_event`]
     /// regardless of the request lifecycle — background subagents outlive
@@ -576,28 +576,28 @@ pub struct App {
     /// request — queued prompts survive a cancel.
     pub pending_cancel: Option<(String, String)>,
     /// Thread id whose persisted history file must be removed
-    /// (feat_thread_delete): set by the confirm-popup Enter path; the event
+    ///: set by the confirm-popup Enter path; the event
     /// loop performs the actual `history::delete_chat_file_in` and consumes
     /// this. Kept out of the I/O-free [`App`] so state logic stays
     /// unit-testable without a filesystem.
     pub pending_delete: Option<String>,
-    /// Transient status toast (feat_thread_delete busy-refusal) shown in the
+    /// Transient status toast (busy-refusal) shown in the
     /// status line; auto-expires after [`STATUS_MSG_TICKS`] spinner ticks.
     pub status_message: Option<(String, u8)>,
-    /// feat_focus_panes: which pane owns the keyboard (Chat by default).
+    /// which pane owns the keyboard (Chat by default).
     /// Reset to [`Focus::Chat`] whenever a modal closes — see [`Focus`].
     pub focus: Focus,
     /// Global input mode (feature: inline thread rename / thread delete /
     /// in-thread search).
     pub mode: Mode,
-    /// feat_search_thread: pending search jump `(message_index, line_index,
+    /// pending search jump `(message_index, line_index,
     /// col)` — the char offset inside the message's rendered line. Set by
     /// Enter in the search popup, consumed by `ui::render_chat` (the jump
     /// math needs the SAME wrapped-row totals as rendering, so it happens
     /// there, not in the state layer). `col` lets the jump land on the
     /// WRAPPED row that actually contains the hit inside a long paragraph.
     pub pending_search_jump: Option<(usize, usize, usize)>,
-    /// feat_search_all_threads: pending GLOBAL search jump `(chat_index,
+    /// pending GLOBAL search jump `(chat_index,
     /// message_index, line_index, col)` — `chat_index` is the match's OWNING
     /// thread. Set by Enter in the all-threads search popup AFTER
     /// [`App::jump_to_selected_all`] already activated that thread (the
@@ -607,12 +607,12 @@ pub struct App {
     /// active chat before jumping, so a chat that vanished mid-frame drops
     /// the jump silently instead of scrolling the wrong thread.
     pub pending_global_search_jump: Option<(usize, usize, usize, usize)>,
-    /// feat_stderr_log_modal: visible height (rows) of the log-viewer
+    /// visible height (rows) of the log-viewer
     /// modal's content area, set during `ui::render_log_viewer` so PgUp/PgDn
     /// scroll exactly one page of modal rows. Defaults to 20 until first
     /// render (same seam as [`App::chat_visible_rows`]).
     pub log_visible_rows: u16,
-    /// feat_log_viewer_core: content width (columns) of the log-viewer
+    /// content width (columns) of the log-viewer
     /// modal's text area, set during `ui::render_log_viewer`. With wrap on,
     /// page steps are measured in reflowed rows, so the cursor math needs
     /// the same width the renderer chunks lines at. Defaults to 100 until
@@ -628,7 +628,7 @@ pub struct App {
     /// row/page of the keybindings table. Defaults to 20 until first render
     /// (same seam as [`App::picker_visible_rows`]).
     pub help_visible_rows: u16,
-    /// feat_stderr_log_modal: the consumer-side "seen" watermark — the
+    /// the consumer-side "seen" watermark — the
     /// [`crate::diag::DiagLog::total`] value at the moment the log stream
     /// was last fully viewed (viewer opened / re-tailed / closed at the
     /// bottom). The `log*` status marker fires while
@@ -636,12 +636,12 @@ pub struct App {
     /// Tracking unseen state on the consumer side of a monotonic producer
     /// total is race-free by construction — no counter resets to coordinate.
     pub log_seen_total: u64,
-    /// feat_status_line: visibility of the one-row status strip (workspace
+    /// visibility of the one-row status strip (workspace
     /// cwd · active chat's model), toggled with ^O. Default HIDDEN. Pure
     /// VIEW state like [`Focus`] — deliberately NOT a [`Mode`]: it never
     /// captures keys and survives every modal open/close untouched.
     pub status_strip_visible: bool,
-    /// feat_status_line: workspace root backing the strip's cwd segment
+    /// workspace root backing the strip's cwd segment
     /// (rendered as the last three path components with a leading `/`).
     /// Wired once at startup from the CLI `--workspace` value (which
     /// itself defaults to the process cwd) for BOTH backends, mock
@@ -650,24 +650,24 @@ pub struct App {
     /// today it is CLI-only and never changes. `None` renders as the `—`
     /// placeholder.
     pub workspace_root: Option<String>,
-    /// feat_model_picker_lite: hidden exchange bundle staged by the key
+    /// hidden exchange bundle staged by the key
     /// handlers (`^M` open, Enter selection) for the event loop to hand to
     /// the backend source via the SAME `send_submitted` path as any prompt.
     /// The bundle carries its own ids; nothing here touches the transcript.
     pub picker_submission: Option<Submitted>,
-    /// feat_model_picker_lite: purpose registry of in-flight hidden
+    /// purpose registry of in-flight hidden
     /// exchanges, keyed by protocol request id. A terminal event whose
     /// tracked id is found here is suppressed from the transcript and
     /// resolved into the picker/toast state instead of a chat bubble.
     hidden_requests: HashMap<String, HiddenPurpose>,
-    /// feat_model_picker_lite: hidden requests deferred behind the per-thread
+    /// hidden requests deferred behind the per-thread
     /// busy rules — `(thread_id, prompt)` FIFO. A picker action taken while
     /// the chat is busy must wait for an idle drain (the same rule any
     /// visible prompt obeys), but it must NOT enter the chat's VISIBLE queue
     /// (it would render bubbles for plumbing). Flushed one-per-drain by the
     /// event loop via [`App::take_deferred_hidden_request`].
     hidden_queue: VecDeque<(String, String)>,
-    /// feat_model_picker_lite: session-scoped last-known model labels staged
+    /// session-scoped last-known model labels staged
     /// by a hidden `/model <n>` switch, keyed by thread id. Bridges the gap
     /// until the chat's next visible reply stamps its OWN label (which
     /// retires the override) — the status strip reads
@@ -676,30 +676,30 @@ pub struct App {
     /// recorded a persisted last-known model (see [`Chat::last_model`]), so
     /// the map itself stays session-only and is never written to disk.
     picker_model_labels: HashMap<String, String>,
-    /// feat_thread_clone: slash commands the backend advertised at handshake.
+    /// slash commands the backend advertised at handshake.
     /// Empty for mocks/offline; gates the ^P clone shortcut via detection.
     pub(crate) backend_commands: Vec<String>,
-    /// feat_thread_clone: clone request staged by `begin_clone_thread` for
+    /// clone request staged by `begin_clone_thread` for
     /// the event loop to send (same seam as `picker_submission`). Carries
     /// the NEW chat's UUID as `thread_id`, so the command arrives on the
     /// thread it creates, exactly like /reset.
     clone_submission: Option<Submitted>,
-    /// feat_thread_clone: the not-yet-listed clone chat plus its request
+    /// the not-yet-listed clone chat plus its request
     /// correlation, held between staging and the backend ack. An error
     /// resolution drops it, so a failed clone leaves no orphan thread.
     pending_clone: Option<PendingClone>,
-    /// ctrl_l_stop_reset_hotkeys: the /stop or /reset control request staged
+    /// the /stop or /reset control request staged
     /// by the confirm popup for the event loop to send (same seam as
     /// `clone_submission`). It travels OUT-OF-BAND on purpose: both commands
     /// exist precisely to act while a request is still running, so the
     /// busy-chat FIFO queue must never delay them.
     control_submission: Option<Submitted>,
-    /// ctrl_l_stop_reset_hotkeys: the in-flight control request's
+    /// the in-flight control request's
     /// correlation, held between staging and the backend ack. A stop never
     /// touches the chat lifecycle (the killed request resolves itself via
     /// its own cancelled error); a reset clears the dialog on the ack.
     pending_control: Option<PendingControl>,
-    /// Wave-2 latest-turn metadata from the most recent `result` frames.
+    /// Latest-turn metadata from the most recent `result` frames.
     ///
     /// Usage is the sticky last-known token count: a terminal frame updates
     /// it only when the frame actually carries usage, and a new request never
@@ -712,7 +712,7 @@ pub struct App {
     /// the active chat's own value, so no cross-thread routing exists to
     /// break.
     pub last_turn_usage: Option<Usage>,
-    /// tui_thoughts_b1: session-only visibility of the dim reasoning block
+    /// session-only visibility of the dim reasoning block
     /// rendered above the latest answer from the active chat's
     /// [`Chat::last_thoughts`]. Default ON; ^S flips it. Pure VIEW state like
     /// [`Focus`] and the status strip — never a [`Mode`], never persisted,
@@ -721,7 +721,7 @@ pub struct App {
     pub thoughts_visible: bool,
 }
 
-/// feat_thread_clone: a clone request in flight. The `chat` waits here until
+/// a clone request in flight. The `chat` waits here until
 /// the backend acks; `source_id` anchors the insert-after-source placement.
 struct PendingClone {
     chat: Chat,
@@ -729,7 +729,7 @@ struct PendingClone {
     source_id: String,
 }
 
-/// ctrl_l_stop_reset_hotkeys: which destructive command the stop/reset
+/// which destructive command the stop/reset
 /// confirmation popup stages. `Stop` maps to the backend's `/stop` command
 /// (telegram kill-all + counter flush semantics); `Reset` to `/reset`,
 /// which additionally clears the local dialog once the backend acks.
@@ -741,7 +741,7 @@ pub enum StopResetAction {
     Reset,
 }
 
-/// ctrl_l_stop_reset_hotkeys: a /stop or /reset control request in flight.
+/// a /stop or /reset control request in flight.
 /// Terminal frames matching `(thread_id, request_id)` are consumed by
 /// [`App::apply_control_event`] before the normal chat routing would drop
 /// them as uncorrelated (the chat keeps tracking the request being killed).
@@ -751,7 +751,7 @@ struct PendingControl {
     thread_id: String,
 }
 
-/// feat_model_picker_lite: what a hidden (transcript-suppressed) request is
+/// what a hidden (transcript-suppressed) request is
 /// FOR — the terminal event's handling depends on it. The wire exchange is
 /// identical to a visible prompt; only the resolution differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -767,24 +767,24 @@ const SPINNER: [&str; 10] = [
     "\u{2807}", "\u{280F}",
 ];
 
-/// feat_input_grow: hard cap on how many terminal rows the ACTIVE editor
+/// hard cap on how many terminal rows the ACTIVE editor
 /// block (message draft OR rename draft) may occupy. Beyond this the
 /// textarea view auto-scrolls inside the capped window so the caret always
 /// stays on screen.
 pub const MAX_INPUT_LINES: usize = 20;
 
-/// feat_thread_delete: how many 100 ms spinner ticks a transient status
+/// how many 100 ms spinner ticks a transient status
 /// toast stays visible (~2.5 s).
 pub const STATUS_MSG_TICKS: u8 = 25;
 
-/// feat_model_picker_lite: the bare listing request. Sent verbatim through
+/// the bare listing request. Sent verbatim through
 /// the normal pipeline; the real backend treats it as a slash command and
 /// answers with the textual model listing in `result.content` (no LLM turn).
 pub const MODEL_LISTING_PROMPT: &str = "/model";
-/// feat_model_picker_lite: toast shown when a hidden listing request
+/// toast shown when a hidden listing request
 /// resolves to an unusable listing (unparsable / zero rows).
 const MODEL_LIST_UNAVAILABLE: &str = "model list unavailable";
-/// fix_ack_silent_absorb: the protocol-level acknowledgement marker the
+/// the protocol-level acknowledgement marker the
 /// backend uses for silent turns ("THE ACK RULE" in the chibi backend,
 /// `chibi/constants.py`). An agent answer whose ENTIRE content is one or
 /// more of these markers (plus optional surrounding whitespace) is a
@@ -879,7 +879,7 @@ impl App {
         self.chats.get(self.active).map(|c| c.id.as_str())
     }
 
-    /// feat_sidebar_unread_marker: the ONE place a chat becomes the selected
+    /// the ONE place a chat becomes the selected
     /// one. Bounds-safe (the index is clamped to the current list), resets
     /// the chat view to follow-bottom, clears the unread marker of the
     /// chat being entered, and re-seeds the sticky ctx segment from the
@@ -922,7 +922,7 @@ impl App {
         self.select_chat(index);
     }
 
-    /// feat_focus_panes: toggle which pane owns the keyboard — Ctrl+T flips
+    /// toggle which pane owns the keyboard — Ctrl+T flips
     /// [`Focus::Chat`] ↔ [`Focus::Sidebar`] (twice round-trips). No chat-list
     /// side effects: the selection, scroll and lifecycle are untouched; with
     /// zero or one chats toggling is still meaningful (the highlight/dot
@@ -936,9 +936,9 @@ impl App {
         };
     }
 
-    // ---- feat_status_line: cwd + model status strip ------------------------
+    // cwd + model status strip ------------------------
 
-    /// feat_status_line: toggle the one-row status strip (workspace cwd ·
+    /// toggle the one-row status strip (workspace cwd ·
     /// active chat's model) with ^O. Pure VIEW state like [`Focus`] —
     /// deliberately not a [`Mode`]: it never captures keys, survives every
     /// modal open/close untouched, and the renderer just reads the flag
@@ -947,7 +947,7 @@ impl App {
         self.status_strip_visible = !self.status_strip_visible;
     }
 
-    /// tui_thoughts_b1: toggle the dim reasoning block above the latest
+    /// toggle the dim reasoning block above the latest
     /// answer with ^S. Render-only session view state (default ON): nothing
     /// is cleared, the flip just changes whether the renderer draws the
     /// active chat's [`Chat::last_thoughts`] block; the retained reasoning
@@ -956,12 +956,12 @@ impl App {
         self.thoughts_visible = !self.thoughts_visible;
     }
 
-    /// feat_status_line: the strip's cwd segment, the LAST THREE components
+    /// the strip's cwd segment, the LAST THREE components
     /// of the workspace root ([`App::workspace_root`], wired from the CLI at
     /// startup; the TUI knows the root from the request frames / CLI and
     /// today it never changes at runtime, but the value is read reactively
     /// here so a future runtime change shows up on the next frame), joined
-    /// with `/` and prefixed with a leading `/`: the owner format
+    /// with `/` and prefixed with a leading `/`: the path-tail format
     /// `/Develop/personal/chibi-tui` instead of the bare `chibi-tui`, so
     /// sibling workspaces tell themselves apart at a glance. Paths with
     /// fewer components show the same prefix with what they have, nothing
@@ -994,8 +994,8 @@ impl App {
         Some(format!("/{}", parts.join("/")))
     }
 
-    /// feat_status_line: the strip's model segment — the LAST KNOWN model
-    /// label of the ACTIVE chat, reusing the feat_agent_model_label
+    /// the strip's model segment — the LAST KNOWN model
+    /// label of the ACTIVE chat, reusing the model-label
     /// per-message metadata: the most recent assistant message carrying a
     /// non-empty label. Deriving it per frame gives the required update
     /// semantics for free: a result resolution stamps the label onto the
@@ -1009,7 +1009,7 @@ impl App {
     /// from its own newest answer once the override retires.
     /// `None` renders as the `—` placeholder.
     ///
-    /// feat_model_picker_lite: a hidden `/model <n>` switch has no transcript
+    /// a hidden `/model <n>` switch has no transcript
     /// bubble to derive from, so it stages a session-scoped override (see
     /// [`App::picker_model_labels`]) that this getter prefers; the chat's
     /// next visible labeled reply retires it and message-derived truth
@@ -1020,7 +1020,7 @@ impl App {
     /// produced, so a mid-chat switch never re-labels past answers.
     pub fn active_model_label(&self) -> Option<&str> {
         let chat = self.chats.get(self.active)?;
-        // feat_model_picker_lite: a hidden `/model <n>` switch updates the
+        // a hidden `/model <n>` switch updates the
         // last-known model WITHOUT a transcript bubble. The staged override
         // shadows the message-derived label until the next visible reply of
         // the chat stamps its own label (and retires the override).
@@ -1030,8 +1030,8 @@ impl App {
         chat.messages.iter().rev().find_map(|m| m.model_label())
     }
 
-    /// Create a chat with a fresh UUID thread_id, select it. feat_focus_panes:
-    /// creating a thread is an editor-bound action — focus lands back on
+    /// Create a chat with a fresh UUID thread_id, select it. Creating a
+    /// thread is an editor-bound action — focus lands back on
     /// Chat so typing goes straight into the prompt.
     pub fn new_chat(&mut self) {
         let n = self.chats.len() + 1;
@@ -1085,7 +1085,7 @@ impl App {
         }
     }
 
-    /// feat_input_grow: terminal rows the ACTIVE editor block needs right
+    /// terminal rows the ACTIVE editor block needs right
     /// now — visible buffer lines clamped to `1..=MAX_INPUT_LINES`.
     ///
     /// Normal mode counts the multiline message draft (`Shift+Enter`);
@@ -1133,7 +1133,7 @@ impl App {
             | Mode::HelpViewing { .. } => return false,
         };
         self.mode = Mode::Normal;
-        // feat_focus_panes: a closed modal returns keyboard ownership to
+        // a closed modal returns keyboard ownership to
         // the editor pane regardless of where focus was before it opened.
         self.focus = Focus::Chat;
         let Some(chat) = self.chats.get_mut(self.active) else {
@@ -1154,11 +1154,11 @@ impl App {
             return false;
         }
         self.mode = Mode::Normal;
-        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
+        self.focus = Focus::Chat; // modal closed → editor pane
         true
     }
 
-    // ---- in-thread search (feat_search_thread) ----------------------------
+    // ---- in-thread search ----------------------------
 
     /// Open the in-thread search popup for the ACTIVE chat with an empty
     /// query. No-op when another modal owns the keyboard (rename session,
@@ -1257,7 +1257,7 @@ impl App {
             return false;
         }
         self.mode = Mode::Normal;
-        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
+        self.focus = Focus::Chat; // modal closed → editor pane
         true
     }
 
@@ -1278,7 +1278,7 @@ impl App {
             Some(target) => {
                 self.pending_search_jump = Some(target);
                 self.mode = Mode::Normal;
-                // feat_focus_panes: modal closed → editor pane.
+                // modal closed → editor pane.
                 self.focus = Focus::Chat;
                 true
             }
@@ -1296,7 +1296,7 @@ impl App {
         }
     }
 
-    // ---- all-threads search (feat_search_all_threads) --------------------
+    // ---- all-threads search --------------------
 
     /// Open the GLOBAL search popup over ALL chats with an empty query.
     /// No-op when another modal owns the keyboard (rename session,
@@ -1405,7 +1405,7 @@ impl App {
             return false;
         }
         self.mode = Mode::Normal;
-        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
+        self.focus = Focus::Chat; // modal closed → editor pane
         true
     }
 
@@ -1437,7 +1437,7 @@ impl App {
                 self.pending_global_search_jump =
                     Some((chat_index, message_index, line_index, col));
                 self.mode = Mode::Normal;
-                // feat_focus_panes: modal closed → editor pane.
+                // modal closed → editor pane.
                 self.focus = Focus::Chat;
                 true
             }
@@ -1467,7 +1467,7 @@ impl App {
         out
     }
 
-    // ---- diagnostics log viewer (feat_stderr_log_modal) -------------------
+    // ---- diagnostics log viewer -------------------
 
     /// Open the ^G diagnostics-log viewer modal with a snapshot of the ring
     /// buffer, live-tailing at the bottom. Opening resets the unseen-lines
@@ -1611,7 +1611,7 @@ impl App {
         }
     }
 
-    // ---- log viewer search (feat_log_viewer_search_copy) ------------------
+    // ---- log viewer search ------------------
 
     /// `/`: open the search prompt at the bottom of the viewer with an
     /// empty buffer. Also clears the copy feedback, so the header never
@@ -1786,7 +1786,7 @@ impl App {
             _ => return false,
         };
         self.mode = Mode::Normal;
-        // feat_focus_panes: modal closed → editor pane.
+        // modal closed → editor pane.
         self.focus = Focus::Chat;
         if at_bottom {
             // The user just watched the tail arrive: everything is seen.
@@ -1795,7 +1795,7 @@ impl App {
         true
     }
 
-    // ---- model picker (feat_model_picker_lite) ----------------------------
+    // ---- model picker ----------------------------
 
     /// Open the model-picker popup for the ACTIVE chat (`^M`).
     ///
@@ -1868,7 +1868,7 @@ impl App {
         self.hidden_queue
             .retain(|(_, prompt)| prompt != MODEL_LISTING_PROMPT);
         self.mode = Mode::Normal;
-        // feat_focus_panes: modal closed → editor pane.
+        // modal closed → editor pane.
         self.focus = Focus::Chat;
         true
     }
@@ -1920,7 +1920,7 @@ impl App {
         }
     }
 
-    /// Open the F1 keybindings help modal (feat_hotkey_help_modal). Normal
+    /// Open the F1 keybindings help modal. Normal
     /// mode only, like every other popup entry point: the modal branches in
     /// `main.rs` return before this could run elsewhere anyway, so the guard
     /// is the single seam that keeps exactly one popup open at a time.
@@ -1942,7 +1942,7 @@ impl App {
             return false;
         }
         self.mode = Mode::Normal;
-        // feat_focus_panes: modal closed → editor pane.
+        // modal closed → editor pane.
         self.focus = Focus::Chat;
         true
     }
@@ -2025,7 +2025,7 @@ impl App {
             return;
         };
         self.mode = Mode::Normal;
-        // feat_focus_panes: modal closed → editor pane.
+        // modal closed → editor pane.
         self.focus = Focus::Chat;
 
         let Some(chat) = self.chats.iter_mut().find(|c| c.id == thread_id) else {
@@ -2260,7 +2260,7 @@ impl App {
     /// Dismiss the error popup without reconnecting.
     pub fn dismiss_error(&mut self) {
         self.error_popup = None;
-        // feat_focus_panes: a closed modal returns keyboard ownership to
+        // a closed modal returns keyboard ownership to
         // the editor pane regardless of where focus was before it appeared
         // (a transport failure can interrupt sidebar navigation).
         self.focus = Focus::Chat;
@@ -2278,7 +2278,7 @@ impl App {
             .set_placeholder_text("Type a message…  (\u{23ce} send)");
     }
 
-    // ---- thread delete (feat_thread_delete) -------------------------------
+    // ---- thread delete -------------------------------
 
     /// Open the delete-confirmation popup for the ACTIVE chat — IDLE ONLY.
     ///
@@ -2312,7 +2312,7 @@ impl App {
             return false;
         }
         self.mode = Mode::Normal;
-        self.focus = Focus::Chat; // feat_focus_panes: modal closed → editor pane
+        self.focus = Focus::Chat; // modal closed → editor pane
         true
     }
 
@@ -2333,7 +2333,7 @@ impl App {
             return None;
         }
         self.mode = Mode::Normal;
-        // feat_focus_panes: modal closed → editor pane (even into the
+        // modal closed → editor pane (even into the
         // clean empty state; focus is pane-level state, not selection).
         self.focus = Focus::Chat;
         let chat = self.chats.get(self.active)?;
@@ -2348,7 +2348,7 @@ impl App {
         Some(removed_id)
     }
 
-    // ---- stop / reset (ctrl_l_stop_reset_hotkeys) --------------------------
+    // ---- stop / reset --------------------------
 
     /// Slash command the backend translates into the telegram /stop core
     /// (cancel the thread's running request + subagent counter kill-flush).
@@ -2556,14 +2556,14 @@ impl App {
         }
     }
 
-    // ---- thread clone (feat_thread_clone) ----------------------------------
+    // ---- thread clone ----------------------------------
 
     /// Slash command the backend lists in `capabilities.commands` when it can
     /// clone a thread with its full conversation context. Consumed via
     /// detection, never assumed: ^P stays dead until the handshake lists it.
     pub const CLONE_COMMAND: &str = "/new_thread_with_current_context";
 
-    /// feat_thread_clone: record the backend's advertised slash-command set
+    /// record the backend's advertised slash-command set
     /// from the handshake. Stays empty for mocks and placeholder sessions,
     /// which keeps the clone shortcut disabled there.
     pub fn set_backend_commands(&mut self, commands: Vec<String>) {
@@ -2757,7 +2757,7 @@ impl App {
         }
     }
 
-    /// feat_sidebar_unread_marker: flag a chat that just grew a VISIBLE
+    /// flag a chat that just grew a VISIBLE
     /// reply while the user was looking at another thread. Only content the
     /// user has not seen counts: a blank/pure-ACK absorb and a hidden
     /// plumbing exchange add nothing readable, so they never light the
@@ -2797,14 +2797,14 @@ impl App {
             return;
         }
 
-        // feat_thread_clone: a terminal event of a pending clone resolves
+        // a terminal event of a pending clone resolves
         // the clone itself and never reaches the chat routing below, which
         // would drop it as an unknown thread id and hang the clone forever.
         if self.apply_clone_event(&event) {
             return;
         }
 
-        // ctrl_l_stop_reset_hotkeys: a frame of the pending /stop or /reset
+        // a frame of the pending /stop or /reset
         // control request resolves the control itself and never reaches the
         // chat routing below — the chat keeps tracking the request the
         // control just killed, and the control's own terminal frame must not
@@ -2853,7 +2853,7 @@ impl App {
             return; // unknown thread: not ours
         };
 
-        // tui_subagents_b5: mid-turn subagent progress folds into the
+        // mid-turn subagent progress folds into the
         // owning chat's counters regardless of the request state — the
         // frames are non-terminal, background subagents keep their count
         // alive after the turn's result frame (idle chat), and a late
@@ -2901,13 +2901,13 @@ impl App {
                 ..
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
-                    // feat_model_picker_lite: a terminal result whose tracked
+                    // a terminal result whose tracked
                     // id is a hidden exchange is suppressed from the
                     // transcript and resolved into the picker/toast state
                     // instead. The lifecycle still returns to Idle so the
                     // busy rules (and the FIFO drain) keep working.
                     let purpose = self.hidden_requests.remove(&tracked_request_id);
-                    // Wave-2: retain the latest-turn protocol metadata before
+                    //retain the latest-turn protocol metadata before
                     // any resolution path runs. Usage is sticky last-known: a
                     // frame without usage (command results, hidden exchanges)
                     // must not wipe the previous value. The owning chat
@@ -2936,7 +2936,7 @@ impl App {
                             self.resolve_hidden_selection(&markdown, model.as_deref(), chat_index);
                         }
                         None => {
-                            // feat_model_picker_lite: a visible reply that
+                            // a visible reply that
                             // stamps its OWN model label retires any
                             // hidden-switch override: the message-derived
                             // label is the fresher truth again. Fieldless /
@@ -2950,7 +2950,7 @@ impl App {
                             let thread_id = self.chats[chat_index].id.clone();
                             let chat = &mut self.chats[chat_index];
                             if is_invisible_result(&markdown) {
-                                // fix_ack_silent_absorb: an empty or pure-ACK answer is
+                                // an empty or pure-ACK answer is
                                 // a protocol-level acknowledgement, not a user-facing
                                 // reply; absorb it invisibly. The pending placeholder
                                 // is dropped (no empty bubble), the lifecycle resolves
@@ -2962,7 +2962,7 @@ impl App {
                                 drop_live_pending_placeholder(chat);
                             } else {
                                 resolve_live_placeholder(chat, markdown, model);
-                                // feat_sidebar_unread_marker: a real reply for a
+                                // a real reply for a
                                 // background thread is content the user has not
                                 // seen yet.
                                 self.mark_unread_if_background(chat_index);
@@ -2982,7 +2982,7 @@ impl App {
                 ..
             } => {
                 if event_matches_request(request_id, &tracked_request_id) {
-                    // feat_model_picker_lite: hidden exchanges respect
+                    // hidden exchanges respect
                     // cancel/errors through the error-popup path: there is
                     // no pending placeholder to resolve inline, so the modal
                     // popup (with its `R` reconnect escape) IS the honest
@@ -3004,7 +3004,7 @@ impl App {
 
                     let chat = &mut self.chats[chat_index];
                     resolve_live_placeholder(chat, format!("**Error:** {message}"), None);
-                    // feat_sidebar_unread_marker: an inline failure is also a
+                    // an inline failure is also a
                     // reply the user has not seen in a background thread.
                     self.mark_unread_if_background(chat_index);
 
@@ -3085,7 +3085,7 @@ impl App {
         self.scroll = 0;
     }
 
-    /// feat_model_picker_lite: resolve a hidden bare-`/model` result.
+    /// resolve a hidden bare-`/model` result.
     ///
     /// * parseable, non-empty listing → the OPEN picker flips to `Ready`
     ///   with best-effort preselection of the chat's last-known model
@@ -3115,7 +3115,7 @@ impl App {
         }
         // Best-effort preselection against the active chat's last-known
         // model label (hidden-switch override first, then the
-        // feat_agent_model_label message metadata); ambiguity → none.
+        // message metadata); ambiguity → none.
         // Computed BEFORE the mutable borrow of the picker state below.
         let label = self.last_known_model_label(chat_index);
         let Mode::ModelPicking { state } = &mut self.mode else {
@@ -3126,7 +3126,7 @@ impl App {
         state.selected = preselect_model_index(&state.entries, label.as_deref()).unwrap_or(0);
     }
 
-    /// feat_model_picker_lite: resolve a hidden `/model <n>` confirmation
+    /// resolve a hidden `/model <n>` confirmation
     /// into the compact status toast (never a bubble; same suppression as
     /// the fetch). Unrecognized bodies fall back to the raw text so a
     /// backend wording change degrades visibly instead of lying.
@@ -3157,10 +3157,10 @@ impl App {
         }
     }
 
-    /// feat_model_picker_lite: the chat's best-effort last-known model label
+    /// the chat's best-effort last-known model label
     /// for picker preselection — the hidden-switch override first (a
     /// just-made `/model <n>` switch leaves no transcript bubble to derive
-    /// from), then the feat_agent_model_label message metadata.
+    /// from), then the message-label metadata.
     fn last_known_model_label(&self, chat_index: usize) -> Option<String> {
         let chat = &self.chats[chat_index];
         self.picker_model_labels.get(&chat.id).cloned().or_else(|| {
@@ -3218,7 +3218,7 @@ fn is_queued_marker(message: &Message) -> bool {
 }
 
 /// Collect case-insensitive substring matches of `query` over the RENDERED
-/// text of an iterator of messages (feat_search_thread).
+/// text of an iterator of messages.
 ///
 /// Matching runs on the same [`crate::markdown::render`] output the chat
 /// pane paints — style markup already stripped, so `**bold**` matches
@@ -3290,7 +3290,7 @@ pub fn collect_search_matches<'a>(
 /// (`result`, `error`, cancel) must never touch queued markers.
 /// Resolve the live pending placeholder of `chat` into a finished message.
 ///
-/// `model` (feat_agent_model_label) is stamped ONLY onto this one message at
+/// `model` is stamped ONLY onto this one message at
 /// result-resolution time: replies are labelled per-message, so future
 /// per-message model switching can never mislabel an earlier answer.
 fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<String>) {
@@ -3305,7 +3305,7 @@ fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<Str
         row.model = model;
     }
 }
-/// fix_ack_silent_absorb: is this answer content invisible-by-contract?
+/// is this answer content invisible-by-contract?
 ///
 /// True when the content is empty/whitespace-only, or consists ONLY of the
 /// [`ACK_MARKER`] — exact, repeated, or embedded in whitespace. Content that
@@ -3325,7 +3325,7 @@ pub fn is_invisible_result(markdown: &str) -> bool {
 }
 
 /// Remove the live pending placeholder row WITHOUT leaving an answer behind
-/// (fix_ack_silent_absorb). Targets the same row [`resolve_live_placeholder`]
+///. Targets the same row [`resolve_live_placeholder`]
 /// would — the last pending, non-queued placeholder — but drops it so an
 /// absorbed (blank / pure-ACK) result leaves no bubble at all. A no-op when
 /// no live placeholder exists (stray result).
@@ -3346,7 +3346,7 @@ fn event_matches_request(event_id: u64, tracked_request_id: &str) -> bool {
     event_id == crate::live::wire_thread_id(tracked_request_id) as u64
 }
 
-/// feat_model_picker_lite: best-effort preselection index — the single parsed
+/// best-effort preselection index — the single parsed
 /// row whose name equals (case-insensitively) the chat's last-known model
 /// label. Ambiguous (duplicate names across providers are common in real
 /// listings) or unknown labels yield `None` → the picker starts at row 0.
@@ -3438,7 +3438,7 @@ mod tests {
         finish_chat_with_model(app, index, None);
     }
 
-    // ---- wave-2 protocol base: latest-turn usage/thoughts retention -------
+    // ---- latest-turn usage/thoughts retention -------
 
     fn sample_usage() -> Usage {
         Usage {
@@ -3524,7 +3524,7 @@ mod tests {
         );
     }
 
-    // ---- thoughts_per_chat: sticky per-thread reasoning -------------------
+    // sticky per-thread reasoning -------------------
 
     /// Deliver a terminal Result carrying reasoning to a chat's tracked
     /// request (the full thoughts payload a real LLM turn brings).
@@ -3661,7 +3661,7 @@ mod tests {
     // ---- sticky last-known display state (ctx + model) --------------------
 
     /// Submit a prompt on the ACTIVE chat and resolve it with a labelled LLM
-    /// answer carrying usage (the full wave-2 metadata a real chat turn
+    /// answer carrying usage (the full latest-turn metadata a real chat turn
     /// brings).
     fn finish_llm_turn(app: &mut App, model: &str, usage: Usage) {
         let submitted = submit_text(app, "turn prompt");
@@ -3814,7 +3814,7 @@ mod tests {
         );
     }
 
-    // ---- remember_last_thread: restore activation -------------------------
+    // restore activation -------------------------
 
     /// A restored pointer must behave exactly like the user picking the
     /// thread: the selection moves, and the sticky ctx segment is re-seeded
@@ -4031,7 +4031,7 @@ mod tests {
         );
     }
 
-    /// [`finish_chat`] with a model label (feat_agent_model_label).
+    /// [`finish_chat`] with a model label.
     fn finish_chat_with_model(app: &mut App, index: usize, model: Option<&str>) {
         let request_id = app.chats[index].lifecycle.request_id().unwrap().to_owned();
         let thread_id = app.chats[index].id.clone();
@@ -4045,7 +4045,7 @@ mod tests {
         });
     }
 
-    // ---- tui_subagents_b5: subagent counter aggregation + gating ----------
+    // subagent counter aggregation + gating ----------
 
     /// Deliver a mid-turn `agent_event` to `index`'s tracked request id
     /// (same correlation path the live glue task uses).
@@ -4246,7 +4246,7 @@ mod tests {
         );
     }
 
-    // ---- chat_state: creation / switching --------------------------------
+    // creation / switching --------------------------------
 
     #[test]
     fn new_chat_appends_selects_and_gets_fresh_uuid() {
@@ -4277,7 +4277,7 @@ mod tests {
         assert_eq!(app.active, 0);
     }
 
-    // ---- feat_focus_panes: Chat ↔ Sidebar focus state ----------------------
+    // Chat ↔ Sidebar focus state ----------------------
 
     /// THE round-trip criterion: Ctrl+T's state flip is a pure pane switch —
     /// toggling twice lands back on Chat; nothing about the chat list
@@ -4455,7 +4455,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Chat);
     }
 
-    /// ^N new-chat is editor-bound (feat_focus_panes): creating a thread
+    /// ^N new-chat is editor-bound: creating a thread
     /// always lands focus back on Chat, whether the chord came from either
     /// pane.
     #[test]
@@ -4601,7 +4601,7 @@ mod tests {
         );
     }
 
-    // ---- feat_agent_model_label: per-message labelling --------------------
+    // per-message labelling --------------------
 
     /// THE per-message contract: two consecutive replies produced by
     /// DIFFERENT models each carry their own label — the second resolution
@@ -4645,7 +4645,7 @@ mod tests {
         assert_eq!(msgs[1].model_label(), None);
     }
 
-    // ---- tui_thoughts_b1: ^S toggle ----------------------------------------
+    // ^S toggle ----------------------------------------
 
     /// The thoughts block starts visible (ON by contract) and toggling
     /// round-trips without ever touching the retained reasoning.
@@ -4665,7 +4665,7 @@ mod tests {
         assert!(app.thoughts_visible);
     }
 
-    // ---- feat_status_line: strip state + segments --------------------------
+    // strip state + segments --------------------------
 
     /// Default hidden; ^O flips visibility round-trip.
     #[test]
@@ -4815,7 +4815,7 @@ mod tests {
         );
     }
 
-    // ---- fix_ack_silent_absorb: invisible ACK / blank answers --------------
+    // invisible ACK / blank answers --------------
 
     /// [`finish_chat_with_model`] with arbitrary answer content.
     fn finish_chat_with_content(app: &mut App, index: usize, markdown: &str) {
@@ -4980,7 +4980,7 @@ mod tests {
         assert!(app.error_popup.is_none());
     }
 
-    // ---- feat_sidebar_unread_marker: state --------------------------------
+    // state --------------------------------
 
     /// A visible reply landing in a BACKGROUND chat flags it unread; the
     /// selected chat's own reply never flags anything. The editor draft of
@@ -5374,7 +5374,7 @@ mod tests {
         assert_eq!(ids.len(), 50, "every new chat gets a unique thread id");
     }
 
-    // ---- ux_polish: error popup ------------------------------------------
+    // error popup ------------------------------------------
 
     #[test]
     fn error_popup_shown_replaced_and_dismissed() {
@@ -5395,7 +5395,7 @@ mod tests {
         assert!(app.error_popup.is_none());
     }
 
-    // ---- ux_polish: clear input (Ctrl+L) ---------------------------------
+    // clear input (Ctrl+L) ---------------------------------
 
     #[test]
     fn clear_input_empties_buffer_and_restores_placeholder() {
@@ -5439,7 +5439,7 @@ mod tests {
         assert!(!app.any_busy());
     }
 
-    // ---- ux_polish: local cancel fallback ---------------------------------
+    // local cancel fallback ---------------------------------
 
     #[test]
     fn resolve_cancel_locally_resolves_pending_and_returns_to_idle() {
@@ -5455,7 +5455,7 @@ mod tests {
         assert!(app.cancel_active().is_none());
     }
 
-    // ---- ux_polish: transport-failure escalation --------------------------
+    // transport-failure escalation --------------------------
 
     #[test]
     fn transport_failures_open_error_popup_and_flip_connection() {
@@ -5522,7 +5522,7 @@ mod tests {
         }
     }
 
-    // ---- feat_rename_thread ------------------------------------------------
+    //------------------------------------------------------------------------
 
     #[test]
     fn ctrl_r_enters_rename_mode_prefilled_with_current_name() {
@@ -5619,7 +5619,7 @@ mod tests {
         }
     }
 
-    // ---- feat_rename_thread: busy-chat rename ------------------------------
+    // busy-chat rename ------------------------------
 
     /// Renaming must not care about request lifecycle: a busy thread's title
     /// is independent of its in-flight work.
@@ -5698,7 +5698,7 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal, "no chat ⇒ no rename session");
     }
 
-    // ---- feat_input_grow: editor block height helper ---------------------
+    // editor block height helper ---------------------
 
     #[test]
     fn input_lines_height_collapses_to_one_when_empty_or_cleared() {
@@ -5754,7 +5754,7 @@ mod tests {
         assert_eq!(app.input_lines_height(), 3);
     }
 
-    // ---- feat_thread_delete: confirm popup state logic --------------------
+    // confirm popup state logic --------------------
 
     #[test]
     fn ctrl_d_opens_confirm_popup_on_idle_chat() {
@@ -5917,7 +5917,7 @@ mod tests {
         assert!(app.pending_delete.is_none());
     }
 
-    // ---- feat_thread_clone: detection, guards, ack/error resolution -------
+    // detection, guards, ack/error resolution -------
 
     fn clone_capable_app(n: usize) -> App {
         let mut app = app_with_chats(n);
@@ -6220,7 +6220,7 @@ mod tests {
         assert!(app.status_message.is_none());
     }
 
-    // ---- feat_search_thread: popup state logic ----------------------------
+    // popup state logic ----------------------------
 
     #[test]
     fn ctrl_f_opens_search_popup_with_empty_query() {
@@ -6600,7 +6600,7 @@ mod tests {
         assert_eq!(app.chats[0].lifecycle, ChatLifecycle::Idle);
     }
 
-    // ---- feat_search_all_threads: popup state logic ----------------------
+    // popup state logic ----------------------
 
     #[test]
     fn ctrl_shift_f_opens_global_search_popup_with_empty_query() {
@@ -6942,7 +6942,7 @@ mod tests {
         );
     }
 
-    // ---- feat_stderr_log_modal: log viewer state ---------------------------
+    // log viewer state ---------------------------
 
     /// Unique marker line for global-buffer assertions: other tests append
     /// to the same process-global stream concurrently, so assertions are
@@ -6964,7 +6964,7 @@ mod tests {
         }
     }
 
-    /// Search semantics at the state level (feat_log_viewer_search_copy):
+    /// Search semantics at the state level:
     /// commit jumps to the nearest match at or after the cursor, n/N walk
     /// with wraparound, and a snapshot refresh reindexes while keeping the
     /// current hit when it still exists.
@@ -7335,7 +7335,7 @@ mod tests {
         assert_eq!(app.scroll, 12, "chat scroll untouched by the modal");
     }
 
-    /// feat_log_viewer_core: `w` flips the wrap flag; the cursor keeps
+    /// `w` flips the wrap flag; the cursor keeps
     /// pointing at the SAME logical line, and one cursor step still walks
     /// one logical line even when wrap splits it over several rows.
     #[test]
@@ -7379,7 +7379,7 @@ mod tests {
         assert!(!log_state(&app).wrap, "second `w` turns wrap back off");
     }
 
-    /// feat_log_viewer_core: PgUp/PgDn move the cursor by one viewport of
+    /// PgUp/PgDn move the cursor by one viewport of
     /// rows (lines while wrap is off); landing back on the newest line
     /// re-arms the live tail.
     #[test]
@@ -7414,7 +7414,7 @@ mod tests {
         );
     }
 
-    /// feat_log_viewer_core: the shared wrap chunker must agree with the
+    /// the shared wrap chunker must agree with the
     /// renderer row-for-row (character-level, display width, exact fit stays
     /// one row, degenerate width never loops).
     #[test]
@@ -7433,7 +7433,7 @@ mod tests {
         assert_eq!(super::wrapped_row_count("", 5), 1);
     }
 
-    // ---- feat_model_picker_lite --------------------------------------------
+    //------------------------------------------------------------------------
 
     /// The REAL captured `/model` listing — the parser's and the picker's
     /// ground truth (see `model_picker.rs` for provenance).

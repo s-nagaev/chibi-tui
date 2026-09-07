@@ -1,7 +1,7 @@
-//! Wave-2 end-to-end integration tests: fake-backend frames → glue events →
+//! End-to-end integration tests: fake-backend frames → glue events →
 //! App state → rendered UI, plus the persistence and diagnostics contracts.
 //!
-//! `tests/fake_backend.py` emits wave-2 frames (usage, thoughts, mid-turn
+//! `tests/fake_backend.py` emits extended frames (usage, thoughts, mid-turn
 //! `agent_event` sequences, one unknown-type frame) gated on the client's
 //! handshake capabilities; these tests verify the TUI consumes ALL of them
 //! through the real `LiveBackend` glue path — the same seam `main.rs` uses.
@@ -131,7 +131,7 @@ fn terminal_result(events: &[BackendEvent]) -> (String, Option<Usage>, Option<St
         .expect("terminal Result present")
 }
 
-/// The full wave-2 result payload survives the real glue path: usage and
+/// The full extended result payload survives the real glue path: usage and
 /// thoughts arrive on the terminal event AND are retained in App state; a
 /// plain session (no subagent flag) emits no agent progress at all.
 #[tokio::test]
@@ -569,7 +569,7 @@ async fn huge_thoughts_arrive_capped_with_truncation_marker() {
     );
 }
 
-/// The fake backend's wave-2 gating at the raw wire level: without client
+/// The fake backend's capability gating at the raw wire level: without client
 /// capabilities no thoughts/agent frames are emitted; with the capability
 /// flags set they appear. Usage is NOT capability-gated and rides in both
 /// sessions.
@@ -714,8 +714,8 @@ fn raw_fake_session_with(
 
 /// Post-subagent continuation: the background tool result comes back after
 /// the parent request's result frame, and the model's follow-up answer must
-/// render as a NEW assistant message in the owning chat (owner live test
-/// 2026-09-07: backend logs proved the answer was produced, yet it never
+/// render as a NEW assistant message in the owning chat (a live-session
+/// bug: backend logs proved the answer was produced, yet it never
 /// appeared). The fake backend delivers it as an out-of-band `message`
 /// frame gated on `capabilities.background_messages`; the session pump
 /// forwards it and the chat folds it without touching the request
@@ -865,7 +865,7 @@ fn background_message_frame_is_gated_on_client_capability() {
     );
 }
 
-// ---- ctrl_l_stop_reset_hotkeys: /stop and /reset through the real glue ----
+// /stop and /reset through the real glue ----
 
 use chibi_tui::app::{Mode, StopResetAction};
 

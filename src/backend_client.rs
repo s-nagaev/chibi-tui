@@ -4,10 +4,10 @@
 //! pipes JSONL frames over stdin/stdout, performs the mandatory
 //! `initialize` → `ready` handshake and shuts the process down gracefully.
 //!
-//! Scope of this module (task 3a — process_lifecycle):
+//! Scope of this module (process lifecycle):
 //! spawn / handshake / `send_raw` / `read_line` / graceful shutdown.
 //!
-//! Out of scope here — task 3b lives in [`crate::request_pipeline`]:
+//! Out of scope here — request correlation lives in [`crate::request_pipeline`]:
 //! request_id correlation, cancel, reconnect, request-level timeouts.
 //!
 //! Errors are reported via [`BackendError`]. A non-zero child exit is only an
@@ -182,7 +182,7 @@ impl BackendClient {
             source: std::io::Error::other("child stdout not captured"),
         })?;
 
-        // feat_stderr_log_modal: stderr is pumped into the diagnostics ring buffer
+        // stderr is pumped into the diagnostics ring buffer
         // (verbatim lines + optional CHIBI_TUI_LOG file mirror) instead of being
         // discarded. Still a fire-and-forget background task: a chatty backend
         // can never deadlock on a full stderr pipe, and the append only
@@ -233,7 +233,7 @@ impl BackendClient {
     ///   zero status → [`BackendError::Handshake`];
     /// - any other frame kind → [`BackendError::Handshake`].
     ///
-    /// feat_stderr_log_modal: the outcome is stamped into the diagnostics
+    /// the outcome is stamped into the diagnostics
     /// stream as a `[tui] handshake ok/failed` lifecycle event.
     pub async fn handshake(&mut self) -> Result<Ready, BackendError> {
         let result = self.handshake_inner().await;
@@ -434,7 +434,7 @@ impl BackendClient {
 }
 
 /// Controlled spawn seam: run an exact argv instead of the production command
-/// line. The request pipeline (task 3b) drives `python3 tests/fake_backend.py`
+/// line. The request pipeline drives `python3 tests/fake_backend.py`
 /// through it; the integration tests rely on the same path.
 pub(crate) async fn spawn_argv(
     workspace_root: &str,
@@ -444,7 +444,7 @@ pub(crate) async fn spawn_argv(
 }
 
 // ---------------------------------------------------------------------------
-// feat_stderr_log_modal: stderr → diagnostics ring buffer
+// stderr → diagnostics ring buffer
 // ---------------------------------------------------------------------------
 
 /// Pump the backend's stderr into the diagnostics log, line by line.
@@ -775,7 +775,7 @@ while true; do sleep 1; done
         );
     }
 
-    // ---- feat_stderr_log_modal: stderr capture ------------------------------
+    // stderr capture ------------------------------
 
     // Pure splitting rules (no pipe needed).
 

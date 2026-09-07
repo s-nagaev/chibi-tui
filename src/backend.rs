@@ -35,8 +35,8 @@ pub enum BackendEvent {
     },
     /// Final markdown answer.
     ///
-    /// `model` is the display label of the model that produced the answer
-    /// (feat_agent_model_label) — already resolved by the source (prefer
+    /// `model` is the display label of the model that produced the answer —
+    /// already resolved by the source (prefer
     /// `model`, fall back to `provider`); `None` renders the plain role
     /// header (fieldless frame, old backend, mock fallback variant).
     Result {
@@ -44,9 +44,9 @@ pub enum BackendEvent {
         markdown: String,
         thread_id: String,
         model: Option<String>,
-        /// Wave-2 latest-turn token accounting; retained in App state.
+        /// Latest-turn token accounting; retained in App state.
         usage: Option<Usage>,
-        /// Wave-2 latest-turn LLM reasoning; retained in App state.
+        /// Latest-turn LLM reasoning; retained in App state.
         thoughts: Option<String>,
     },
     /// Request failed.
@@ -116,7 +116,7 @@ impl Backend for MockBackend {
         self.reply_counter = (self.reply_counter + 1) % crate::mock::MOCK_REPLIES.len();
         let markdown = crate::mock::MOCK_REPLIES[self.reply_counter].to_string();
 
-        // feat_agent_model_label: mock results alternate between a labelled
+        // mock results alternate between a labelled
         // reply (even index) and a fieldless one (odd index) so both the
         // `● Chibi (model)` and the plain fallback rendering are exercised
         // end-to-end in demo/mock mode.

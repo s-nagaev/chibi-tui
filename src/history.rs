@@ -123,7 +123,7 @@ impl From<StoredChat> for Chat {
             // has no live request to resume (see Message::normalized_for_storage).
             lifecycle: crate::model::ChatLifecycle::Idle,
             queue: std::collections::VecDeque::new(),
-            // feat_sidebar_unread_marker: the marker is session-only and
+            // the marker is session-only and
             // stays out of the persisted format entirely.
             unread: false,
             last_usage: stored.last_usage,
@@ -132,7 +132,7 @@ impl From<StoredChat> for Chat {
             // thread never carries thoughts, whatever it reasoned about
             // before the restart.
             last_thoughts: None,
-            // tui_subagents_b5: live subagent counters are session-only —
+            // live subagent counters are session-only —
             // a restart starts every thread with an empty counter map.
             subagent_counts: std::collections::HashMap::new(),
         }
@@ -157,7 +157,7 @@ pub fn save_chat_in(override_dir: Option<&Path>, chat: &Chat) -> std::io::Result
 }
 
 /// Delete one chat's persisted history snapshot, keyed by its stable thread
-/// id (feat_thread_delete). A missing file is treated as success — deleting
+/// id. A missing file is treated as success — deleting
 /// an already-deleted or never-saved chat is idempotent, never an error.
 pub fn delete_chat_file(chat_id: &str) -> std::io::Result<()> {
     delete_chat_file_in(None, chat_id)
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(loaded[0].messages.len(), 3);
     }
 
-    /// tui_thoughts_b1: LLM reasoning is session-only and must NEVER reach
+    /// LLM reasoning is session-only and must NEVER reach
     /// storage. The document is inspected RAW (not just via the loader) so
     /// the test would catch even a serde-visible thoughts field appearing
     /// in the file format; the exact key set proves the structure can carry
@@ -501,7 +501,7 @@ mod tests {
         );
     }
 
-    /// Restart seam for per-answer labels (owner report 2026-09-07): the
+    /// Restart seam for per-answer labels: the
     /// answering model travels with each message through the snapshot, so a
     /// mid-chat switch can never re-label history; pre-label rows (no
     /// `model` key) reload plain — never invented, never backfilled.
@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(path.file_name().unwrap(), "______escape.json");
     }
 
-    // ---- feat_rename_thread: rename persistence ----------------------------
+    // rename persistence ----------------------------
 
     /// The whole point of the rename feature's persistence contract: a saved
     /// renamed chat must come back with the NEW title on the next launch.
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(load_chats_from(Some(&root))[0].name, "after");
     }
 
-    // ---- feat_thread_delete: history file removal ------------------------
+    // history file removal ------------------------
 
     /// Deleting a chat removes its persisted snapshot: the file is gone and
     /// a subsequent load yields nothing.
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(loaded[0].name, "keeper");
     }
 
-    // ---- remember_last_thread: last-active pointer -------------------------
+    // last-active pointer -------------------------
 
     /// The whole point of the pointer's persistence contract: the recorded
     /// id round-trips through the state file, and every new activation

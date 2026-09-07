@@ -19,7 +19,7 @@ pub struct Message {
     /// Never persisted as `true`: a snapshot saved mid-request is reloaded
     /// with the placeholder resolved (see [`Self::normalized_for_storage`]).
     pub pending: bool,
-    /// Model that produced an assistant answer (feat_agent_model_label).
+    /// Model that produced an assistant answer.
     ///
     /// Stamped per-message at result-resolution time, because model
     /// switching must not mislabel earlier replies. Persisted with the
@@ -85,9 +85,9 @@ impl Message {
     /// Storage view of a message: pending placeholders become empty assistant
     /// messages so a restored history never shows a stuck spinner row.
     ///
-    /// The per-message model label travels along (owner report 2026-09-07:
-    /// a mid-chat switch must not re-label old answers, so each answer
-    /// freezes the model that produced it). Additive on disk: the serde
+    /// The per-message model label travels along: a mid-chat switch must
+    /// not re-label old answers, so each answer
+    /// freezes the model that produced it. Additive on disk: the serde
     /// attributes on [`Self::model`] keep snapshots without a label
     /// byte-compatible with the pre-label format, and old files without
     /// the key reload plain.
@@ -195,7 +195,7 @@ mod tests {
         );
     }
 
-    // ---- feat_agent_model_label: per-message model metadata ---------------
+    // per-message model metadata ---------------
 
     #[test]
     fn model_label_is_absent_by_default_and_trim_guarded() {

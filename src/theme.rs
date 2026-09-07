@@ -29,15 +29,15 @@ pub struct Theme {
     /// the sidebar panel and the bare chat background.
     pub input_panel_bg: Color,
     /// Sidebar marker role slot: the dot of the currently selected chat
-    /// (feat_sidebar_unread_marker). A slot, not a raw accent, so a future
+    ///. A slot, not a raw accent, so a future
     /// theme swap only remaps the role.
     pub active_marker: Color,
     /// Sidebar marker role slot: the dot of an inactive thread with an
-    /// unseen background reply (feat_sidebar_unread_marker). Pairs with a
+    /// unseen background reply. Pairs with a
     /// bold name and no row highlight.
     pub unread_activity: Color,
     /// Sidebar marker role slot: the resting dot of a read, unselected
-    /// thread (feat_sidebar_unread_marker).
+    /// thread.
     pub dot_default: Color,
     /// Log viewer role slots: one per diagnostics tier that has no base
     /// accent of its own. `TRACE` lines take a very dim tone, one step
@@ -47,7 +47,7 @@ pub struct Theme {
     /// Log viewer role slot: `DEBUG` lines take the dim gray, visible but
     /// clearly quieter than the default foreground.
     pub log_debug: Color,
-    /// Log viewer search matches (feat_log_viewer_search_copy): every hit
+    /// Log viewer search matches: every hit
     /// inside the rendered text takes this slot, kept apart from the level
     /// colors so a match stays readable on any level tint. The match the
     /// cursor currently sits on reuses the slot with reversed colors.

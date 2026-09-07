@@ -1,9 +1,9 @@
-//! feat_model_picker_lite: parser for the backend's textual `/model` listing.
+//! Parser for the backend's textual `/model` listing.
 //!
 //! The picker popup has NO protocol support — it reuses the plain chat
 //! pipeline: a bare `/model` request answers with a line-per-model listing in
 //! `result.content`, and `/model <n>` answers with a one-line confirmation.
-//! Both formats are captured from the REAL backend (2026-08-28) and committed
+//! Both formats are captured from the REAL backend and committed
 //! as the parser's test fixture
 //! (`tests/fixtures/model_listing_captured.txt`):
 //!

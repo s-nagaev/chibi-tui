@@ -29,18 +29,18 @@ pub mod theme;
 pub mod ui;
 
 // Public re-exports: the protocol type surface consumed by `backend_client`
-// (task 3a) — keep stable.
+// — keep stable.
 pub use crate::protocol::{
     AgentEventKind, Capabilities, ClientInfo, ClientMessage, CursorPosition, ErrorCode,
     ProtocolVersion, Selection, ServerInfo, ServerMessage, StatusState,
 };
 
-// Public re-exports: the process lifecycle surface of the real client (3a).
+// Public re-exports: the process lifecycle surface of the real client.
 pub use crate::backend_client::{BackendClient, BackendError};
 
-// Public re-exports: request correlation surface of the real client (3b).
+// Public re-exports: request correlation surface of the real client.
 pub use crate::request_pipeline::{AgentEventUpdate, RequestArgs, RequestPipeline, StatusUpdate};
 
-// Public re-exports: application-state surface bridging backend → UI (task 4).
+// Public re-exports: application-state surface bridging backend → UI.
 pub use crate::app::{App, Chat, Connection, Submitted};
 pub use crate::live::LiveBackend;
