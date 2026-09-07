@@ -256,28 +256,6 @@ async fn connect_live(
     }
 }
 
-/// Consume the one-shot ^L wipe intent (bugfix_ctrl_l_screen_clear) and emit
-/// the real terminal wipe. Generic over the backend so tests can drive the
-/// consume-emit step with a recording backend instead of a live terminal.
-///
-/// Returns whether an intent was pending. When it was, `Terminal::clear()`
-/// emits the backend's full clear — OUTSIDE ratatui's diff-based draw — and
-/// also resets ratatui's cached back buffer, so the immediately-following
-/// draw repaints every cell and nothing stale lingers. `App::request_clear_
-/// screen` already snapped the chat view to follow-bottom before this fires.
-fn perform_screen_wipe_if_requested<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    app: &mut chibi_tui::app::App,
-    theme: &theme::Theme,
-) -> std::io::Result<bool> {
-    if !app.take_clear_screen_request() {
-        return Ok(false);
-    }
-    terminal.clear()?;
-    terminal.draw(|f| ui::draw(f, app, theme))?;
-    Ok(true)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     terminal: &mut Tui,
@@ -351,6 +329,11 @@ async fn run_loop(
                             // either.
                             let was_help_viewing =
                                 matches!(app.mode, Mode::HelpViewing { .. });
+                            // ctrl_l_stop_reset_hotkeys: the Enter that
+                            // confirms the stop/reset popup belongs to the
+                            // popup, never to the message draft.
+                            let was_confirming_stop_reset =
+                                matches!(app.mode, Mode::ConfirmStopReset { .. });
 
                             handle_key(&mut app, key);
 
@@ -368,6 +351,15 @@ async fn run_loop(
                             // event resolves the pending clone inside App.
                             if let Some(clone_req) = app.take_clone_submission() {
                                 send_submitted(source, &clone_req, event_tx.clone());
+                            }
+
+                            // ctrl_l_stop_reset_hotkeys: a staged /stop or
+                            // /reset control request rides the same
+                            // out-of-band send path — deliberately NOT the
+                            // busy-chat FIFO, which would only run it after
+                            // the very turn it exists to interrupt.
+                            if let Some(control_req) = app.take_control_submission() {
+                                send_submitted(source, &control_req, event_tx.clone());
                             }
 
                             // A rename commit happened iff Enter closed an
@@ -388,6 +380,10 @@ async fn run_loop(
                             // never submit the message draft to the neighbour.
                             let enter_consumed_by_delete =
                                 was_confirming_delete && key.code == KeyCode::Enter;
+                            // ctrl_l_stop_reset_hotkeys: same gate for the
+                            // stop/reset popup's confirming Enter.
+                            let enter_consumed_by_stop_reset =
+                                was_confirming_stop_reset && key.code == KeyCode::Enter;
                             // feat_search_thread: the Enter that jumped to the
                             // selected match belongs to the popup too, so it
                             // must never submit the message draft.
@@ -486,6 +482,7 @@ async fn run_loop(
                                 && source.accepts_submissions()
                                 && should_submit(&key)
                                 && !enter_consumed_by_delete
+                                && !enter_consumed_by_stop_reset
                                 && !enter_consumed_by_search
                                 && !enter_consumed_by_search_all
                                 && !enter_consumed_by_sidebar
@@ -505,18 +502,6 @@ async fn run_loop(
                                 }
                             }
 
-                            // bugfix_ctrl_l_screen_clear: ^L wipes the VISIBLE
-                            // screen. The consume-emit step lives in
-                            // perform_screen_wipe_if_requested (unit-tested
-                            // against a recording backend): the backend clear
-                            // is emitted HERE, outside ratatui's diff-based
-                            // draw; Terminal::clear() also resets ratatui's
-                            // cached back buffer, so the immediately-following
-                            // draw repaints every cell and nothing stale
-                            // lingers. App::request_clear_screen already
-                            // snapped the chat view to follow-bottom before
-                            // this fires.
-                            perform_screen_wipe_if_requested(terminal, &mut app, theme)?;
                         }
                     }
                     Some(Ok(CtEvent::Resize(_, _))) => {
@@ -883,6 +868,36 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         return;
     }
 
+    // ---- ctrl_l_stop_reset_hotkeys: stop/reset confirm popup captures ----
+    // everything ----
+    //
+    // While the ^L (stop) or ⇧^L (reset) confirmation is open, ONLY the
+    // destructive decision keys work: Enter/`y` confirm, Esc/`n` cancel,
+    // Ctrl+C quits — the exact grammar of the delete confirm. Everything
+    // else (typing, arrows, global chords) is swallowed so no keystroke
+    // leaks into the textarea and no global binding fires. `q` is
+    // deliberately unbound here (same destructive-popup rule as the delete
+    // confirm).
+    if matches!(app.mode, Mode::ConfirmStopReset { .. }) {
+        match key.code {
+            KeyCode::Enter => {
+                app.confirm_stop_reset();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') if !ctrl => {
+                app.confirm_stop_reset();
+            }
+            KeyCode::Esc => {
+                app.cancel_stop_reset();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
+                app.cancel_stop_reset();
+            }
+            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            _ => {}
+        }
+        return;
+    }
+
     // ---- feat_search_thread: modal search popup captures everything ----
     //
     // While the Ctrl+F search popup is open, ONLY search keys work: plain
@@ -1093,10 +1108,15 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             // feat_thread_clone: same Normal-mode ^P semantics under sidebar
             // focus (parity contract with the chord match below).
             KeyCode::Char('p') if ctrl => app.begin_clone_thread(),
+            // ctrl_l_stop_reset_hotkeys: same pair as the Normal-mode ^L /
+            // ⇧^L arms below (guarded confirm popups; idle ^L is a no-op).
+            KeyCode::Char('L') if ctrl => app.begin_reset_confirm(),
             KeyCode::Char('l') if ctrl => {
-                // Same pair as the global ^L arm below (clear + wipe intent).
-                app.clear_input();
-                app.request_clear_screen();
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    app.begin_reset_confirm();
+                } else {
+                    app.begin_stop_confirm();
+                }
             }
             KeyCode::Char('f') if ctrl => app.begin_search(),
             // Chat-pane scrolling regardless of focus.
@@ -1152,15 +1172,34 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             app.begin_help_modal();
             return;
         }
+        // Ctrl+L: stop the RUNNING request (ctrl_l_stop_reset_hotkeys) via
+        // the guarded confirm popup; the backend intercepts the staged
+        // `/stop` prompt pre-LLM and reuses the telegram handler core
+        // (task cancel + subagent counter kill-flush). Idle is a silent
+        // no-op: nothing to stop, and the retired screen-wipe semantics
+        // taught that a visible idle action invites accidental clears.
+        // Chord verification (same audit class as ^F/^G/^O/^S/^M): ^L never
+        // reaches the textarea — tui-textarea 0.7 has no Char('l') +
+        // CONTROL mapping (its input match has no ctrl-letter arms beyond
+        // the ones the dispatch claims), so the chord is free.
+        (KeyCode::Char('l'), true) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Kitty-protocol variant that reports the unshifted char with
+            // the SHIFT flag: reset, same as the ⇧^L arm below.
+            app.begin_reset_confirm();
+            return;
+        }
         (KeyCode::Char('l'), true) => {
-            // Readline `^L` kept clearing the input, but in a chat TUI the
-            // hint bar's `^L clear` reads as "wipe the visible screen"
-            // (bugfix_ctrl_l_screen_clear). Both now: input is still cleared,
-            // and a one-shot wipe intent is recorded for the event loop:
-            // the real crossterm Clear(All) + full repaint is emitted there,
-            // outside ratatui's diff-based draw.
-            app.clear_input();
-            app.request_clear_screen();
+            app.begin_stop_confirm();
+            return;
+        }
+        // Shift+Ctrl+L: reset the thread (ctrl_l_stop_reset_hotkeys) via the
+        // guarded confirm popup; the staged `/reset` prompt reaches the
+        // backend out-of-band and a confirmed ack clears the local dialog.
+        // Kitty protocol delivers the chord as Char('L') + CONTROL (the
+        // SHIFT flag may ride along); terminals WITHOUT it degrade to plain
+        // ^L (stop) — documented in the README, same class as ^⇧F.
+        (KeyCode::Char('L'), true) => {
+            app.begin_reset_confirm();
             return;
         }
         (KeyCode::Char('u'), true) => {
@@ -1672,206 +1711,159 @@ mod tests {
         assert_eq!(app.chats.len(), 2, "Ctrl+N creates a new chat");
     }
 
-    // ---- bugfix_ctrl_l_screen_clear ------------------------------------------
+    // ---- ctrl_l_stop_reset_hotkeys ------------------------------------------
+
+    fn busy_app_with_commands(commands: &[&str]) -> chibi_tui::app::App {
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(commands.iter().map(|c| (*c).to_owned()).collect());
+        submit_text(&mut app, "in flight");
+        app
+    }
 
     #[test]
-    fn ctrl_l_wipes_screen_intent_and_resets_scroll_to_bottom() {
-        let mut app = app_with_chats(1);
-        for ch in "hello".chars() {
-            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
-        }
-        app.scroll_up(30);
-        assert!(!app.at_bottom(), "precondition: chat view is scrolled up");
+    fn ctrl_l_busy_opens_stop_confirm_and_idle_is_noop() {
+        // Busy chat: ^L opens the stop confirmation.
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Stop
+            }
+        ));
 
+        // Idle chat: silent no-op (retired wipe semantics stay retired).
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(vec!["/stop".to_owned()]);
+        type_in(&mut app, "draft survives");
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(app.mode.is_normal(), "idle ^L must not open the popup");
+        assert_eq!(app.input.lines().join(""), "draft survives");
+        assert!(app.take_control_submission().is_none());
+    }
+
+    #[test]
+    fn ctrl_l_without_backend_support_shows_toast() {
+        let mut app = busy_app_with_commands(&["/reset"]);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(
+            app.mode.is_normal(),
+            "no popup without the advertised command"
+        );
+        assert!(app.status_message.is_some(), "transient toast explains");
+    }
+
+    #[test]
+    fn shift_ctrl_l_opens_reset_confirm_in_both_kitty_variants() {
+        // Kitty protocol: shifted chord arrives as Char('L') + CONTROL.
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(vec!["/stop".to_owned(), "/reset".to_owned()]);
+        press(
+            &mut app,
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Reset
+            }
+        ));
+
+        // Variant where the unshifted char rides with the SHIFT flag.
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(vec!["/stop".to_owned(), "/reset".to_owned()]);
+        press(
+            &mut app,
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Reset
+            }
+        ));
+
+        // Plain ^L stays STOP even while the reset capability exists.
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Stop
+            }
+        ));
+    }
+
+    #[test]
+    fn stop_confirm_keys_follow_the_delete_confirm_grammar() {
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
         press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
 
-        assert!(
-            app.input.lines().iter().all(|l| l.is_empty()),
-            "^L keeps clearing the input (readline compatibility)"
-        );
-        assert_eq!(
-            app.scroll, 0,
-            "screen wipe snaps the chat view back to follow-bottom"
-        );
-        assert!(app.at_bottom());
-        assert!(
-            app.take_clear_screen_request(),
-            "one-shot wipe intent handed to the event loop"
-        );
-
-        // Esc is unchanged: input-clear only, never a screen wipe.
-        for ch in "again".chars() {
-            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
-        }
+        // Esc cancels; 'n' cancels; Enter confirms; 'y' confirms.
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(app.input.lines().iter().all(|l| l.is_empty()));
-        assert!(!app.clear_screen_requested, "Esc must not request a wipe");
-    }
+        assert!(app.mode.is_normal());
+        assert!(app.take_control_submission().is_none());
 
-    // ---- ^L wipe consumer (perform_screen_wipe_if_requested) ----------------
-    //
-    // The handler-side intent (press → request_clear_screen) is pinned above;
-    // these tests pin the OTHER half of the lifecycle: the event-loop consumer
-    // that turns the one-shot intent into a real backend clear + full repaint,
-    // OUTSIDE ratatui's diff-based draw.
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(app.mode.is_normal());
 
-    /// Recording backend: counts the commands ratatui issues to the terminal
-    /// layer without touching a real terminal. `clear()` is the hook ratatui's
-    /// `Terminal::clear()` drives for a full wipe; `cell_writes` counts every
-    /// cell update pushed through `draw`, which makes a diff-based partial
-    /// repaint distinguishable from a full-frame repaint (a cold draw and a
-    /// post-wipe draw both diff against a reset back buffer, so both push the
-    /// same full-frame count).
-    struct WipeProbeBackend {
-        area: ratatui::layout::Size,
-        cell_writes: usize,
-        clear_all: usize,
-        flushes: usize,
-    }
-
-    impl WipeProbeBackend {
-        fn new(width: u16, height: u16) -> Self {
-            Self {
-                area: ratatui::layout::Size::new(width, height),
-                cell_writes: 0,
-                clear_all: 0,
-                flushes: 0,
-            }
-        }
-    }
-
-    impl ratatui::backend::Backend for WipeProbeBackend {
-        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
-        where
-            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
-        {
-            self.cell_writes += content.count();
-            Ok(())
-        }
-
-        fn hide_cursor(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn show_cursor(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
-            Ok(ratatui::layout::Position::ORIGIN)
-        }
-
-        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
-            &mut self,
-            _position: P,
-        ) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn clear(&mut self) -> std::io::Result<()> {
-            self.clear_all += 1;
-            Ok(())
-        }
-
-        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
-            Ok(self.area)
-        }
-
-        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
-            Ok(ratatui::backend::WindowSize {
-                columns_rows: self.area,
-                pixels: ratatui::layout::Size::ZERO,
-            })
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.flushes += 1;
-            Ok(())
-        }
-    }
-
-    fn wipe_probe_terminal(width: u16, height: u16) -> Terminal<WipeProbeBackend> {
-        Terminal::new(WipeProbeBackend::new(width, height)).expect("probe terminal")
-    }
-
-    #[test]
-    fn screen_wipe_consumes_intent_emits_clear_and_full_repaint_exactly_once() {
-        let theme = theme::Theme::tokyo_night();
-        let mut app = app_with_chats(1);
-        let mut terminal = wipe_probe_terminal(80, 24);
-        terminal
-            .draw(|f| ui::draw(f, &mut app, &theme))
-            .expect("initial frame");
-        let (base_clears, base_writes, base_flushes) = {
-            let b = terminal.backend();
-            (b.clear_all, b.cell_writes, b.flushes)
-        };
-        // The cold first draw diffs against a reset back buffer, so it pushes
-        // the entire frame — the exact count a post-wipe draw must match.
-        let frame_writes = base_writes;
-
-        app.request_clear_screen();
-        let wiped =
-            perform_screen_wipe_if_requested(&mut terminal, &mut app, &theme).expect("wipe call");
-        assert!(wiped, "pending wipe intent consumed by the loop-side unit");
-        {
-            let b = terminal.backend();
-            assert_eq!(
-                b.clear_all - base_clears,
-                1,
-                "exactly one backend clear per wipe, never zero, never two"
-            );
-            assert_eq!(
-                b.cell_writes - base_writes,
-                frame_writes,
-                "post-clear draw repaints the FULL frame (diff against the \
-                 reset back buffer), not a partial diff"
-            );
-            assert!(b.flushes > base_flushes, "frame actually flushed");
-        }
-
-        // One-shot: the next unrelated cycle consumes nothing and emits nothing.
-        let (clears, writes, flushes) = {
-            let b = terminal.backend();
-            (b.clear_all, b.cell_writes, b.flushes)
-        };
-        let again =
-            perform_screen_wipe_if_requested(&mut terminal, &mut app, &theme).expect("re-call");
-        assert!(!again, "intent is one-shot: no sticky re-clear");
-        {
-            let b = terminal.backend();
-            assert_eq!(b.clear_all, clears, "no Clear(All) spam after the wipe");
-            assert_eq!(b.cell_writes, writes, "no stray cell writes");
-            assert_eq!(b.flushes, flushes);
-        }
-    }
-
-    #[test]
-    fn screen_wipe_without_pending_intent_never_touches_the_terminal() {
-        let theme = theme::Theme::tokyo_night();
-        let mut app = app_with_chats(1);
-        let mut terminal = wipe_probe_terminal(80, 24);
-        terminal
-            .draw(|f| ui::draw(f, &mut app, &theme))
-            .expect("initial frame");
-        let (clears, writes, flushes) = {
-            let b = terminal.backend();
-            (b.clear_all, b.cell_writes, b.flushes)
-        };
-
-        let wiped =
-            perform_screen_wipe_if_requested(&mut terminal, &mut app, &theme).expect("no-op");
-        assert!(!wiped, "no intent -> no wipe");
-        let b = terminal.backend();
-        assert_eq!(
-            b.clear_all, clears,
-            "Clear(All) is emitted ONLY on the ^L intent, never routinely"
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        // Deliberately n/y-free: plain n/y ARE the popup's decision keys.
+        type_in(&mut app, "swallowed draft");
+        assert!(
+            matches!(app.mode, chibi_tui::app::Mode::ConfirmStopReset { .. }),
+            "plain typing must not close the popup"
         );
-        assert_eq!(b.cell_writes, writes);
-        assert_eq!(b.flushes, flushes);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.mode.is_normal());
+        let staged = app
+            .take_control_submission()
+            .expect("stop staged on confirm");
+        assert_eq!(staged.prompt, "/stop");
+        assert_eq!(staged.thread_id, app.chats[app.active].id);
+        // The chat lifecycle stays on the RUNNING request, not the control.
+        assert_ne!(
+            app.chats[app.active].lifecycle.request_id(),
+            Some(staged.request_id.as_str()),
+            "the killed request keeps the chat's lifecycle until its own cancel resolves"
+        );
     }
 
-    // ---- should_submit -------------------------------------------------------    // ---- should_submit -------------------------------------------------------
+    #[test]
+    fn reset_confirm_stages_reset_command_and_cancels_cleanly() {
+        let mut app = app_with_chats(1);
+        app.set_backend_commands(vec!["/stop".to_owned(), "/reset".to_owned()]);
+        press(
+            &mut app,
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        let staged = app
+            .take_control_submission()
+            .expect("reset staged on confirm");
+        assert_eq!(staged.prompt, "/reset");
+        assert_eq!(staged.thread_id, app.chats[app.active].id);
+        assert!(app.mode.is_normal());
+    }
+
+    #[test]
+    fn stop_and_reset_are_gated_on_the_handshake_command_list() {
+        // Mocks and offline sessions never advertise the commands.
+        let mut app = app_with_chats(1);
+        press(
+            &mut app,
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(app.mode.is_normal(), "no popup on an older backend");
+        assert!(app.take_control_submission().is_none());
+    }
+
+    // ---- should_submit -------------------------------------------------------
 
     #[test]
     fn should_submit_enter_returns_true() {
@@ -2089,14 +2081,18 @@ mod tests {
     // ---- extended input keybindings ------------------------------------------
 
     #[test]
-    fn ctrl_l_clears_input() {
+    fn ctrl_l_idle_neither_clears_input_nor_stages_anything() {
         let mut app = app_with_chats(1);
         for ch in "hello".chars() {
             press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
         }
         assert_eq!(app.input.lines().join(""), "hello");
         press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
-        assert!(app.input.lines().iter().all(|l| l.is_empty()));
+        assert!(
+            app.input.lines().join("") == "hello",
+            "idle ^L is a silent no-op: no input clear, no popup, no request"
+        );
+        assert!(app.take_control_submission().is_none());
     }
 
     #[test]
@@ -2682,9 +2678,8 @@ mod tests {
 
     /// Global service chords stay live with their exact Normal-mode
     /// semantics while the sidebar holds focus: ^F / ^⇧F open searches,
-    /// ^D opens the guarded confirm popup, ^L clears input + records the
-    /// screen-wipe intent, ^R enters rename — and closing any of them hands
-    /// focus back to Chat.
+    /// ^D opens the guarded confirm popup, ^L opens the stop confirm popup,
+    /// ^R enters rename — and closing any of them hands focus back to Chat.
     #[test]
     fn service_chords_stay_live_while_sidebar_focused() {
         // Each chord gets its own fresh app so lifecycles can't interfere.
@@ -2731,13 +2726,20 @@ mod tests {
         assert!(app.mode.is_normal());
         assert_eq!(app.focus, chibi_tui::app::Focus::Chat, "popup close resets");
 
-        // ^L clears input + wipes screen intent while Sidebar focused.
+        // ^L opens the stop confirm while Sidebar focused (idle chat would be
+        // a no-op; a busy chat opens the popup — parity with Normal mode).
         let mut app = app_with_chats(1);
-        type_in(&mut app, "gone");
+        app.set_backend_commands(vec!["/stop".to_owned(), "/reset".to_owned()]);
+        submit_text(&mut app, "in flight");
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
-        assert!(app.input.lines().iter().all(|l| l.is_empty()));
-        assert!(app.take_clear_screen_request(), "wipe intent recorded");
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Stop
+            }
+        ));
+        app.cancel_stop_reset();
 
         // ^R renames from the sidebar; committing returns focus to Chat.
         let mut app = app_with_chats(1);
@@ -3005,7 +3007,10 @@ mod tests {
             matches!(app.mode, chibi_tui::app::Mode::ConfirmDelete),
             "popup must stay open"
         );
-        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(
+            !matches!(app.mode, chibi_tui::app::Mode::ConfirmStopReset { .. }),
+            "Ctrl+L must not fire"
+        );
         assert!(!app.should_quit);
         // q is deliberately unbound inside the popup — a stray q must not
         // quit while a destructive confirmation is on screen.
@@ -3115,7 +3120,10 @@ mod tests {
         assert_eq!(app.active, 0, "thread switch must not fire");
         assert_eq!(app.chats.len(), 2, "Ctrl+N must not fire");
         assert_eq!(app.scroll, scroll_before, "PgUp/PgDn must not scroll");
-        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(
+            !matches!(app.mode, chibi_tui::app::Mode::ConfirmStopReset { .. }),
+            "Ctrl+L must not fire"
+        );
         assert!(!app.should_quit);
         assert!(app.pending_search_jump.is_none());
     }
@@ -3419,7 +3427,10 @@ mod tests {
         assert_eq!(app.active, 0, "thread switch must not fire");
         assert_eq!(app.chats.len(), 2, "Ctrl+N must not fire");
         assert_eq!(app.scroll, scroll_before, "PgUp/PgDn must not scroll");
-        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(
+            !matches!(app.mode, chibi_tui::app::Mode::ConfirmStopReset { .. }),
+            "Ctrl+L must not fire"
+        );
         assert!(!app.should_quit);
         assert!(app.pending_global_search_jump.is_none());
     }
@@ -3681,7 +3692,10 @@ mod tests {
         );
         assert_eq!(app.chats.len(), 3, "Ctrl+N must not fire");
         assert_eq!(app.scroll, scroll_before, "PgUp-style chat scroll blocked");
-        assert!(!app.clear_screen_requested, "Ctrl+L must not fire");
+        assert!(
+            !matches!(app.mode, chibi_tui::app::Mode::ConfirmStopReset { .. }),
+            "Ctrl+L must not fire"
+        );
         assert!(!app.should_quit);
         assert_eq!(
             app.input.lines().join(""),
@@ -4366,7 +4380,16 @@ mod tests {
         ("Global", "Ctrl+O", "toggle the status strip"),
         ("Global", "Ctrl+S", "toggle the thoughts block"),
         ("Global", "Ctrl+M", "open the model picker"),
-        ("Global", "Ctrl+L", "clear the input · wipe the screen"),
+        (
+            "Global",
+            "Ctrl+L",
+            "stop the running request (confirmation)",
+        ),
+        (
+            "Global",
+            "Shift+Ctrl+L",
+            "reset this thread · clear the dialog (confirmation)",
+        ),
         ("Global", "Ctrl+↑/↓ · Alt+↑/↓", "switch the active thread"),
         ("Global", "PgUp / PgDn", "scroll the chat view"),
         ("Global", "Esc", "clear the input · dismiss popups"),
@@ -4578,7 +4601,7 @@ mod tests {
             (
                 "Ctrl+L".into(),
                 vec![e(KeyCode::Char('l'), M::CONTROL)],
-                DraftEffect::Cleared,
+                DraftEffect::Unchanged,
                 false,
             ),
             (

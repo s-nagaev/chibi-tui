@@ -864,3 +864,186 @@ fn background_message_frame_is_gated_on_client_capability() {
         "continuation must arrive after the parent result"
     );
 }
+
+// ---- ctrl_l_stop_reset_hotkeys: /stop and /reset through the real glue ----
+
+use chibi_tui::app::{Mode, StopResetAction};
+
+/// Fold events from a SHARED channel until both terminal kinds arrived (the
+/// killed request's error and the control request's result), applying each
+/// through App exactly like the event loop does.
+async fn fold_until_both_terminals(
+    rx: &mut tokio::sync::mpsc::Receiver<BackendEvent>,
+    app: &mut App,
+) -> Vec<BackendEvent> {
+    let mut events = Vec::new();
+    let mut saw_result = false;
+    let mut saw_error = false;
+    for _ in 0..40 {
+        let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+            .await
+            .expect("event in time")
+            .expect("channel alive");
+        match &evt {
+            BackendEvent::Result { .. } => saw_result = true,
+            BackendEvent::Error { .. } => saw_error = true,
+            _ => {}
+        }
+        app.apply_backend_event(evt.clone());
+        events.push(evt);
+        if saw_result && saw_error {
+            return events;
+        }
+    }
+    panic!("terminal events never both arrived: {events:?}");
+}
+
+/// /stop issued while a request runs: the killed request resolves through
+/// its own clean cancelled error, the control request resolves with the
+/// backend's feedback text, the dialog STAYS (stop never clears) and the
+/// lifecycle returns to idle with no zombie placeholder.
+#[tokio::test]
+async fn stop_command_kills_running_request_end_to_end() {
+    let live = connect(&["--result-delay", "5"]).await;
+    let mut app = app_with_one_chat();
+    app.set_backend_commands(vec!["/stop".to_owned(), "/reset".to_owned()]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let submitted = submitted_for(&app, "long running");
+    app.begin_request(&submitted);
+    live.submit_encoded(submitted, tx.clone());
+
+    // Drive to the running state before stopping.
+    loop {
+        let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+            .await
+            .expect("event in time")
+            .expect("channel alive");
+        let running = matches!(&evt, BackendEvent::Running { .. });
+        app.apply_backend_event(evt.clone());
+        if running {
+            break;
+        }
+    }
+    assert!(app.chats[0].is_busy(), "precondition: request in flight");
+
+    // Stage and send the control request through the App seam (the same
+    // out-of-band path the event loop uses — never the busy FIFO).
+    app.begin_stop_confirm();
+    assert!(matches!(
+        app.mode,
+        Mode::ConfirmStopReset {
+            action: StopResetAction::Stop
+        }
+    ));
+    app.confirm_stop_reset();
+    let control = app
+        .take_control_submission()
+        .expect("stop staged on confirm");
+    assert_eq!(control.prompt, "/stop");
+    live.submit_encoded(control, tx);
+
+    let events = fold_until_both_terminals(&mut rx, &mut app).await;
+
+    // The chat resolved to idle: no zombie pending state, no spinner leak.
+    assert_eq!(
+        app.chats[0].lifecycle,
+        ChatLifecycle::Idle,
+        "the killed request's cancelled error resolved the lifecycle"
+    );
+    // The dialog STAYS: the user bubble plus the cancelled error bubble.
+    let transcript: Vec<&str> = app.chats[0]
+        .messages
+        .iter()
+        .map(|m| m.markdown.as_str())
+        .collect();
+    assert!(
+        transcript.iter().any(|t| t.contains("Cancelled")),
+        "the killed request surfaced its cancellation: {transcript:?}"
+    );
+    assert!(
+        !transcript.iter().any(|t| t.contains("Everything stopped.")),
+        "the control request's own answer never leaks into the transcript"
+    );
+    assert!(
+        app.status_message
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Everything stopped.")),
+        "the backend's feedback text arrived as the toast"
+    );
+    assert!(
+        !events.is_empty(),
+        "the fake answered both the kill and the stop"
+    );
+
+    let _ = live.shutdown().await;
+}
+
+/// /reset confirmed while a request runs: the killed request resolves,
+/// the control ack clears the dialog (messages, queue, thoughts, counters)
+/// and the lifecycle returns to idle — the local mirror of the backend's
+/// thread-scoped history drop.
+#[tokio::test]
+async fn reset_command_clears_dialog_end_to_end() {
+    let live = connect(&["--result-delay", "5"]).await;
+    let mut app = app_with_one_chat();
+    app.set_backend_commands(vec!["/stop".to_owned(), "/reset".to_owned()]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let submitted = submitted_for(&app, "doomed turn");
+    app.begin_request(&submitted);
+    live.submit_encoded(submitted, tx.clone());
+    loop {
+        let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+            .await
+            .expect("event in time")
+            .expect("channel alive");
+        let running = matches!(&evt, BackendEvent::Running { .. });
+        app.apply_backend_event(evt.clone());
+        if running {
+            break;
+        }
+    }
+
+    // A queued prompt waits behind the running turn; the reset must clear it.
+    app.chats[0].queue.push_back("queued survivor?".to_owned());
+
+    app.begin_reset_confirm();
+    assert!(matches!(
+        app.mode,
+        Mode::ConfirmStopReset {
+            action: StopResetAction::Reset
+        }
+    ));
+    app.confirm_stop_reset();
+    let control = app
+        .take_control_submission()
+        .expect("reset staged on confirm");
+    assert_eq!(control.prompt, "/reset");
+    live.submit_encoded(control, tx);
+
+    fold_until_both_terminals(&mut rx, &mut app).await;
+
+    assert_eq!(
+        app.chats[0].lifecycle,
+        ChatLifecycle::Idle,
+        "reset leaves the chat idle"
+    );
+    assert!(
+        app.chats[0].messages.is_empty(),
+        "the dialog view is cleared on the reset ack"
+    );
+    assert!(
+        app.chats[0].queue.is_empty(),
+        "queued prompts do not survive a reset"
+    );
+    assert!(app.chats[0].last_thoughts.is_none());
+    assert!(
+        app.status_message
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("Done!")),
+        "the backend's ack text arrived as the toast"
+    );
+
+    let _ = live.shutdown().await;
+}

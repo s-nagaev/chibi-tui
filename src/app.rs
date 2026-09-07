@@ -345,6 +345,13 @@ pub enum Mode {
     /// key is swallowed by the modal branch in `main.rs` so nothing leaks
     /// into the textarea or triggers a global binding.
     ConfirmDelete,
+    /// The ^L / ⇧^L stop-reset confirmation popup is open
+    /// (ctrl_l_stop_reset_hotkeys). `action` selects which destructive
+    /// command the confirmation stages: stop the running request (/stop) or
+    /// reset the thread (/reset + local dialog clear). Enter/`y` confirm,
+    /// Esc/`n` cancel; every other key is swallowed by the modal branch in
+    /// `main.rs` — same grammar and isolation as [`Mode::ConfirmDelete`].
+    ConfirmStopReset { action: StopResetAction },
     /// The Ctrl+F in-thread search popup is open (feat_search_thread):
     /// `state` holds the query buffer, cached match list and selection.
     /// Modal-ish isolation mirrors ConfirmDelete — keystrokes go to the
@@ -564,11 +571,6 @@ pub struct App {
     /// Set by `R` in the error popup; the event loop performs the async
     /// reconnect and clears it.
     pub reconnect_requested: Option<ReconnectRequest>,
-    /// One-shot screen-wipe intent set by Ctrl+L (bugfix_ctrl_l_screen_clear)
-    /// and consumed by the main loop, which emits the real crossterm
-    /// `Clear(All)` outside ratatui's diff-based draw and forces a full
-    /// repaint. Visual-only: messages, history and bindings are untouched.
-    pub clear_screen_requested: bool,
     /// Cancel target `(request_id, thread_id)` produced by Ctrl+C; the event
     /// loop sends the actual frame. Targets ONLY the active chat's in-flight
     /// request — queued prompts survive a cancel.
@@ -686,6 +688,17 @@ pub struct App {
     /// correlation, held between staging and the backend ack. An error
     /// resolution drops it, so a failed clone leaves no orphan thread.
     pending_clone: Option<PendingClone>,
+    /// ctrl_l_stop_reset_hotkeys: the /stop or /reset control request staged
+    /// by the confirm popup for the event loop to send (same seam as
+    /// `clone_submission`). It travels OUT-OF-BAND on purpose: both commands
+    /// exist precisely to act while a request is still running, so the
+    /// busy-chat FIFO queue must never delay them.
+    control_submission: Option<Submitted>,
+    /// ctrl_l_stop_reset_hotkeys: the in-flight control request's
+    /// correlation, held between staging and the backend ack. A stop never
+    /// touches the chat lifecycle (the killed request resolves itself via
+    /// its own cancelled error); a reset clears the dialog on the ack.
+    pending_control: Option<PendingControl>,
     /// Wave-2 latest-turn metadata from the most recent `result` frames.
     ///
     /// Usage is the sticky last-known token count: a terminal frame updates
@@ -714,6 +727,28 @@ struct PendingClone {
     chat: Chat,
     request_id: String,
     source_id: String,
+}
+
+/// ctrl_l_stop_reset_hotkeys: which destructive command the stop/reset
+/// confirmation popup stages. `Stop` maps to the backend's `/stop` command
+/// (telegram kill-all + counter flush semantics); `Reset` to `/reset`,
+/// which additionally clears the local dialog once the backend acks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopResetAction {
+    /// ^L: stop the running request.
+    Stop,
+    /// ⇧^L: reset the thread and clear the dialog.
+    Reset,
+}
+
+/// ctrl_l_stop_reset_hotkeys: a /stop or /reset control request in flight.
+/// Terminal frames matching `(thread_id, request_id)` are consumed by
+/// [`App::apply_control_event`] before the normal chat routing would drop
+/// them as uncorrelated (the chat keeps tracking the request being killed).
+struct PendingControl {
+    kind: StopResetAction,
+    request_id: String,
+    thread_id: String,
 }
 
 /// feat_model_picker_lite: what a hidden (transcript-suppressed) request is
@@ -803,7 +838,6 @@ impl App {
             error_popup: None,
             connection: Connection::Connecting,
             reconnect_requested: None,
-            clear_screen_requested: false,
             pending_cancel: None,
             pending_delete: None,
             status_message: None,
@@ -825,6 +859,8 @@ impl App {
             backend_commands: Vec::new(),
             clone_submission: None,
             pending_clone: None,
+            control_submission: None,
+            pending_control: None,
             last_turn_usage,
             thoughts_visible: true,
         }
@@ -1040,6 +1076,7 @@ impl App {
             // a seperate state).
             Mode::Normal
             | Mode::ConfirmDelete
+            | Mode::ConfirmStopReset { .. }
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
@@ -1064,6 +1101,7 @@ impl App {
             // exactly like Normal.
             Mode::Normal
             | Mode::ConfirmDelete
+            | Mode::ConfirmStopReset { .. }
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
@@ -1087,6 +1125,7 @@ impl App {
             // viewer): no-op.
             Mode::Normal
             | Mode::ConfirmDelete
+            | Mode::ConfirmStopReset { .. }
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
@@ -2239,26 +2278,6 @@ impl App {
             .set_placeholder_text("Type a message…  (\u{23ce} send)");
     }
 
-    // ---- screen clear (bugfix_ctrl_l_screen_clear) -------------------------
-
-    /// Testable seam behind `Ctrl+L`: record the one-shot screen-wipe intent
-    /// AND reset the chat view state to follow-bottom (`scroll = 0`), so the
-    /// post-clear full repaint shows the newest messages.
-    ///
-    /// Visual-only: messages, history files, popups and other bindings are
-    /// untouched. The main loop consumes the flag via
-    /// [`App::take_clear_screen_request`] and performs the real terminal
-    /// `Clear(All)` + immediate full repaint — unit tests need no terminal.
-    pub fn request_clear_screen(&mut self) {
-        self.scroll = 0;
-        self.clear_screen_requested = true;
-    }
-
-    /// Consume the pending screen-wipe intent (one-shot; main loop only).
-    pub fn take_clear_screen_request(&mut self) -> bool {
-        std::mem::take(&mut self.clear_screen_requested)
-    }
-
     // ---- thread delete (feat_thread_delete) -------------------------------
 
     /// Open the delete-confirmation popup for the ACTIVE chat — IDLE ONLY.
@@ -2327,6 +2346,214 @@ impl App {
         self.select_chat(self.active);
         self.pending_delete = Some(removed_id.clone());
         Some(removed_id)
+    }
+
+    // ---- stop / reset (ctrl_l_stop_reset_hotkeys) --------------------------
+
+    /// Slash command the backend translates into the telegram /stop core
+    /// (cancel the thread's running request + subagent counter kill-flush).
+    pub const STOP_COMMAND: &str = "/stop";
+
+    /// Slash command the backend intercepts pre-LLM to reset the thread's
+    /// history (telegram /reset core).
+    pub const RESET_COMMAND: &str = "/reset";
+
+    /// Whether the connected backend advertises `/stop` at handshake. Mocks
+    /// and offline sessions never do, so the ^L confirm stays honest there.
+    pub fn supports_stop(&self) -> bool {
+        self.backend_commands
+            .iter()
+            .any(|command| command == Self::STOP_COMMAND)
+    }
+
+    /// Whether the connected backend advertises `/reset` at handshake.
+    pub fn supports_reset(&self) -> bool {
+        self.backend_commands
+            .iter()
+            .any(|command| command == Self::RESET_COMMAND)
+    }
+
+    /// Open the stop-confirmation popup for the ACTIVE chat — BUSY ONLY.
+    ///
+    /// Stopping is meaningless without a turn in flight, so an idle chat is
+    /// a silent no-op (the retired ^L screen-wipe taught that a chord that
+    /// "does something visible" while idle invites accidental clears; the
+    /// disabled-modal alternative adds state for no information). No-op
+    /// outside Normal mode (a rename session or another popup owns the
+    /// keyboard). An older backend that never advertised `/stop` gets a
+    /// transient toast instead of a dead popup.
+    pub fn begin_stop_confirm(&mut self) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        if !self.supports_stop() {
+            self.show_status("backend does not support /stop");
+            return;
+        }
+        let Some(chat) = self.chats.get(self.active) else {
+            return;
+        };
+        if !chat.is_busy() {
+            return;
+        }
+        self.mode = Mode::ConfirmStopReset {
+            action: StopResetAction::Stop,
+        };
+    }
+
+    /// Open the reset-confirmation popup for the ACTIVE chat. Unlike stop,
+    /// resetting an idle thread is meaningful (it drops the stored history
+    /// and clears the dialog), so only the mode/no-chat guards apply.
+    pub fn begin_reset_confirm(&mut self) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        if !self.supports_reset() {
+            self.show_status("backend does not support /reset");
+            return;
+        }
+        if self.chats.get(self.active).is_none() {
+            return;
+        }
+        self.mode = Mode::ConfirmStopReset {
+            action: StopResetAction::Reset,
+        };
+    }
+
+    /// Leave the stop/reset popup without acting. The active chat, its
+    /// messages and the message draft are untouched.
+    pub fn cancel_stop_reset(&mut self) -> bool {
+        if !matches!(self.mode, Mode::ConfirmStopReset { .. }) {
+            return false;
+        }
+        self.mode = Mode::Normal;
+        self.focus = Focus::Chat;
+        true
+    }
+
+    /// Confirm the popup: stages the `/stop` or `/reset` control request for
+    /// the event loop to send OUT-OF-BAND (never through the busy-chat FIFO
+    /// — the whole point is to act while a turn is still running). The chat
+    /// lifecycle is deliberately untouched here: the chat keeps tracking the
+    /// request the backend is about to kill, and that request resolves
+    /// through its own `cancelled` error frame.
+    pub fn confirm_stop_reset(&mut self) {
+        let Mode::ConfirmStopReset { action } = self.mode else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        self.focus = Focus::Chat;
+        let Some(chat) = self.chats.get(self.active) else {
+            return;
+        };
+        let prompt = match action {
+            StopResetAction::Stop => Self::STOP_COMMAND.to_owned(),
+            StopResetAction::Reset => Self::RESET_COMMAND.to_owned(),
+        };
+        let request_id = crate::history::new_request_id();
+        let thread_id = chat.id.clone();
+        self.pending_control = Some(PendingControl {
+            kind: action,
+            request_id: request_id.clone(),
+            thread_id: thread_id.clone(),
+        });
+        self.control_submission = Some(Submitted {
+            request_id,
+            thread_id,
+            prompt,
+        });
+    }
+
+    /// Hand the staged control request to the event loop. One-shot, same
+    /// pattern as [`App::take_clone_submission`].
+    pub fn take_control_submission(&mut self) -> Option<Submitted> {
+        self.control_submission.take()
+    }
+
+    /// Resolve a frame that belongs to the pending /stop or /reset control
+    /// request. Returns true when the frame was consumed here, so the normal
+    /// chat routing never sees it (the chat still tracks the request being
+    /// killed and would drop it as an id mismatch anyway; intercepting keeps
+    /// that accident-proof).
+    ///
+    /// Progress frames are consumed silently. The terminal result toasts the
+    /// backend's own feedback text ("Everything stopped." / "Done!");
+    /// a confirmed reset additionally clears the dialog view of the thread
+    /// it reset (messages, FIFO queue, thoughts, subagent counters —
+    /// mirroring the backend's thread-scoped history drop; sticky ctx/model
+    /// view state survives per the sticky-display contract). Errors surface
+    /// through the modal error popup with the backend's own text; a failed
+    /// reset never clears the dialog locally.
+    fn apply_control_event(&mut self, event: &BackendEvent) -> bool {
+        let Some(pending) = &self.pending_control else {
+            return false;
+        };
+        match event {
+            BackendEvent::Queued {
+                request_id,
+                thread_id,
+            }
+            | BackendEvent::Running {
+                request_id,
+                thread_id,
+            }
+            | BackendEvent::AgentProgress {
+                request_id,
+                thread_id,
+                ..
+            } => {
+                thread_id == &pending.thread_id
+                    && event_matches_request(*request_id, &pending.request_id)
+            }
+            BackendEvent::Result {
+                request_id,
+                thread_id,
+                markdown,
+                ..
+            } => {
+                if thread_id != &pending.thread_id
+                    || !event_matches_request(*request_id, &pending.request_id)
+                {
+                    return false;
+                }
+                let pending = self.pending_control.take().expect("pending checked above");
+                if pending.kind == StopResetAction::Reset {
+                    if let Some(chat) = self.chats.iter_mut().find(|c| c.id == pending.thread_id) {
+                        chat.messages.clear();
+                        chat.queue.clear();
+                        chat.last_thoughts = None;
+                        chat.subagent_counts.clear();
+                        chat.lifecycle = ChatLifecycle::Idle;
+                    }
+                    if self.active_thread_id() == Some(pending.thread_id.as_str()) {
+                        self.scroll = 0;
+                    }
+                }
+                self.show_status(markdown.trim());
+                true
+            }
+            BackendEvent::Error {
+                request_id,
+                message,
+                thread_id,
+            } => {
+                let ours = thread_id.as_deref() == Some(pending.thread_id.as_str())
+                    && event_matches_request(*request_id, &pending.request_id);
+                if !ours {
+                    return false;
+                }
+                self.pending_control = None;
+                if is_transport_failure(message) {
+                    self.connection = Connection::Disconnected;
+                }
+                self.show_error(message.clone());
+                true
+            }
+            // Not control-related (or no lifecycle frame at all).
+            BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => false,
+            // Unreachable: handled by the early return in apply_backend_event.
+            BackendEvent::BackgroundMessage { .. } => false,
+        }
     }
 
     // ---- thread clone (feat_thread_clone) ----------------------------------
@@ -2574,6 +2801,15 @@ impl App {
         // the clone itself and never reaches the chat routing below, which
         // would drop it as an unknown thread id and hang the clone forever.
         if self.apply_clone_event(&event) {
+            return;
+        }
+
+        // ctrl_l_stop_reset_hotkeys: a frame of the pending /stop or /reset
+        // control request resolves the control itself and never reaches the
+        // chat routing below — the chat keeps tracking the request the
+        // control just killed, and the control's own terminal frame must not
+        // disturb that lifecycle.
+        if self.apply_control_event(&event) {
             return;
         }
 
@@ -3158,39 +3394,6 @@ mod tests {
         let mut app = App::new(Vec::new());
         app.scroll_up(u16::MAX);
         assert_eq!(app.scroll, u16::MAX / 2);
-    }
-
-    // ---- bugfix_ctrl_l_screen_clear -----------------------------------------
-
-    #[test]
-    fn request_clear_screen_resets_scroll_to_follow_bottom() {
-        let mut app = App::new(Vec::new());
-        app.scroll_up(37);
-        assert!(!app.at_bottom());
-        assert!(!app.clear_screen_requested, "precondition: no wipe pending");
-
-        app.request_clear_screen();
-
-        assert_eq!(
-            app.scroll, 0,
-            "^L snaps the chat view back to follow-bottom"
-        );
-        assert!(app.at_bottom());
-        assert!(
-            app.clear_screen_requested,
-            "wipe intent recorded for the event loop"
-        );
-    }
-
-    #[test]
-    fn take_clear_screen_request_is_one_shot() {
-        let mut app = App::new(Vec::new());
-        app.request_clear_screen();
-        assert!(app.take_clear_screen_request());
-        assert!(
-            !app.take_clear_screen_request(),
-            "a second consume must not re-wipe the screen"
-        );
     }
 
     // ---- helpers ---------------------------------------------------------

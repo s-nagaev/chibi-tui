@@ -130,6 +130,7 @@ def ready_frame():
         "capabilities": {
             "commands": [
                 "/reset",
+                "/stop",
                 "/new_thread_with_current_context",
                 "/model",
                 "/imagine",
@@ -149,6 +150,12 @@ def main() -> int:
         "--garbage-on-start",
         action="store_true",
         help="emit one non-JSON line right after ready",
+    )
+    parser.add_argument(
+        "--result-delay",
+        type=float,
+        default=0.25,
+        help="seconds between a request's status running and its result timer",
     )
     parser.add_argument(
         "--crash-after-running",
@@ -254,7 +261,8 @@ def main() -> int:
             result["thoughts"] = thoughts_payload
         emit(result)
 
-    def schedule_result(request_id: str, delay: float = 0.25) -> None:
+    def schedule_result(request_id: str) -> None:
+        delay = args.result_delay
         timer = threading.Timer(delay, emit_result, args=(request_id,))
         timer.daemon = True
         finish_timers.append(timer)
@@ -361,6 +369,44 @@ def main() -> int:
 
         request_id = obj["request_id"]
         prompt = obj.get("prompt") or ""
+
+        # ctrl_l_stop_reset_hotkeys: deterministic /stop and /reset semantics.
+        # Both kill the thread's in-flight request (the canonical cancelled
+        # error) and answer their own request, mirroring the real backend's
+        # telegram-handler reuse; a /reset kill-flush emits the authoritative
+        # zero-active agent_event for the killed request's counters.
+        if prompt in ("/stop", "/reset"):
+            emit({"type": "status", "request_id": request_id, "state": "queued"})
+            emit({"type": "status", "request_id": request_id, "state": "running"})
+            killed = [rid for rid in inflight if rid != request_id]
+            for rid in killed:
+                inflight.discard(rid)
+                emit(
+                    {
+                        "type": "error",
+                        "request_id": rid,
+                        "code": "cancelled",
+                        "message": "Request cancelled.",
+                    }
+                )
+                if prompt == "/reset":
+                    emit(
+                        {
+                            "type": "agent_event",
+                            "request_id": rid,
+                            "event": "finished",
+                            "active": 0,
+                            "total": 0,
+                        }
+                    )
+            emit(
+                {
+                    "type": "result",
+                    "request_id": request_id,
+                    "content": "Everything stopped." if prompt == "/stop" else "Done!",
+                }
+            )
+            return
 
         # feat_thread_clone: deterministic ack for the clone command. The ack
         # text repeats the received frame (destination thread id + raw args)

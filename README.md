@@ -150,7 +150,8 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+V` | Paste clipboard (macOS: Cmd+V) |
 | `Ctrl+A` / `Ctrl+E` | Move cursor to start / end of line |
 | `Ctrl+U` | Delete from cursor to start of line |
-| `Ctrl+L` | Clear input and wipe the visible screen (chat view returns to bottom) |
+| `Ctrl+L` | Stop the running request of the current chat behind a confirmation popup (`Enter`/`y` confirm · `Esc`/`n` cancel). The stop reuses the backend's `/stop` command — the same mechanism as the Telegram bot: the in-flight request is cancelled, subagent counters are flushed and the transcript stays. A silent no-op when the chat is idle. Needs a backend that advertises `/stop`; on older backends a toast explains instead |
+| `Shift+Ctrl+L` | Reset the current thread behind a confirmation popup (same `Enter`/`y` · `Esc`/`n` grammar). Sends the backend's `/reset` command — history is dropped thread-scoped — and clears the local dialog (messages, queued prompts, reasoning block) when the backend acks. Works while a request is running (the running turn is cancelled first) and when idle |
 | `F1` | Toggle the keybindings help modal: a centered popup listing **every** active chord — global keys, input editing, sidebar, rename/delete confirmations, model picker, both search popups, the log viewer and the error popup — grouped and scrollable (`↑`/`↓` or `PgUp`/`PgDn` scroll; the same chord or `Esc` closes) |
 
 > **Terminal support note:** `⇧↵` / `⌥↵` (newline inserts), `Ctrl+↑` /
@@ -182,6 +183,10 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 >   path to global search, so on such terminals it is unavailable; use a
 >   kitty-protocol-capable terminal if you need it. There is no reliable way
 >   to distinguish these keys there; this is a terminal limitation, not a bug.
+> - **`Shift+Ctrl+L` becomes indistinguishable from `Ctrl+L`** (same lost
+>   Shift modifier): those presses then open the stop confirmation instead
+>   of the reset one. When the chat is idle the reset stays reachable by
+>   typing `/reset` into the prompt and sending it.
 
 **macOS note (Mission Control):** macOS binds `Ctrl+↑` / `Ctrl+↓` to the
 *Move between spaces* shortcuts system-wide, so on stock macOS those chords

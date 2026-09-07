@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Connection, Focus, ModelPickerPhase};
+use crate::app::{App, Connection, Focus, ModelPickerPhase, StopResetAction};
 use crate::markdown;
 use crate::model::{ChatLifecycle, Role};
 use crate::popup::ErrorPopup;
@@ -80,6 +80,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         // normal input row (the popup overlays it and captures all keys).
         Mode::Normal
         | Mode::ConfirmDelete
+        | Mode::ConfirmStopReset { .. }
         | Mode::Searching { .. }
         | Mode::SearchingAll { .. }
         | Mode::LogViewer { .. }
@@ -95,6 +96,10 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // feat_thread_delete: confirm popup overlays everything (rendered last).
     if matches!(app.mode, Mode::ConfirmDelete) {
         render_delete_popup(f, app, theme);
+    }
+    // ctrl_l_stop_reset_hotkeys: stop/reset confirm popup (rendered last).
+    if matches!(app.mode, Mode::ConfirmStopReset { .. }) {
+        render_stop_reset_popup(f, app, theme);
     }
     // feat_search_thread: search popup overlays everything (rendered last).
     if matches!(app.mode, Mode::Searching { .. }) {
@@ -861,8 +866,12 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // longest status label (`● disconnected (press R)`).
     // feat_search_all_threads: `^⇧F all` joined the hints; the self-evident
     // `^L` and `^V` hints retired (both actions are README-documented and
-    // universal enough (clear-screen and paste) so the line stays within
+    // universal enough (clear-screen-then and paste) so the line stays within
     // 120 cols with the longest status label. ^C cancel is never dropped.
+    // ctrl_l_stop_reset_hotkeys: ^L was later repurposed to the guarded stop
+    // confirmation, so its hints-row absence stayed correct — the row was at
+    // 119 cols with `F1 help` + the `^S` state token, one short of the 120
+    // cap, and no token could be added without retiring another.
     // feat_alt_arrows_nav: `^↑↓ chats` grew to `^/⌥↑↓ chats` (Alt is a
     // full synonym for thread switching, because macOS Mission Control hijacks
     // Ctrl+arrows). To fit the +2-col token, the self-evident `^F find`
@@ -1545,7 +1554,12 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
     HotkeyRow {
         group: "Global",
         chord: "Ctrl+L",
-        action: "clear the input · wipe the screen",
+        action: "stop the running request (confirmation)",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Shift+Ctrl+L",
+        action: "reset this thread · clear the dialog (confirmation)",
     },
     HotkeyRow {
         group: "Global",
@@ -2035,6 +2049,64 @@ fn render_delete_popup(f: &mut Frame, app: &mut App, theme: &Theme) {
 
     if inner.height > 0 {
         let lines = wrap_text(&message, inner.width.max(1) as usize);
+        let hint_line = Line::from(Span::styled(hint, Style::new().fg(theme.yellow)));
+        let mut all: Vec<Line<'static>> = lines;
+        all.push(hint_line); // rendered last; clipped when out of room
+        let text = Text::from(all);
+        let visible = inner.height as usize;
+        let skip = text.height().saturating_sub(visible);
+        let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
+        f.render_widget(paragraph, inner);
+    }
+}
+
+/// Centered modal stop/reset confirmation popup (ctrl_l_stop_reset_hotkeys),
+/// over the full frame. Same visual language as the delete confirm: red
+/// border + red title for the destructive action, yellow decision hint —
+/// theme slots only. Purely visual — all key handling lives in `main.rs`.
+fn render_stop_reset_popup(f: &mut Frame, app: &mut App, theme: &Theme) {
+    use ratatui::widgets::{Clear, Padding};
+
+    let Mode::ConfirmStopReset { action } = app.mode else {
+        return;
+    };
+    let (title, message) = match action {
+        StopResetAction::Stop => (" Stop request ", "Stop the running request?"),
+        StopResetAction::Reset => (" Reset thread ", "Reset this thread? (clears the dialog)"),
+    };
+    let hint = "y/Enter confirm \u{00b7} Esc/n cancel \u{00b7} Ctrl+C quit";
+
+    // Centered box at ~50% of the frame width (content-driven minimum, hard
+    // floor of 20 so tiny terminals never panic on an invalid clamp range).
+    let max_w = f.area().width.saturating_sub(4).max(20);
+    let width = (message.width() as u16 + hint.width() as u16 + 6)
+        .max(f.area().width / 2)
+        .clamp(20, max_w);
+    let height = 5.min(f.area().height.saturating_sub(2)).max(3);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.red))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            title,
+            Style::new().fg(theme.red).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height > 0 {
+        let lines = wrap_text(message, inner.width.max(1) as usize);
         let hint_line = Line::from(Span::styled(hint, Style::new().fg(theme.yellow)));
         let mut all: Vec<Line<'static>> = lines;
         all.push(hint_line); // rendered last; clipped when out of room
