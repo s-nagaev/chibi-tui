@@ -872,7 +872,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // everything ----
     //
     // While the ^L (stop) or ⇧^L (reset) confirmation is open, ONLY the
-    // destructive decision keys work: Enter/`y` confirm, Esc/`n` cancel,
+    // destructive decision keys work: Enter/`y` confirm, Esc/`n`/same-chord
+    // cancel (the chord that opened the popup: ^L for stop, ⇧^L for reset),
     // Ctrl+C quits — the exact grammar of the delete confirm. Everything
     // else (typing, arrows, global chords) is swallowed so no keystroke
     // leaks into the textarea and no global binding fires. `q` is
@@ -890,6 +891,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                 app.cancel_stop_reset();
             }
             KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
+                app.cancel_stop_reset();
+            }
+            KeyCode::Char('l') | KeyCode::Char('L')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                // Same-chord cancel: ^L (stop) and ⇧^L in both kitty
+                // variants (reset) close the popup without staging anything.
                 app.cancel_stop_reset();
             }
             KeyCode::Char('c') if ctrl => app.should_quit = true,
@@ -1848,6 +1856,70 @@ mod tests {
         assert_eq!(staged.prompt, "/reset");
         assert_eq!(staged.thread_id, app.chats[app.active].id);
         assert!(app.mode.is_normal());
+    }
+
+    #[test]
+    fn same_chord_cancels_both_stop_and_reset_popups() {
+        // Stop popup opened by ^L: the same chord closes it, nothing staged.
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Stop
+            }
+        ));
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(app.mode.is_normal(), "same chord must cancel the popup");
+        assert!(
+            app.take_control_submission().is_none(),
+            "cancelled stop must not stage /stop"
+        );
+
+        // Reset popup opened by Shift+Ctrl+L (kitty variant): same chord cancels.
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(
+            &mut app,
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Reset
+            }
+        ));
+        press(
+            &mut app,
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(app.mode.is_normal(), "same chord must cancel the popup");
+        assert!(
+            app.take_control_submission().is_none(),
+            "cancelled reset must not stage /reset"
+        );
+
+        // Variant where the unshifted char rides with SHIFT: same-chord cancel too.
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(
+            &mut app,
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Reset
+            }
+        ));
+        press(
+            &mut app,
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(app.mode.is_normal());
+        assert!(app.take_control_submission().is_none());
     }
 
     #[test]
@@ -4496,7 +4568,7 @@ mod tests {
     enum DraftEffect {
         /// The documented action does not touch the draft.
         Unchanged,
-        /// The documented action empties the draft (Esc, ^L, ^U).
+        /// The documented action empties the draft (Esc, ^U).
         Cleared,
         /// The documented action appends a newline (⇧↵ / ⌥↵).
         Newline,
