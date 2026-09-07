@@ -21,11 +21,12 @@ pub struct Message {
     pub pending: bool,
     /// Model that produced an assistant answer (feat_agent_model_label).
     ///
-    /// Stamped per-message at result-resolution time, because future
-    /// per-message model switching must not mislabel earlier replies.
-    /// Session-scoped: stripped by [`Self::normalized_for_storage`] so the
-    /// history file format stays untouched — restored chats render the plain
-    /// label (old backend / historical rows alike).
+    /// Stamped per-message at result-resolution time, because model
+    /// switching must not mislabel earlier replies. Persisted with the
+    /// snapshot additively — `#[serde(default, skip_serializing_if)]`
+    /// keeps pre-label files parsing and label-less rows byte-compatible —
+    /// so a restored transcript keeps the model that actually produced
+    /// each answer instead of inheriting the thread's current one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
@@ -84,16 +85,17 @@ impl Message {
     /// Storage view of a message: pending placeholders become empty assistant
     /// messages so a restored history never shows a stuck spinner row.
     ///
-    /// The model label is session-scoped and dropped here: the persisted
-    /// format stays byte-compatible with pre-label snapshots and a reloaded
-    /// chat intentionally shows the plain role header again.
+    /// The per-message model label travels along (owner report 2026-09-07:
+    /// a mid-chat switch must not re-label old answers, so each answer
+    /// freezes the model that produced it). Additive on disk: the serde
+    /// attributes on [`Self::model`] keep snapshots without a label
+    /// byte-compatible with the pre-label format, and old files without
+    /// the key reload plain.
     pub fn normalized_for_storage(&self) -> Self {
         if self.pending {
             Message::assistant("")
         } else {
-            let mut copy = self.clone();
-            copy.model = None;
-            copy
+            self.clone()
         }
     }
 
@@ -219,22 +221,27 @@ mod tests {
         assert_eq!(msg.markdown, "**42**");
     }
 
-    /// History format contract: the model label is session-scoped and never
-    /// persisted — `normalized_for_storage` strips it, so the on-disk shape
-    /// stays identical to pre-label snapshots and reloaded chats show the
-    /// plain role header.
+    /// Storage keeps the label: the answering model is per-message history
+    /// now — a mid-chat switch must not re-label old answers, and a restart
+    /// must not erase who answered what. Additive on disk: the key only
+    /// appears when a label exists, so pre-label snapshots stay
+    /// byte-compatible.
     #[test]
-    fn storage_normalization_strips_model_label() {
+    fn storage_normalization_keeps_model_label() {
         let live = Message::assistant_with_model("answer", "glm-5.2");
         let stored = live.normalized_for_storage();
-        assert_eq!(stored.model_label(), None, "label must not be persisted");
+        assert_eq!(
+            stored.model_label(),
+            Some("glm-5.2"),
+            "label persists with the message"
+        );
         assert_eq!(stored.markdown, "answer");
         assert!(!stored.pending);
 
         let json = serde_json::to_string(&stored).unwrap();
         assert!(
-            !json.contains("model"),
-            "serialized storage form must not carry a model key: {json}"
+            json.contains(r#""model":"glm-5.2""#),
+            "serialized storage form must carry the model key: {json}"
         );
     }
 }

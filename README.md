@@ -108,10 +108,11 @@ are each labeled with their own.
 
 The parenthetical is **absent** — a plain `● Chibi` — when the answer carries
 no model information: an older backend, a `result` frame without the optional
-fields, or historical messages. Known limitation: the label is session-scoped
-and intentionally not persisted in the history file (its format is unchanged),
-so after a restart every restored message shows the plain header again; a
-later wave may revisit this.
+fields, or messages saved before labels were persisted. The label is stored
+per message in the history file (an optional `model` key, additive and
+backward-compatible), so each restored answer keeps the model that actually
+produced it: switching the model mid-chat never re-labels past answers, and
+the thread's current model is only shown by the status strip / panel readout.
 
 ### Behavior notes
 
@@ -355,8 +356,9 @@ open/close and never captures keys.
     label, and switching chats re-labels from that chat's own history. A
     model switch made in the picker updates it too — without a transcript
     bubble (see the Model picker section). Both
-    segments render a `—` placeholder when unknown. Model labels are
-    session-scoped — restored history shows `—` again.
+    segments render a `—` placeholder when unknown. Model labels persist per
+    message, so a restored chat re-labels the strip from its own newest
+    answer (until the next switch or turn updates it).
 - **Placement** — the strip rides the SAME top-border row as the chat title
   (`#1/4 · JSONL protocol`), right-aligned: it costs **zero vertical space**.
   On narrow terminals it is truncated with an ellipsis to the space left of

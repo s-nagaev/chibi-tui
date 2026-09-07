@@ -927,9 +927,11 @@ impl App {
     /// new message (visible next frame), an error/fieldless resolution
     /// stamps `None` (the previous label remains "last known"), and
     /// switching chats re-labels from that chat's own message history.
-    /// Session-scoped like the header labels: the map is never written to
-    /// disk, but startup restore seeds it from each thread's persisted
-    /// last-known model (see [`App::picker_model_labels`]).
+    /// The override map is never written to disk, but startup restore
+    /// seeds it from each thread's persisted last-known model (see
+    /// [`App::picker_model_labels`]); per-message labels themselves
+    /// persist with the snapshot, so a restored chat re-labels the strip
+    /// from its own newest answer once the override retires.
     /// `None` renders as the `—` placeholder.
     ///
     /// feat_model_picker_lite: a hidden `/model <n>` switch has no transcript
@@ -938,9 +940,9 @@ impl App {
     /// next visible labeled reply retires it and message-derived truth
     /// resumes.
     ///
-    /// The transcript renderer reuses this readout as the fallback for
-    /// header lines without their own label, so the status strip and the
-    /// in-chat `● Chibi (model)` annotation never disagree for a chat.
+    /// In-chat `● Chibi (model)` annotations are independent of this
+    /// getter: each message renders only the label captured when it was
+    /// produced, so a mid-chat switch never re-labels past answers.
     pub fn active_model_label(&self) -> Option<&str> {
         let chat = self.chats.get(self.active)?;
         // feat_model_picker_lite: a hidden `/model <n>` switch updates the
@@ -3245,9 +3247,9 @@ mod tests {
         assert_eq!(app.active_model_label(), Some("glm-5.2"));
 
         // Restart seam: the event loop persists the chat and a new App loads
-        // it. Per-message labels stay session-scoped (stripped by the
-        // history layer), while the thread-level last-known usage/model pair
-        // rides along with the snapshot and seeds the display state.
+        // it. Per-message labels travel with their messages, while the
+        // thread-level last-known usage/model pair rides along with the
+        // snapshot and seeds the display state.
         let dir = std::env::temp_dir().join(format!(
             "chibi-tui-sticky-restart-{}-{}",
             std::process::id(),
@@ -3259,12 +3261,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(restored.len(), 1, "one snapshot file");
-        assert!(
-            restored[0]
-                .messages
-                .iter()
-                .all(|m| m.model_label().is_none()),
-            "restored answers carry no annotation"
+        assert_eq!(
+            restored[0].messages.last().and_then(|m| m.model_label()),
+            Some("glm-5.2"),
+            "the answer's label persists with its message"
         );
         assert_eq!(
             restored[0].last_usage,
@@ -3288,12 +3288,10 @@ mod tests {
             Some("glm-5.2"),
             "panel model is seeded from the persisted label"
         );
-        assert!(
-            fresh.chats[0]
-                .messages
-                .iter()
-                .all(|m| m.model_label().is_none()),
-            "restore never backfills per-message annotations"
+        assert_eq!(
+            fresh.chats[0].messages.last().and_then(|m| m.model_label()),
+            Some("glm-5.2"),
+            "restored answers keep their captured labels"
         );
     }
 

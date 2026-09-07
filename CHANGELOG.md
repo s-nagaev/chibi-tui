@@ -31,9 +31,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `last_model` keys in the thread's history file and are only written once a
   turn or a model switch actually reports them; existing history files parse
   unchanged, threads without recorded data display exactly as before, and
-  per-answer model annotations remain session-scoped (no backfill). Restored
-  answers keep unlabeled messages but name the thread's last-known model in
-  their header — the same readout the panel shows.
+  per-answer model annotations no longer backfill from the thread's current
+  model (see the model-switch fix below).
 - Status strip (`Ctrl+O`): a hideable dim one-row `cwd: <workspace> · <model>`
   readout on the chat header's top border — right-aligned, zero vertical cost,
   truncated with an ellipsis on narrow terminals, hidden by default. The model
@@ -45,12 +44,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Model label in the assistant header: when the backend's `result` frame
   carries the optional `model`/`provider` fields, the answer's header renders
   as `● Chibi (model)` with a dim parenthetical (model preferred, provider as
-  fallback). A header without its own label falls back to the thread's
-  last-known model — the readout the status strip shows — so restored history
-  keeps naming the model beside the bot name, and a thread with no known
-  model keeps the plain `● Chibi`. Labels attach per message; a long model
-  name wraps safely with the row-accurate scroll math. The label is
-  session-scoped — the history file format is unchanged.
+  fallback). Each header names ONLY the model that produced its own answer —
+  captured at answer time and persisted with the snapshot — so a mid-chat
+  model switch never re-labels past answers and a restart keeps every
+  restored answer's own model. A header without its own label (older
+  history, fieldless frames) stays the plain `● Chibi`; a thread with no
+  known model keeps it too. Labels attach per message; a long model
+  name wraps safely with the row-accurate scroll math.
 - Growing input block: the editor area now expands from 1 up to 20 rows with
   the multiline draft (`Shift+Enter`), squeezing the chat pane; past 20 lines
   the view auto-follows the caret. The `⏎ send` chip moves to the first row of
@@ -110,6 +110,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keep their roles, and reconnect respawns the same new command.
 
 ### Fixed
+- Model-switch backfill: changing the model in the chat (`Ctrl+M`) re-labeled
+  every past answer with the newly selected model, and the restore-time
+  header fallback did the same for unlabeled history. Per-answer labels are
+  now frozen at answer time and rendered from the message's own stored value
+  only: the answering model persists additively as an optional `model` key
+  per message (backward-compatible with existing history files), restored
+  pre-label messages keep the plain `● Chibi` header — never invented,
+  never backfilled — and the status strip / panel readout is unchanged.
 - Sticky last-known display state: the `ctx` usage segment no longer loses
   its value. It used to be wiped at every request start and overwritten by
   every terminal frame, so a frame without usage (a command result or a
@@ -119,9 +127,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with no segment. The status strip's model readout and the per-answer
   `(model)` header annotation already followed the same last-known rules and
   are now pinned by tests: a command answer renders no annotation and leaves
-  both readouts untouched, a model change shows up with the next labelled
-  result, and a restart resets everything to `—` / plain headers (nothing
-  new is persisted).
+  both readouts untouched, and a model change shows up with the next labelled
+  result (per-answer labels themselves now persist — see the model-switch
+  fix above).
 - The log viewer colorizes the backend's custom log levels (`TOOL`, `THINK`,
   `CALL`, `CHECK`, `MODERATOR`, `SUBAGENT`, `DELEGATE`) instead of leaving
   them plain: each maps onto the theme slot mirroring its backend

@@ -316,11 +316,12 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// like "(unknown)". The name itself stays hardcoded `Chibi` (B2/BOT_NAME
 /// is a later task).
 ///
-/// The transcript call site decides the argument: a message's own label
-/// first, then the chat's sticky last-known model (the same readout the
-/// status strip shows). Restored rows carry no per-message label — the
-/// history layer strips them — so the sticky fallback is what keeps the
-/// model named beside the bot name after a restart.
+/// The transcript call site passes ONLY the message's own label, captured
+/// when the answer arrived and persisted with the snapshot: each answer
+/// keeps the model that actually produced it, and a mid-chat model switch
+/// never re-labels history (owner report 2026-09-07). Rows without their
+/// own label — restored pre-label history, fieldless frames — stay plain;
+/// the thread's last-known model lives in the status strip, not here.
 ///
 /// Returns a single logical line: a long model name simply wraps within it,
 /// and the row-accurate scroll math counts display rows, so nothing else
@@ -411,11 +412,6 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     let Some(chat) = app.chats.get(app.active) else {
         return;
     };
-    // Headers without their own per-message label (restored rows, fieldless
-    // frames) fall back to the chat's sticky last-known model — the same
-    // readout the status strip shows — so a restart keeps the model named
-    // beside the bot name without backfilling message metadata.
-    let sticky = app.active_model_label();
 
     // Render every message into lines. `msg_ranges` records each message's
     // `[start, end)` span of LOGICAL lines (role header + content + trailing
@@ -453,7 +449,11 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
                 )));
             }
             Role::Assistant => {
-                lines.push(assistant_header_line(msg.model_label().or(sticky), theme));
+                // Each answer renders ONLY the label captured when it was
+                // produced (persisted with the snapshot): no fallback to the
+                // thread's current model — a mid-chat switch must never
+                // re-label past answers.
+                lines.push(assistant_header_line(msg.model_label(), theme));
             }
         }
         if msg.pending {
@@ -4471,15 +4471,82 @@ mod tests {
         );
     }
 
-    /// Restart seam: restored rows carry no per-message label (the history
-    /// layer strips them), yet the header must still name the model. The
-    /// transcript falls back to the thread's sticky last-known model — the
-    /// readout the status strip shows — seeded by `App::new` from the
-    /// persisted snapshot.
+    /// THE backfill regression (owner report 2026-09-07): switching the
+    /// model mid-chat must not re-label answers produced earlier. A row
+    /// without its own per-message label — restored pre-label history or a
+    /// fieldless result frame — keeps the plain `● Chibi` header even when
+    /// the thread's last-known model (the status strip source) names a
+    /// different model.
     #[test]
-    fn restored_last_model_seeds_chat_annotation() {
+    fn model_switch_never_relabels_unlabeled_answers() {
+        // Post-switch state: the picker stamped the thread's last-known
+        // model with the NEW selection (Ctrl+M confirm), while the earlier
+        // answer predates the label and carries no annotation of its own.
+        let mut chat = Chat::new("switched");
+        chat.messages
+            .push(Message::assistant("answer made before the switch"));
+        chat.last_model = Some("kimi-k3".to_string());
+
+        let mut app = App::new(vec![chat]);
+        assert_eq!(
+            app.active_model_label(),
+            Some("kimi-k3"),
+            "panel reflects the switched model"
+        );
+
+        let flat = render_grid(&mut app).join("\n");
+        assert!(
+            flat.lines()
+                .any(|r| r.contains("\u{25cf} Chibi") && !r.contains('(')),
+            "the unlabeled answer must keep the plain header:\n{flat}"
+        );
+        assert!(
+            !flat.contains("(kimi-k3)"),
+            "the switched model must not backfill old answers:\n{flat}"
+        );
+    }
+
+    /// Per-answer independence: each header renders the model that produced
+    /// ITS message, captured at answer time — never the thread's current
+    /// selection, never a neighbor's label.
+    #[test]
+    fn each_answer_keeps_its_own_captured_label() {
+        let mut chat = Chat::new("multi");
+        chat.messages
+            .push(Message::assistant_with_model("first answer", "glm-5.2"));
+        chat.messages
+            .push(Message::assistant_with_model("second answer", "kimi-k3"));
+        chat.last_model = Some("qwen-flash".to_string());
+
+        let mut app = App::new(vec![chat]);
+        let flat = render_grid(&mut app).join("\n");
+
+        assert!(
+            flat.lines()
+                .any(|r| r.contains("\u{25cf} Chibi") && r.contains("(glm-5.2)")),
+            "the first answer keeps its own model:\n{flat}"
+        );
+        assert!(
+            flat.lines()
+                .any(|r| r.contains("\u{25cf} Chibi") && r.contains("(kimi-k3)")),
+            "the second answer keeps its own model:\n{flat}"
+        );
+        assert!(
+            !flat.contains("(qwen-flash)"),
+            "the panel selection must not leak into the transcript:\n{flat}"
+        );
+    }
+
+    /// Restart seam: restored rows render ONLY their own persisted label.
+    /// Rows saved before labels were persisted (no `model` key) reload
+    /// plain and are never backfilled from the thread's last-known model;
+    /// the panel readout (status strip source) still names that model.
+    #[test]
+    fn restored_rows_render_own_persisted_label_and_legacy_rows_stay_plain() {
         let mut chat = Chat::new("restored");
-        chat.messages.push(Message::assistant("old answer"));
+        chat.messages
+            .push(Message::assistant_with_model("old answer", "some/model"));
+        chat.messages.push(Message::assistant("pre-label answer"));
         chat.last_model = Some("some/model".to_string());
 
         let dir = std::env::temp_dir().join(format!(
@@ -4497,12 +4564,14 @@ mod tests {
             Some("some/model"),
             "last-known model persists with the thread"
         );
+        assert_eq!(
+            restored[0].messages[0].model_label(),
+            Some("some/model"),
+            "the per-answer label persists with its message"
+        );
         assert!(
-            restored[0]
-                .messages
-                .iter()
-                .all(|m| m.model_label().is_none()),
-            "restore never backfills per-message annotations"
+            restored[0].messages[1].model_label().is_none(),
+            "pre-label rows stay label-less on disk and in memory"
         );
 
         let mut app = App::new(restored);
@@ -4516,11 +4585,17 @@ mod tests {
         assert!(
             flat.lines()
                 .any(|r| r.contains("\u{25cf} Chibi") && r.contains("(some/model)")),
-            "restored header must carry the persisted model:\n{flat}"
+            "the labeled row keeps its persisted label after restart:\n{flat}"
+        );
+        let labeled_headers = flat
+            .lines()
+            .filter(|r| r.contains("\u{25cf} Chibi ("))
+            .count();
+        assert_eq!(
+            labeled_headers, 1,
+            "no backfill: only the row with its own label is labeled:\n{flat}"
         );
     }
-
-    // ---- feat_stderr_log_modal: log viewer + status marker -----------------
 
     fn unique_marker(tag: &str) -> String {
         format!(

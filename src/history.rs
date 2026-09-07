@@ -469,6 +469,38 @@ mod tests {
         );
     }
 
+    /// Restart seam for per-answer labels (owner report 2026-09-07): the
+    /// answering model travels with each message through the snapshot, so a
+    /// mid-chat switch can never re-label history; pre-label rows (no
+    /// `model` key) reload plain — never invented, never backfilled.
+    #[test]
+    fn message_model_label_survives_snapshot_roundtrip_and_legacy_rows_stay_plain() {
+        let mut chat = sample_chat("labels");
+        chat.messages[1] = Message::assistant_with_model("labeled answer", "glm-5.2");
+        chat.last_model = Some("kimi-k3".to_string());
+
+        let root = temp_root("label-roundtrip");
+        save_chat_in(Some(&root), &chat).expect("save");
+        let restored = load_chats_from(Some(&root));
+
+        assert_eq!(restored.len(), 1, "one snapshot file");
+        assert_eq!(
+            restored[0].messages[1].model_label(),
+            Some("glm-5.2"),
+            "the per-answer label survives the restart"
+        );
+        assert_eq!(
+            restored[0].messages[0].model_label(),
+            None,
+            "a row without its own label reloads plain — never invented"
+        );
+        assert_eq!(
+            restored[0].last_model.as_deref(),
+            Some("kimi-k3"),
+            "thread-level last-known model unaffected"
+        );
+    }
+
     #[test]
     fn corrupt_files_are_skipped_not_fatal() {
         let root = temp_root("corrupt");
