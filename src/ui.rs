@@ -83,7 +83,8 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         | Mode::Searching { .. }
         | Mode::SearchingAll { .. }
         | Mode::LogViewer { .. }
-        | Mode::ModelPicking { .. } => render_input(f, app, theme, chat_column),
+        | Mode::ModelPicking { .. }
+        | Mode::HelpViewing { .. } => render_input(f, app, theme, chat_column),
     }
     render_status(f, app, theme, root[3]);
 
@@ -110,6 +111,10 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // feat_model_picker_lite: model picker popup (rendered last).
     if matches!(app.mode, Mode::ModelPicking { .. }) {
         render_model_picker(f, app, theme);
+    }
+    // feat_hotkey_help_modal: keybindings help modal (rendered last).
+    if matches!(app.mode, Mode::HelpViewing { .. }) {
+        render_help_modal(f, app, theme);
     }
 }
 
@@ -896,6 +901,15 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Base row: 82 cols, 87 with the clone token, so the `log*` worst case
     // (87 + 7 marker + 2 separator + 24 longest label = 120 ≤ 120) still
     // holds verbatim. ^C cancel is never dropped.
+    // feat_hotkey_help_modal: `F1 help` joins the hints (the toggle for the
+    // full keybindings modal — every chord the status row can no longer
+    // spell out lives one keypress away). To pay the +10 cols the
+    // self-evident `↑↓ caret` token retired: plain arrows moving the text
+    // caret is the universal editor convention (same retirement precedent
+    // as PgUp/PgDn scroll; README still documents them). Net width change:
+    // base 82 → 81, 86 with the clone token, so the `log*` worst case
+    // (86 + 7 marker + 2 separator + 24 longest label = 119 ≤ 120) still
+    // holds. ^C cancel is never dropped.
     let spans = if let Some((message, _)) = &app.status_message {
         // Transient status toast (busy-delete refusal): replaces the hint
         // block while visible. Short message + connection label always fit
@@ -907,7 +921,7 @@ fn render_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ]
     } else {
         let mut spans = vec![Span::styled(
-            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} \u{2191}\u{2193} caret \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T \u{00b7} ^O",
+            "   ^/\u{2325}\u{2191}\u{2193} chats \u{00b7} ^N \u{00b7} ^R \u{00b7} ^C cancel \u{00b7} \u{21e7}\u{21b5} \u{00b7} ^D \u{00b7} ^F \u{00b7} ^\u{21e7}F all \u{00b7} ^T \u{00b7} ^O \u{00b7} F1 help",
             Style::new().fg(theme.selection),
         )];
         // feat_thread_clone: the clone chord is advertised only when the
@@ -1407,6 +1421,485 @@ fn render_model_picker(f: &mut Frame, app: &mut App, theme: &Theme) {
         f.render_stateful_widget(list, body, &mut list_state);
     }
 
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::new().fg(theme.yellow),
+        ))),
+        footer,
+    );
+}
+
+/// One row of the keybindings help modal (feat_hotkey_help_modal): the
+/// chord as displayed, the logical group it belongs to and the action the
+/// dispatch performs. `group` must stay contiguous — the renderer opens a
+/// group header on every change (see [`help_modal_total_lines`]).
+pub struct HotkeyRow {
+    /// Group label rendered as the dim separator row above the entry.
+    pub group: &'static str,
+    /// Chord as shown in the left column (`Ctrl+N`, `⇧↵ / ⌥↵`, `text`, …).
+    pub chord: &'static str,
+    /// Human action description in the right column.
+    pub action: &'static str,
+}
+
+/// The SINGLE source of truth for the help modal's content: every chord the
+/// key dispatch (`main.rs::handle_key` + the tui-textarea fall-through)
+/// actually handles, grouped by surface. The dispatch itself is inline match
+/// arms with no action enum to reuse, so this const table sits next to the
+/// render; `main.rs`'s test module pins it against the live handlers with a
+/// dispatch enumeration plus a typing-leak probe, so a chord added to the
+/// dispatch without a matching row here fails the suite.
+pub const HOTKEY_ROWS: &[HotkeyRow] = &[
+    HotkeyRow {
+        group: "Global",
+        chord: "F1",
+        action: "open / close this keybindings help",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+C",
+        action: "cancel the active request · quit when idle",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+N",
+        action: "new chat",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+P",
+        action: "clone the active thread (needs backend support)",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+R",
+        action: "rename the active thread",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+D",
+        action: "delete the active thread (confirmation)",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+F",
+        action: "find in the active thread",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+Shift+F",
+        action: "find in all threads",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+T",
+        action: "toggle pane focus (chat / sidebar)",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+G",
+        action: "open the diagnostics log viewer",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+O",
+        action: "toggle the status strip",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+S",
+        action: "toggle the thoughts block",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+M",
+        action: "open the model picker",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+L",
+        action: "clear the input · wipe the screen",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl+↑/↓ · Alt+↑/↓",
+        action: "switch the active thread",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "PgUp / PgDn",
+        action: "scroll the chat view",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Esc",
+        action: "clear the input · dismiss popups",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "Enter",
+        action: "send the message (queues while busy)",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "⇧↵ / ⌥↵",
+        action: "insert a newline",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "↑ / ↓",
+        action: "move the caret in the draft",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "Ctrl+A / Ctrl+E",
+        action: "caret to line start / end",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "Ctrl+U",
+        action: "delete to the start of the line",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "Ctrl+V / Cmd+V",
+        action: "paste the clipboard",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "Backspace",
+        action: "delete backwards",
+    },
+    HotkeyRow {
+        group: "Input",
+        chord: "text",
+        action: "type into the draft",
+    },
+    HotkeyRow {
+        group: "Sidebar (Ctrl+T)",
+        chord: "↑ / ↓",
+        action: "select a thread (switches live)",
+    },
+    HotkeyRow {
+        group: "Sidebar (Ctrl+T)",
+        chord: "Enter · Esc",
+        action: "return to the editor",
+    },
+    HotkeyRow {
+        group: "Rename (Ctrl+R)",
+        chord: "Enter",
+        action: "save the title",
+    },
+    HotkeyRow {
+        group: "Rename (Ctrl+R)",
+        chord: "⇧↵ / ⌥↵",
+        action: "insert a newline into the title",
+    },
+    HotkeyRow {
+        group: "Rename (Ctrl+R)",
+        chord: "Backspace",
+        action: "delete backwards",
+    },
+    HotkeyRow {
+        group: "Rename (Ctrl+R)",
+        chord: "Esc",
+        action: "cancel the rename",
+    },
+    HotkeyRow {
+        group: "Delete (Ctrl+D)",
+        chord: "Enter · y",
+        action: "confirm the delete",
+    },
+    HotkeyRow {
+        group: "Delete (Ctrl+D)",
+        chord: "Esc · n",
+        action: "cancel",
+    },
+    HotkeyRow {
+        group: "Model picker (Ctrl+M)",
+        chord: "↑ / ↓",
+        action: "move the selection",
+    },
+    HotkeyRow {
+        group: "Model picker (Ctrl+M)",
+        chord: "PgUp / PgDn",
+        action: "page the selection",
+    },
+    HotkeyRow {
+        group: "Model picker (Ctrl+M)",
+        chord: "Enter",
+        action: "apply the highlighted model",
+    },
+    HotkeyRow {
+        group: "Model picker (Ctrl+M)",
+        chord: "Esc",
+        action: "close without switching",
+    },
+    HotkeyRow {
+        group: "Find in thread (Ctrl+F)",
+        chord: "text",
+        action: "edit the query (live filter)",
+    },
+    HotkeyRow {
+        group: "Find in thread (Ctrl+F)",
+        chord: "Backspace",
+        action: "delete backwards",
+    },
+    HotkeyRow {
+        group: "Find in thread (Ctrl+F)",
+        chord: "↑ / ↓",
+        action: "walk the matches",
+    },
+    HotkeyRow {
+        group: "Find in thread (Ctrl+F)",
+        chord: "Enter",
+        action: "jump to the match · close",
+    },
+    HotkeyRow {
+        group: "Find in thread (Ctrl+F)",
+        chord: "Esc",
+        action: "close without jumping",
+    },
+    HotkeyRow {
+        group: "Find everywhere (Ctrl+⇧F)",
+        chord: "text",
+        action: "edit the query (live filter)",
+    },
+    HotkeyRow {
+        group: "Find everywhere (Ctrl+⇧F)",
+        chord: "Backspace",
+        action: "delete backwards",
+    },
+    HotkeyRow {
+        group: "Find everywhere (Ctrl+⇧F)",
+        chord: "↑ / ↓",
+        action: "walk the matches",
+    },
+    HotkeyRow {
+        group: "Find everywhere (Ctrl+⇧F)",
+        chord: "Enter",
+        action: "activate the match's thread · jump",
+    },
+    HotkeyRow {
+        group: "Find everywhere (Ctrl+⇧F)",
+        chord: "Esc",
+        action: "close without jumping",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "↑ / ↓ · k / j",
+        action: "move the cursor one line",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "PgUp / PgDn",
+        action: "page the view",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "g / G",
+        action: "jump to the top / the tail",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "w",
+        action: "toggle wrap",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "/",
+        action: "search the log",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "n / N",
+        action: "next / previous match",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "y",
+        action: "copy the cursor line",
+    },
+    HotkeyRow {
+        group: "Log viewer (Ctrl+G)",
+        chord: "Esc",
+        action: "close",
+    },
+    HotkeyRow {
+        group: "Log search (/)",
+        chord: "text",
+        action: "edit the pattern",
+    },
+    HotkeyRow {
+        group: "Log search (/)",
+        chord: "Backspace",
+        action: "delete backwards",
+    },
+    HotkeyRow {
+        group: "Log search (/)",
+        chord: "Enter",
+        action: "commit the search",
+    },
+    HotkeyRow {
+        group: "Log search (/)",
+        chord: "Esc",
+        action: "cancel the search",
+    },
+    HotkeyRow {
+        group: "Error popup",
+        chord: "R",
+        action: "reconnect",
+    },
+    HotkeyRow {
+        group: "Error popup",
+        chord: "q",
+        action: "quit",
+    },
+    HotkeyRow {
+        group: "Error popup",
+        chord: "Esc · any key",
+        action: "dismiss",
+    },
+    HotkeyRow {
+        group: "Help (F1)",
+        chord: "↑ / ↓ · PgUp / PgDn",
+        action: "scroll the list",
+    },
+    HotkeyRow {
+        group: "Help (F1)",
+        chord: "F1 · Esc",
+        action: "close",
+    },
+];
+
+/// Total rendered line count of the help modal's body: one line per
+/// [`HOTKEY_ROWS`] entry plus one header per distinct (contiguous) group.
+/// The scroll clamps in `app.rs` page over THIS count, so the window can
+/// always reach the table's last row.
+pub fn help_modal_total_lines() -> usize {
+    let mut lines = HOTKEY_ROWS.len();
+    let mut prev_group = "";
+    for row in HOTKEY_ROWS {
+        if row.group != prev_group {
+            lines += 1;
+            prev_group = row.group;
+        }
+    }
+    lines
+}
+
+/// feat_hotkey_help_modal: the F1 keybindings modal — a centered, bordered
+/// popup over the chat panes listing EVERY active chord, built from the
+/// [`HOTKEY_ROWS`] const table (the dispatch-side test in `main.rs` pins the
+/// table against the real key handlers). Visual language copied from the
+/// model picker: blue bordered box, bold blue title, body rows above and
+/// a yellow decision hint on the last row. The body is a scrolled window of
+/// `help_visible_rows` lines; the offset lives in the mode state and is
+/// clamped here against the REAL viewport so a resized frame can never show
+/// a stale window.
+fn render_help_modal(f: &mut Frame, app: &mut App, theme: &Theme) {
+    use ratatui::widgets::{Clear, Padding};
+
+    let Mode::HelpViewing { state } = &mut app.mode else {
+        return;
+    };
+    let hint = "\u{2191}\u{2193} scroll \u{00b7} PgUp/PgDn page \u{00b7} F1/Esc close";
+
+    let chord_w = HOTKEY_ROWS
+        .iter()
+        .map(|r| r.chord.width())
+        .max()
+        .unwrap_or(8);
+    // Rows pad the chord column to the GLOBAL max chord width, so the
+    // widest rendered line is that padding + separator + the widest action.
+    let action_w = HOTKEY_ROWS
+        .iter()
+        .map(|r| r.action.width())
+        .max()
+        .unwrap_or(24);
+    let row_w = chord_w + 2 + action_w;
+
+    let max_w = f.area().width.saturating_sub(4).max(20);
+    let width = (hint.width() as u16 + 12)
+        .max((row_w as u16 + 6).min(max_w))
+        .clamp(20, max_w);
+    let max_body = f.area().height.saturating_sub(6) as usize;
+    let total = help_modal_total_lines();
+    let body_rows = total.min(24).min(max_body.max(1));
+    let height = (body_rows as u16 + 1 + 2) // + hint row + borders
+        .min(f.area().height.saturating_sub(2))
+        .max(3);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.blue))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            " Keybindings ",
+            Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Body rows above, decision hint on the last row (same family shape).
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let footer = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+
+    app.help_visible_rows = body.height.max(1);
+
+    let visible = body.height as usize;
+    let max_scroll = total.saturating_sub(visible);
+    state.scroll = state.scroll.min(max_scroll);
+    let scroll = state.scroll;
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(total);
+    let mut prev_group = "";
+    for row in HOTKEY_ROWS {
+        if row.group != prev_group {
+            prev_group = row.group;
+            lines.push(Line::from(Span::styled(
+                row.group.to_owned(),
+                Style::new().fg(theme.dim).add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<width$}", row.chord, width = chord_w),
+                Style::new().fg(theme.cyan),
+            ),
+            Span::raw("  ".to_owned()),
+            Span::styled(row.action.to_owned(), Style::new().fg(theme.fg)),
+        ]));
+    }
+    let window_end = (scroll + visible).min(lines.len());
+    let window = &lines[scroll.min(lines.len())..window_end];
+
+    f.render_widget(
+        Paragraph::new(Text::from(window.to_vec())).style(Style::new().bg(theme.bg)),
+        body,
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
@@ -3205,7 +3698,9 @@ mod tests {
     /// Status hints line lists the thread tools AND the multi-line hint;
     /// `^C cancel` stays readable next to the longest connection label.
     /// feat_ctrl_arrows_nav: `^↑↓ chats` documents Ctrl-arrow thread
-    /// switching and `↑↓ caret` documents plain-arrow caret movement.
+    /// switching; the plain-arrow caret hint it carried was later retired
+    /// (feat_hotkey_help_modal: plain arrows moving the caret is the
+    /// universal editor convention, and the F1 modal is the full reference).
     /// feat_thread_delete: `^D del` joined, later compacted to bare `^D`
     /// (feat_status_line: the confirm popup is self-explanatory).
     /// feat_focus_panes: `^T panel` documents the pane-focus toggle, later
@@ -3223,7 +3718,7 @@ mod tests {
             "\u{21e7}\u{21b5}",
             "^C cancel",
             "^/\u{2325}\u{2191}\u{2193} chats",
-            "\u{2191}\u{2193} caret",
+            "F1 help",
             "^D",
             "^F",
             "^T",
@@ -3234,6 +3729,10 @@ mod tests {
         assert!(
             !last.contains("^T next"),
             "stale cycling hint must be gone: {last:?}"
+        );
+        assert!(
+            !last.contains("caret"),
+            "retired caret hint must be gone: {last:?}"
         );
     }
 
@@ -5838,5 +6337,120 @@ mod tests {
         app.scroll_up(5);
         let (_, buf3) = render_grid_with_buffer(&mut app);
         assert_eq!(buf3[(0, 1)].fg, theme.unread_activity, "survives scrolling");
+    }
+
+    // ---- feat_hotkey_help_modal -------------------------------------------
+
+    /// The help modal renders the picker-family visual language (centered
+    /// bordered box, blue border, bold title, yellow hint footer) and, swept
+    /// across its scroll pages, EVERY row of the const table. One frame
+    /// cannot hold all rows by design — the body is a scrolled window — so
+    /// the sweep walks the clamped page offsets and unions the frames.
+    #[test]
+    fn help_modal_renders_every_table_row_across_scroll_pages() {
+        let mut app = App::new(mock::initial_chats());
+        app.begin_help_modal();
+        let total = help_modal_total_lines();
+        let page = {
+            render_grid(&mut app);
+            app.help_visible_rows as usize
+        };
+        assert!(page > 0 && page < total, "small viewport must paginate");
+
+        let mut seen = String::new();
+        let mut scroll = 0;
+        loop {
+            if let Mode::HelpViewing { state } = &mut app.mode {
+                state.scroll = scroll;
+            }
+            let rows = render_grid(&mut app).join("\n");
+            seen.push_str(&rows);
+            seen.push('\n');
+            if scroll + page >= total {
+                break;
+            }
+            scroll += page;
+        }
+
+        assert!(seen.contains(" Keybindings "), "title missing");
+        assert!(seen.contains("F1/Esc close"), "hint footer missing");
+        for row in HOTKEY_ROWS {
+            assert!(
+                seen.contains(row.chord),
+                "chord {:?} never rendered",
+                row.chord
+            );
+            assert!(
+                seen.contains(row.action),
+                "action {:?} never rendered",
+                row.action
+            );
+        }
+        // Group headers render once per group at the group's first row.
+        assert!(seen.contains("Global"));
+        assert!(seen.contains("Help (F1)"));
+    }
+
+    /// On a small frame the modal is a scrolled window: the top row is only
+    /// visible at scroll 0 and the table's last row only after paging to the
+    /// bottom clamp, with the render-fed viewport reported back to the App
+    /// seam that PgUp/PgDn page by.
+    #[test]
+    fn help_modal_scrolls_when_the_table_exceeds_the_viewport() {
+        let mut app = App::new(mock::initial_chats());
+        app.begin_help_modal();
+        // 14 rows tall: body = 14 - 4 (hint+borders+title slack) leaves
+        // a handful of visible rows — far fewer than the table.
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 14);
+        let joined = rows.join("\n");
+        let page = app.help_visible_rows as usize;
+        assert!(page < help_modal_total_lines(), "must paginate");
+        assert!(
+            joined.contains("open / close this keybindings help"),
+            "top row visible at scroll 0: {joined}"
+        );
+        assert!(
+            !joined.contains("copy the cursor line"),
+            "bottom rows hidden at scroll 0"
+        );
+
+        // Page to the bottom clamp: the last row surfaces, the first row
+        // scrolls away.
+        let total = help_modal_total_lines();
+        for _ in 0..(total / page + 2) {
+            app.help_page_down();
+        }
+        if let Mode::HelpViewing { state } = &mut app.mode {
+            assert_eq!(state.scroll, total - page, "bottom clamp");
+        }
+        let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 14);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("Help (F1)") && joined.contains("scroll the list"),
+            "last rows visible at the bottom clamp: {joined}"
+        );
+        assert!(
+            !joined.contains("open / close this keybindings help"),
+            "top row scrolled away"
+        );
+    }
+
+    /// The renderer opens a group header on every group CHANGE; duplicated
+    /// or interleaved groups would render phantom headers and skew the
+    /// total-line count the scroll clamps use.
+    #[test]
+    fn help_table_groups_are_contiguous() {
+        let mut seen = std::collections::HashSet::new();
+        let mut prev = "";
+        for row in HOTKEY_ROWS {
+            if row.group != prev {
+                assert!(
+                    seen.insert(row.group),
+                    "group {:?} appears twice (non-contiguous)",
+                    row.group
+                );
+                prev = row.group;
+            }
+        }
     }
 }

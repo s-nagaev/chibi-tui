@@ -7,6 +7,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Keybindings help modal (`F1`): a centered popup listing every active chord
+  — global keys, input editing, sidebar navigation, rename/delete
+  confirmations, model picker, both search popups, the log viewer and the
+  error popup — grouped and scrollable (`↑`/`↓` one line, `PgUp`/`PgDn` one
+  page, clamped at the table edges over the render-fed viewport). The same
+  chord or `Esc` closes; `Ctrl+C` quits as in every popup. The modal's
+  content is a single const table next to its renderer, and a dispatch-side
+  test suite pins that table against the real key handlers (an enumerated
+  chord map plus a typing-leak probe over every Normal-mode row), so a
+  chord added to the dispatch without a matching help row fails the suite.
+  The status hints row advertises the modal (`F1 help`); to pay for the
+  token the self-evident `↑↓ caret` hint retired (plain arrows in the
+  editor move the caret — README still documents it, and the modal is now
+  the on-screen reference for everything else).
 - Remember the last active thread across restarts: the thread id is recorded
   in `last-thread.json` next to the threads directory on every activation
   (write-on-activation, atomic temp-file + rename), so even a hard crash

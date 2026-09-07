@@ -151,6 +151,7 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 | `Ctrl+A` / `Ctrl+E` | Move cursor to start / end of line |
 | `Ctrl+U` | Delete from cursor to start of line |
 | `Ctrl+L` | Clear input and wipe the visible screen (chat view returns to bottom) |
+| `F1` | Toggle the keybindings help modal: a centered popup listing **every** active chord — global keys, input editing, sidebar, rename/delete confirmations, model picker, both search popups, the log viewer and the error popup — grouped and scrollable (`↑`/`↓` or `PgUp`/`PgDn` scroll; the same chord or `Esc` closes) |
 
 > **Terminal support note:** `⇧↵` / `⌥↵` (newline inserts), `Ctrl+↑` /
 > `Ctrl+↓` and `Alt+↑` / `Alt+↓` (thread switching) and `Ctrl+Shift+F`
@@ -219,7 +220,12 @@ While the **Sidebar** holds focus:
   Chat), `^R` rename, `^D` delete (still refused while busy), `^P` clone
   thread (same busy refusal), `^F` /
   `Ctrl+Shift+F` search popups, `^G` log viewer, `^O` status strip, `^M`
-  model picker, `^L` clear screen, `^C` cancel/quit.
+  model picker, `^L` clear screen, `^C` cancel/quit, `F1` help.
+
+Every chord above (and the ones the hints row compacts away) is listed in
+one place: press `F1` for the keybindings help modal — the popup renders the
+single keybindings table the tests pin against the real key dispatch, so it
+cannot drift from what the handlers actually do.
 
 The focused sidebar signals itself through the theme only: its divider and
 `Chats` title lift to a brighter accent and the idle dot column brightens;

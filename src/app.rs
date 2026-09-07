@@ -312,6 +312,19 @@ pub struct ModelPickerState {
     pub selected: usize,
 }
 
+/// State of the open keybindings help modal (feat_hotkey_help_modal).
+///
+/// The content is static — the renderer reads `ui::HOTKEY_ROWS` directly —
+/// so the only per-open state is the scroll offset of the row window, fed
+/// back a matching visible-row count the same seam the log viewer and the
+/// picker page by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelpModalState {
+    /// First visible row of `ui::HOTKEY_ROWS`; clamped at both ends by the
+    /// scroll methods so the window can never pass an edge.
+    pub scroll: usize,
+}
+
 /// Input mode of the whole app (feature: inline thread rename / search).
 ///
 /// Deliberately tiny and explicit so tests can drive transitions
@@ -361,6 +374,13 @@ pub enum Mode {
     /// the NORMAL request pipeline as a hidden exchange — see
     /// [`HiddenPurpose`] and [`App::begin_model_picker`].
     ModelPicking { state: ModelPickerState },
+    /// The F1 keybindings help modal is open (feat_hotkey_help_modal).
+    /// Modal isolation like the popup family: ↑/↓ (and PgUp/PgDn) scroll the
+    /// static `ui::HOTKEY_ROWS` table, F1 or Esc closes, everything else is
+    /// swallowed. The table is a const in `ui.rs` next to the render; a
+    /// dispatch-side test pins it against the real key handlers so future
+    /// chords cannot silently miss the modal.
+    HelpViewing { state: HelpModalState },
 }
 
 impl Mode {
@@ -590,6 +610,11 @@ pub struct App {
     /// viewport of picker rows. Defaults to 20 until first render (same
     /// seam as [`App::chat_visible_rows`] and [`App::log_visible_rows`]).
     pub picker_visible_rows: u16,
+    /// Visible body height (rows) of the open help modal, set during
+    /// `ui::render_help_modal` so ↑/↓ and PgUp/PgDn scroll exactly one
+    /// row/page of the keybindings table. Defaults to 20 until first render
+    /// (same seam as [`App::picker_visible_rows`]).
+    pub help_visible_rows: u16,
     /// feat_stderr_log_modal: the consumer-side "seen" watermark — the
     /// [`crate::diag::DiagLog::total`] value at the moment the log stream
     /// was last fully viewed (viewer opened / re-tailed / closed at the
@@ -777,6 +802,7 @@ impl App {
             log_visible_rows: 20,
             log_content_width: 100,
             picker_visible_rows: 20,
+            help_visible_rows: 20,
             log_seen_total: 0,
             status_strip_visible: false,
             workspace_root: None,
@@ -1004,7 +1030,8 @@ impl App {
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
-            | Mode::ModelPicking { .. } => None,
+            | Mode::ModelPicking { .. }
+            | Mode::HelpViewing { .. } => None,
         }
     }
 
@@ -1027,7 +1054,8 @@ impl App {
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
-            | Mode::ModelPicking { .. } => self.input.lines().len(),
+            | Mode::ModelPicking { .. }
+            | Mode::HelpViewing { .. } => self.input.lines().len(),
         };
         buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
     }
@@ -1049,7 +1077,8 @@ impl App {
             | Mode::Searching { .. }
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
-            | Mode::ModelPicking { .. } => return false,
+            | Mode::ModelPicking { .. }
+            | Mode::HelpViewing { .. } => return false,
         };
         self.mode = Mode::Normal;
         // feat_focus_panes: a closed modal returns keyboard ownership to
@@ -1836,6 +1865,80 @@ impl App {
         match &self.mode {
             Mode::ModelPicking { state } => &state.entries,
             _ => &[],
+        }
+    }
+
+    /// Open the F1 keybindings help modal (feat_hotkey_help_modal). Normal
+    /// mode only, like every other popup entry point: the modal branches in
+    /// `main.rs` return before this could run elsewhere anyway, so the guard
+    /// is the single seam that keeps exactly one popup open at a time.
+    /// Pure view state: nothing is fetched, nothing is cleared, the draft
+    /// and the connection state are untouched.
+    pub fn begin_help_modal(&mut self) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        self.mode = Mode::HelpViewing {
+            state: HelpModalState { scroll: 0 },
+        };
+    }
+
+    /// Close the help modal (F1 toggle or Esc). Returns whether a modal was
+    /// actually closed, mirroring [`App::close_model_picker`].
+    pub fn close_help_modal(&mut self) -> bool {
+        if !matches!(self.mode, Mode::HelpViewing { .. }) {
+            return false;
+        }
+        self.mode = Mode::Normal;
+        // feat_focus_panes: modal closed → editor pane.
+        self.focus = Focus::Chat;
+        true
+    }
+
+    /// Total rendered line count of the static keybindings table (rows +
+    /// group headers — the scroll window pages over header lines too).
+    fn help_table_len(&self) -> usize {
+        crate::ui::help_modal_total_lines()
+    }
+
+    /// ↑ or k in the help modal: scroll the row window up one line, clamped
+    /// at the top (no wraparound — same edge rule as the picker arrows).
+    pub fn help_scroll_up(&mut self) {
+        if let Mode::HelpViewing { state } = &mut self.mode {
+            state.scroll = state.scroll.saturating_sub(1);
+        }
+    }
+
+    /// ↓ or j in the help modal: scroll the row window down one line,
+    /// clamped so the window never passes the table's last row. The page
+    /// size is the render-fed [`App::help_visible_rows`], so the bottom edge
+    /// honors the real viewport; before the first render the default of 20
+    /// applies (harmless: nothing is on screen yet to scroll).
+    pub fn help_scroll_down(&mut self) {
+        let page = self.help_visible_rows.max(1) as usize;
+        let max_scroll = self.help_table_len().saturating_sub(page);
+        if let Mode::HelpViewing { state } = &mut self.mode {
+            state.scroll = (state.scroll + 1).min(max_scroll);
+        }
+    }
+
+    /// PgUp in the help modal: one full page up, clamped at the top (same
+    /// render-fed viewport seam as [`App::model_picker_page_up`]).
+    pub fn help_page_up(&mut self) {
+        if let Mode::HelpViewing { state } = &mut self.mode {
+            let page = self.help_visible_rows.max(1) as usize;
+            state.scroll = state.scroll.saturating_sub(page);
+        }
+    }
+
+    /// PgDn in the help modal: one full page down, clamped so the window
+    /// never passes the table's last row (same seam as
+    /// [`App::model_picker_page_down`], scroll-offset flavor).
+    pub fn help_page_down(&mut self) {
+        let page = self.help_visible_rows.max(1) as usize;
+        let max_scroll = self.help_table_len().saturating_sub(page);
+        if let Mode::HelpViewing { state } = &mut self.mode {
+            state.scroll = (state.scroll + page).min(max_scroll);
         }
     }
 
