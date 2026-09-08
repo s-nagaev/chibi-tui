@@ -1,0 +1,33 @@
+version: '3'
+
+vars:
+  TAG: dev
+  IMAGE: pysergio/chibi
+
+tasks:
+  lint:
+    desc: "Formatting and clippy gates (mirrors the CI linters job)"
+    cmds:
+      - cargo fmt --check
+      - cargo clippy --all-targets -- -D warnings
+
+  test:
+    desc: "Run the full test suite (mirrors the CI tests job)"
+    cmds:
+      - cargo test
+
+  artifacts:
+    desc: "Build the release binary and copy it into dist/"
+    cmds:
+      - cargo build --release
+      - mkdir -p dist
+      - cp target/release/chibi-tui dist/chibi-tui
+
+  build:lfull:
+    desc: "Build full backend+TUI image locally (amd64) with specified tag"
+    cmds:
+      - docker buildx build
+          --load
+          -t {{.IMAGE}}:full-{{.TAG}}
+          -f full.Dockerfile
+          .
