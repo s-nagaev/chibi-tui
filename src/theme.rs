@@ -57,7 +57,7 @@ pub struct Theme {
 impl Theme {
     pub const fn tokyo_night() -> Self {
         Self {
-            bg: Color::Rgb(26, 27, 38),             // #1a1b26
+            bg: Color::Rgb(32, 34, 46),             // #20222e — half tone above panel
             panel: Color::Rgb(21, 22, 31),          // #15161f
             selection: Color::Rgb(41, 46, 59),      // #292e42
             fg: Color::Rgb(192, 202, 245),          // #c0caf5
@@ -72,7 +72,7 @@ impl Theme {
             code_bg: Color::Rgb(17, 18, 26),        // #11121a — inline code chip
             code_panel_bg: Color::Rgb(23, 25, 35),  // #171923 — code block panel
             code_border: Color::Rgb(47, 61, 104),   // #2f3d68 — dim Tokyo blue
-            input_panel_bg: Color::Rgb(30, 32, 44), // #1e202c — input zone tint
+            input_panel_bg: Color::Rgb(36, 38, 51), // #242633 — lifted against chat bg
             // Marker role slots reuse the Tokyo Night accents they always
             // rendered with: the selected dot stayed green, an unseen
             // reply lights yellow, a read thread rests dim.
