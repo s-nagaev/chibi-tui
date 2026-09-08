@@ -97,7 +97,7 @@ pub fn content_lines(os: TargetOs, theme: &Theme) -> Vec<Line<'static>> {
                 cmd,
             )));
             lines.push(Line::from(Span::styled(
-                "  ~/.local/share/chibi-tui/venv/bin/pip install chibi",
+                "  ~/.local/share/chibi-tui/venv/bin/pip install chibi-bot",
                 cmd,
             )));
             lines.push(Line::from(Span::styled(
@@ -111,7 +111,7 @@ pub fn content_lines(os: TargetOs, theme: &Theme) -> Vec<Line<'static>> {
                 cmd,
             )));
             lines.push(Line::from(Span::styled(
-                r"  %USERPROFILE%\.local\share\chibi-tui\venv\Scripts\pip install chibi",
+                r"  %USERPROFILE%\.local\share\chibi-tui\venv\Scripts\pip install chibi-bot",
                 cmd,
             )));
             lines.push(Line::from(Span::styled(
@@ -249,7 +249,7 @@ mod tests {
         assert!(text.contains("not found on PATH"), "got: {text}");
         assert!(text.contains("pipx install chibi"));
         assert!(text.contains("python3 -m venv ~/.local/share/chibi-tui/venv"));
-        assert!(text.contains("~/.local/share/chibi-tui/venv/bin/pip install chibi"));
+        assert!(text.contains("~/.local/share/chibi-tui/venv/bin/pip install chibi-bot"));
         assert!(text.contains("export CHIBI_BACKEND_BIN=~/.local/share/chibi-tui/venv/bin/chibi"));
         assert!(text.contains("export CHIBI_BACKEND_BIN=/path/to/chibi"));
     }
@@ -258,7 +258,7 @@ mod tests {
     fn windows_content_lists_py_and_venv_commands() {
         let text = flat(&content_lines(TargetOs::Windows, &Theme::tokyo_night()));
         assert!(text.contains(r"py -3 -m venv %USERPROFILE%"), "got: {text}");
-        assert!(text.contains(r"\Scripts\pip install chibi"));
+        assert!(text.contains(r"\Scripts\pip install chibi-bot"));
         assert!(text.contains(r"set CHIBI_BACKEND_BIN=%USERPROFILE%"));
         assert!(text.contains(r"set CHIBI_BACKEND_BIN=C:\path\to\chibi.exe"));
         // pipx works on Windows too, so it stays on that page as well.
