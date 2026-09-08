@@ -1,0 +1,10 @@
+# Keep the build context small: target/ alone is several GB of Rust artifacts.
+target
+.git
+.github
+.idea
+.vscode
+.DS_Store
+docs
+examples
+tests
