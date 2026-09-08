@@ -2,26 +2,30 @@
 # The TUI spawns `chibi stdio --tui`, so the backend console script is installed
 # in the same image; skills are served from /app/skills.
 #
-# This image is identical to the one built from the backend repository
-# (chibi/full.Dockerfile) — the roles are mirrored: the TUI is built from the
-# main context, and the backend source is supplied through a named build
-# context (`backend-src`), declared below as an empty scratch stage and
-# overridden at build time.
+# This image is self-sufficient: a bare clone of chibi-tui builds it with no
+# external build context. The backend source is git-cloned inside the build
+# from the public repository (override with CHIBI_REPO / CHIBI_REF).
 #
-# Local checkout:
+# Default invocation:
 #   docker buildx build \
 #     --load \
-#     --build-context backend-src=../chibi \
 #     -f full.Dockerfile -t pysergio/chibi:full .
 #
-# Remote git context (works today — the backend repository is public):
-#   docker buildx build \
-#     --load \
-#     --build-context backend-src=https://github.com/s-nagaev/chibi \
-#     -f full.Dockerfile -t pysergio/chibi:full .
+# Backend repository overrides:
+#   --build-arg CHIBI_REPO=<any git URL or path reachable by the builder>
+#     e.g. https://github.com/s-nagaev/chibi
+#   --build-arg CHIBI_REF=<branch, tag or commit; default main>
 
-# === Backend source (empty placeholder, replaced by --build-context backend-src=...) ===
-FROM scratch AS backend-src
+# === Backend source (git clone; override with --build-arg CHIBI_REPO / CHIBI_REF) ===
+ARG CHIBI_REPO=https://github.com/s-nagaev/chibi
+ARG CHIBI_REF=main
+
+FROM alpine/git AS backend-src
+ARG CHIBI_REPO
+ARG CHIBI_REF
+WORKDIR /repo
+RUN git clone "${CHIBI_REPO}" . \
+    && git checkout --detach "${CHIBI_REF}"
 
 # === TUI builder ===
 FROM rust:slim-bookworm AS tui-builder
@@ -39,9 +43,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=backend-src requirements.txt pyproject.toml README.md ./
-COPY --from=backend-src chibi ./chibi
-COPY --from=backend-src skills ./skills
+COPY --from=backend-src /repo/requirements.txt /repo/pyproject.toml /repo/README.md ./
+COPY --from=backend-src /repo/chibi ./chibi
+COPY --from=backend-src /repo/skills ./skills
 # data/.keep is excluded from the build context by the backend's .dockerignore;
 # recreate it so the poetry includes resolve during wheel build.
 RUN mkdir -p data && touch data/.keep
@@ -82,7 +86,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=tui-builder /tui/target/release/chibi-tui /usr/local/bin/chibi-tui
 
 WORKDIR /app
-COPY --from=backend-src skills ./skills
+COPY --from=backend-src /repo/skills ./skills
 RUN mkdir -p /app/data
 
 # Default environment variables (agent mode)
