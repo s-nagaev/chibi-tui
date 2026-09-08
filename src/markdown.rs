@@ -336,8 +336,8 @@ fn flush_code_block(out: &mut Vec<MdLine>, body: &str, lang: &str, theme: &Theme
         Span::styled("\u{256e}", Style::new().fg(theme.code_border)),
     ]));
 
-    // Highlighted body lines, painted onto a panel background so the block
-    // reads as a distinct surface against the chat background.
+    // Highlighted body lines, painted on the chat background: the
+    // `code_border` frame is the only separator, the interior blends in.
     let syntax = hl.syntax_for(lang);
     let mut hlines = HighlightLines::new(syntax, &hl.theme);
     let panel_bg = Style::new().bg(theme.code_panel_bg);
@@ -723,6 +723,50 @@ mod tests {
             "clipped row must reach full width incl. closing border"
         );
         assert!(plain.ends_with('\u{2502}'), "right border lost: {plain:?}");
+    }
+
+    /// Code surfaces blend into the chat: both background role slots equal
+    /// `theme.bg`, so neither the fenced block interior nor the inline code
+    /// chip cuts a dark patch into the chat surface — the `code_border`
+    /// frame (and the inline text itself) is the only separator.
+    #[test]
+    fn code_surfaces_share_chat_background() {
+        let theme = Theme::tokyo_night();
+        assert_eq!(theme.code_panel_bg, theme.bg, "panel tone must equal bg");
+        assert_eq!(theme.code_bg, theme.bg, "inline chip tone must equal bg");
+
+        // Fenced block: interior, gutters, padding and side borders all
+        // carry the unified background.
+        let md = "```rust\nlet x = 42;\n```\n";
+        let rows: Vec<Vec<Span<'static>>> = render(md, &theme)
+            .iter()
+            .filter(|l| {
+                let p: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                p.starts_with('\u{2502}')
+            })
+            .map(|l| l.spans.clone())
+            .collect();
+        assert!(!rows.is_empty(), "panel body rows expected");
+        for row in &rows {
+            for span in row {
+                assert_eq!(
+                    span.style.bg,
+                    Some(theme.bg),
+                    "panel span {:?} left the chat background",
+                    span.content
+                );
+            }
+        }
+
+        // Inline code chip: no hard cutout mid-line.
+        let lines = render("run `make all` now", &theme);
+        let chip: Vec<_> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.content.contains("make all"))
+            .collect();
+        assert_eq!(chip.len(), 1, "one inline chip span expected");
+        assert_eq!(chip[0].style.bg, Some(theme.bg));
     }
 }
 

@@ -18,9 +18,13 @@ pub struct Theme {
     pub orange: Color,
     pub red: Color,
     pub yellow: Color,
+    /// Inline code tone: identical to `bg` on purpose — inline code is marked
+    /// by its bold accent text, not by a background patch, so nothing cuts a
+    /// dark hole into the chat surface mid-line.
     pub code_bg: Color,
-    /// Slightly lifted tone used inside fenced code blocks so the block reads
-    /// as a distinct panel surface against the chat background.
+    /// Fenced code block interior: identical to `bg` on purpose — the block
+    /// is marked by its `code_border` frame (and language label), not by a
+    /// separate panel tone, so the interior blends into the chat surface.
     pub code_panel_bg: Color,
     /// Muted border color framing code blocks.
     pub code_border: Color,
@@ -69,9 +73,9 @@ impl Theme {
             orange: Color::Rgb(255, 158, 100),      // #ff9e64
             red: Color::Rgb(247, 118, 142),         // #f7768e
             yellow: Color::Rgb(224, 175, 104),      // #e0af68
-            code_bg: Color::Rgb(17, 18, 26),        // #11121a — inline code chip
-            code_panel_bg: Color::Rgb(23, 25, 35),  // #171923 — code block panel
-            code_border: Color::Rgb(47, 61, 104),   // #2f3d68 — dim Tokyo blue
+            code_bg: Color::Rgb(32, 34, 46),        // #20222e — same as bg: text marks inline code
+            code_panel_bg: Color::Rgb(32, 34, 46), // #20222e — same as bg: the frame marks the block
+            code_border: Color::Rgb(47, 61, 104),  // #2f3d68 — dim Tokyo blue
             input_panel_bg: Color::Rgb(36, 38, 51), // #242633 — lifted against chat bg
             // Marker role slots reuse the Tokyo Night accents they always
             // rendered with: the selected dot stayed green, an unseen
