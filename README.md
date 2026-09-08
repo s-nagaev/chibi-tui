@@ -1,7 +1,16 @@
+<h1 align="center"><img width=150 src="https://github.com/s-nagaev/chibi/raw/main/docs/logo.png" alt="Chibi Logo"></h1>
+
 # chibi-tui
 
-[![CI](https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml"><img src="https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml/badge.svg" alt="Build"></a>
+  <a href="https://www.codefactor.io/repository/github/s-nagaev/chibi"><img src="https://www.codefactor.io/repository/github/s-nagaev/chibi/badge" alt="CodeFactor"></a>
+  <a href="https://hub.docker.com/r/pysergio/chibi"><img src="https://img.shields.io/docker/pulls/pysergio/chibi" alt="Docker Pulls"></a>
+  <a href="https://pypi.org/project/chibi-bot/"><img src="https://static.pepy.tech/personalized-badge/chibi-bot?period=total&units=INTERNATIONAL_SYSTEM&left_color=GRAY&right_color=BLUE&left_text=pip+installs" alt="PyPI Downloads"></a>  
+  <a href="https://hub.docker.com/r/pysergio/chibi/tags"><img src="https://img.shields.io/badge/arch-arm64%20%7C%20amd64-informational" alt="Architectures"></a>
+  <a href="https://github.com/s-nagaev/chibi/blob/main/LICENSE"><img src="https://img.shields.io/github/license/s-nagaev/chibi" alt="License"></a>
+  <a href="https://chibi.bot"><img src="https://img.shields.io/badge/docs-chibi.bot-blue" alt="Documentation"></a>
+</p>
 
 A terminal UI client for [Chibi](https://github.com/s-nagaev/chibi) — an AI
 assistant — built with Rust + ratatui + crossterm + tokio. Chats with the
@@ -53,11 +62,12 @@ binary or build from source).
 
 ### Backend
 
-The TUI is a client: it spawns the [`chibi`](https://pypi.org/project/chibi/)
-backend (Python, installable from PyPI) and talks IDE protocol v1 over stdio:
+The TUI is a client: it spawns the `chibi` binary from the
+[`chibi-bot`](https://pypi.org/project/chibi-bot/) Python package and talks
+IDE protocol v1 over stdio:
 
 ```bash
-pip install chibi
+pip install chibi-bot
 ```
 
 The default transport spawns `chibi stdio --tui`; the workspace root travels
@@ -127,126 +137,49 @@ raw; cleaning up partial markers is the backend's job, not the TUI's.
 
 | Key | Action |
 |---|---|
-| `Ctrl+↑` / `Ctrl+↓` | Switch to previous / next thread (resets the chat scroll; clamped at list edges) |
-| `Alt+↑` / `Alt+↓` | Same as `Ctrl+↑` / `Ctrl+↓` — a full synonym (see the macOS note below) |
-| `Ctrl+T` | **Toggle pane focus** Chat ↔ Sidebar (see the pane-focus section below). While the Sidebar holds focus, `↑`/`↓` move the thread selection with live switching and bare `Enter`/`Esc` return to the editor. Works in ANY terminal: it is a plain Ctrl+letter chord, so it never degrades the way the arrow chords do without the kitty protocol. The previous wrap-cycling thread switcher this key used to bind was removed |
-| `↑` / `↓` | Move the text cursor up/down inside the input (navigate the multi-line draft); while the Sidebar holds focus they move the thread selection instead (see pane focus below) |
-| `Ctrl+N` | New chat |
-| `Ctrl+P` | Clone the current thread with its full conversation context: a `<name> (copy)` thread appears right after the source and gets selected. Refused while the thread is busy (in-flight turn or queued prompts). Needs a backend that advertises the clone command; on older backends a popup explains instead |
-| `Ctrl+R` | Rename the current thread inline (`Enter` save · `Esc` cancel) |
-| `Ctrl+D` | Delete the current thread (`Enter`/`y` confirm · `Esc`/`n` cancel; refused while the thread is busy) |
-| `Ctrl+F` | Find in the current thread (type to filter, `↑`/`↓` navigate matches, `Enter` jump to match, `Esc` close) |
-| `Ctrl+Shift+F` | Find in ALL threads (global search; same popup family with thread-title labels and total counts; `Enter` switches to the match's thread and jumps; requires the kitty keyboard protocol) |
-| `Ctrl+G` | Open the diagnostics log viewer (backend stderr + TUI lifecycle events; `PgUp`/`PgDn` or `↑`/`↓` scroll, `Esc` close — see the Diagnostics section) |
-| `Ctrl+O` | Toggle the status strip: a dim one-row `cwd: <workspace> · <model>` readout on the chat header's top border, extended with a trailing `· ctx …` usage segment once the backend reports one (hidden by default; see the Status strip section) |
-| `Ctrl+S` | Toggle the dim reasoning (thoughts) block above the latest answer (on by default; session-only view state — flipping it never clears anything and reasoning is never saved to history) |
-| `Ctrl+M` | Open the model picker popup (`↑`/`↓` navigate · `Enter` switch · `Esc` close — see the Model picker section; requires the kitty keyboard protocol) |
-| `Enter` | Send message (or queue it while this chat is busy) |
-| `⇧↵` / `⌥↵` | Insert a newline into the input (multi-line prompts) |
+| `Ctrl+↑` / `Ctrl+↓` | Switch to the previous / next thread (the chat scroll resets on every switch; on stock macOS use `Alt+↑` / `Alt+↓` instead — see the macOS note below) |
+| `Ctrl+T` | Toggle keyboard focus between the Chat pane (the prompt editor, default) and the Sidebar (the thread list) — while the Sidebar holds focus, `↑`/`↓` move the thread selection with live switching, `Enter`/`Esc` return to the editor with the draft untouched, and `PgUp`/`PgDn` keep scrolling the chat |
+| `↑` / `↓` | Move the text cursor up/down inside the multi-line input (they move the thread selection instead while the Sidebar holds focus) |
+| `Ctrl+N` | Start a new chat |
+| `Ctrl+P` | Clone the current thread with its full conversation context as a `<name> (copy)` thread (refused while the thread is busy; on older backends a popup explains instead) |
+| `Ctrl+R` | Rename the current thread inline (`Enter` saves, `Esc` cancels) |
+| `Ctrl+D` | Delete the current thread after confirmation (`Enter`/`y` confirm, `Esc`/`n` cancel; refused while the thread is busy) |
+| `Ctrl+F` | Find text in the current thread: type to filter, `↑`/`↓` navigate matches, `Enter` jump to a match, `Esc` close |
+| `Ctrl+Shift+F` | Find text across all threads; `Enter` switches to the match's thread and jumps to the match (requires the kitty keyboard protocol) |
+| `Ctrl+G` | Open the diagnostics log viewer (`PgUp`/`PgDn` or `↑`/`↓` scroll, `Esc` close) |
+| `Ctrl+O` | Toggle the status strip — a dim `cwd: <workspace> · <model>` readout on the chat header's top border, extended with a `· ctx …` context-usage segment once the backend reports one (hidden by default) |
+| `Ctrl+S` | Toggle the dim reasoning (thoughts) block above the latest answer (on by default; a session-only view state — nothing is ever removed from saved history) |
+| `Ctrl+M` | Open the model picker popup (`↑`/`↓` navigate, `Enter` switch, `Esc` close; requires the kitty keyboard protocol) |
+| `Enter` | Send the message (or queue it while this chat is busy) |
+| `Shift+Enter` / `Alt+Enter` | Insert a newline into the input (multi-line prompts) |
 | `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
-| `PgUp` / `PgDn` | Scroll chat view up/down one page (by visible rows) |
-| macOS: `fn`+`↑` / `fn`+`↓` | Equivalent to PgUp/PgDn on laptops without a dedicated Page key |
-| `Esc` | Clear input / dismiss popup; while the Sidebar holds focus it just returns focus to Chat (draft untouched) |
-| `Ctrl+V` | Paste clipboard (macOS: Cmd+V) |
-| `Ctrl+A` / `Ctrl+E` | Move cursor to start / end of line |
-| `Ctrl+U` | Delete from cursor to start of line |
-| `Ctrl+L` | Stop the running request of the current chat behind a confirmation popup (`Enter`/`y` confirm · `Esc`/`n` cancel). The stop reuses the backend's `/stop` command — the same mechanism as the Telegram bot: the in-flight request is cancelled, subagent counters are flushed and the transcript stays. A silent no-op when the chat is idle. Needs a backend that advertises `/stop`; on older backends a toast explains instead |
-| `Shift+Ctrl+L` | Reset the current thread behind a confirmation popup (same `Enter`/`y` · `Esc`/`n` grammar). Sends the backend's `/reset` command — history is dropped thread-scoped — and clears the local dialog (messages, queued prompts, reasoning block) when the backend acks. Works while a request is running (the running turn is cancelled first) and when idle |
-| `F1` | Toggle the keybindings help modal: a centered popup listing **every** active chord — global keys, input editing, sidebar, rename/delete confirmations, model picker, both search popups, the log viewer and the error popup — grouped and scrollable (`↑`/`↓` or `PgUp`/`PgDn` scroll; the same chord or `Esc` closes) |
+| `PgUp` / `PgDn` | Scroll the chat view up/down one page (on macOS laptops without Page keys, `fn`+`↑` / `fn`+`↓` are equivalent) |
+| `Esc` | Clear the input or dismiss a popup; while the Sidebar holds focus, it just returns focus to Chat without touching the draft |
+| `Ctrl+V` | Paste from the clipboard (macOS: Cmd+V) |
+| `Ctrl+A` / `Ctrl+E` | Move the cursor to the start / end of the line |
+| `Ctrl+U` | Delete from the cursor to the start of the line |
+| `Ctrl+L` | Stop the running request of the current chat behind a confirmation popup (`Enter`/`y` confirm, `Esc`/`n` cancel; a no-op when idle; on backends without `/stop` support a toast explains instead) |
+| `Shift+Ctrl+L` | Reset the current thread behind a confirmation popup (same confirm/cancel keys): the thread's history is dropped and the local dialog cleared, both while running and when idle (on legacy terminals this degrades to `Ctrl+L` — type `/reset` at the prompt instead) |
+| `F1` | Toggle the keybindings help modal — a centered, scrollable popup listing every active chord |
 
-> **Terminal support note:** `⇧↵` / `⌥↵` (newline inserts), `Ctrl+↑` /
-> `Ctrl+↓` and `Alt+↑` / `Alt+↓` (thread switching) and `Ctrl+Shift+F`
-> (global search) require a terminal that implements the
+> **Terminal support:** `Shift+Enter` / `Alt+Enter`, `Ctrl+↑` / `Ctrl+↓`,
+> `Alt+↑` / `Alt+↓`, `Ctrl+Shift+F`, `Shift+Ctrl+L` and `Ctrl+M` require a
+> terminal that implements the
 > [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
-> (kitty, WezTerm, foot, recent Ghostty, iTerm2, …). chibi-tui requests it at
-> startup via crossterm's `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`
-> and pops the flags on exit. On terminals without support the request is
-> silently ignored:
->
-> - **Shift+Enter degrades to plain Enter — i.e. it sends the message**
->   instead of inserting a newline.
-> - **`Ctrl+↑` / `Ctrl+↓` become indistinguishable from plain `↑` / `↓`**
->   (legacy terminals send the same escape bytes as plain arrows, or nothing
->   for the combination): those presses then move the text cursor instead of
->   switching threads. On stock macOS this flavor is additionally hijacked by
->   Mission Control *before* the terminal ever sees it — use `Alt+↑` /
->   `Alt+↓` there (see the macOS note below).
-> - **`Alt+↑` / `Alt+↓` arrive as an Esc press followed by a plain arrow** on
->   legacy terminals: crossterm splits the `ESC ESC [ A`-style sequence into
->   two events, so Esc clears the input and the arrow then moves the caret —
->   no thread switch. This is a terminal limitation, not a bug: use a
->   kitty-protocol-capable terminal (or iTerm2, which sends proper Alt+arrow
->   sequences out of the box) if you need Alt thread switching there.
-> - **`Ctrl+Shift+F` becomes indistinguishable from `Ctrl+F`** (the Shift
->   modifier is lost on such terminals): those presses then open the
->   in-thread search instead of the global one. There is no other keyboard
->   path to global search, so on such terminals it is unavailable; use a
->   kitty-protocol-capable terminal if you need it. There is no reliable way
->   to distinguish these keys there; this is a terminal limitation, not a bug.
-> - **`Shift+Ctrl+L` becomes indistinguishable from `Ctrl+L`** (same lost
->   Shift modifier): those presses then open the stop confirmation instead
->   of the reset one. When the chat is idle the reset stays reachable by
->   typing `/reset` into the prompt and sending it.
+> (kitty, WezTerm, foot, recent Ghostty, iTerm2, …); chibi-tui requests the
+> protocol at startup, and on terminals without support the request is
+> silently ignored: `Shift+Enter` / `Alt+Enter` degrade to plain `Enter`
+> (sending the message), the thread-switching chords may arrive as plain
+> arrows or an Esc + arrow pair and then just move the cursor,
+> `Ctrl+Shift+F` degrades to `Ctrl+F`, `Shift+Ctrl+L` to `Ctrl+L`, and
+> `Ctrl+M` arrives as bare `Enter`.
 
-**macOS note (Mission Control):** macOS binds `Ctrl+↑` / `Ctrl+↓` to the
-*Move between spaces* shortcuts system-wide, so on stock macOS those chords
-are swallowed by Mission Control before the terminal ever receives them. This
-is why chibi-tui also binds `Alt+↑` / `Alt+↓` as a **full synonym** — identical
-thread-switching semantics, no behavior divergence. To re-enable the Ctrl
-variant instead, turn the system shortcuts off: **System Settings → Keyboard →
-Keyboard Shortcuts → Mission Control** → uncheck *Move left a space* / *Move
-right a space* (the `Ctrl+↑`/`Ctrl+↓` entries). Per-terminal Alt behavior:
-**kitty** is native (its keyboard protocol is requested at startup), **iTerm2**
-sends proper Option+arrow sequences out of the box, and **Terminal.app**
-needs **Use Option as Meta Key** (*Settings → Profiles → Keys*) so Option
-reaches the app at all — but on terminals without kitty-protocol support the
-chord may still be split into Esc + arrow (see the terminal support note
-above); verify on your terminal.
-
-**Pane focus (`Ctrl+T`):** `Ctrl+T` toggles the keyboard between the two
-panes — **Chat** (the prompt editor, default) and **Sidebar** (the thread
-list). It deliberately remains a plain Ctrl+letter chord, so it arrives
-intact in **every** terminal; modals (rename, delete confirm, both search
-popups) sit above focus and closing any of them always lands back on Chat.
-
-While the **Sidebar** holds focus:
-
-- `↑` / `↓` move the thread selection with **live switching** — exactly the
-  clamped mechanics of `Ctrl+↑`/`Ctrl+↓` (the active chat and its view
-  follow instantly; every switch resets scrolling to follow-bottom).
-- bare `Enter` applies and returns focus to Chat (the highlighted chat
-  stays active; it never submits the draft), `Esc` returns WITHOUT touching
-  what you have typed.
-- plain typing never leaks into the editor: printable keys, Backspace,
-  Shift/Alt+Enter newlines and readline edits are all swallowed.
-- `PgUp`/`PgDn` still scroll the CHAT pane — reading works regardless of
-  which pane holds focus.
-- global service chords stay live: `^N` (new chat — then focus lands on
-  Chat), `^R` rename, `^D` delete (still refused while busy), `^P` clone
-  thread (same busy refusal), `^F` /
-  `Ctrl+Shift+F` search popups, `^G` log viewer, `^O` status strip, `^M`
-  model picker, `^L` clear screen, `^C` cancel/quit, `F1` help.
-
-Every chord above (and the ones the hints row compacts away) is listed in
-one place: press `F1` for the keybindings help modal — the popup renders the
-single keybindings table the tests pin against the real key dispatch, so it
-cannot drift from what the handlers actually do.
-
-The focused sidebar signals itself through the theme only: its divider and
-`Chats` title lift to a brighter accent and the idle dot column brightens;
-the chat pane's `❯` marker dims while typing is parked.
-
-The old wrap-around *cycling* semantics this key used to carry ("jump to
-the NEXT thread, last wraps to first") was removed in favor of the toggle:
-use `Ctrl+↑` / `Ctrl+↓` (or their Alt synonyms) for sequential thread
-switching.
-
-**Growing input block:** the editor area expands from one up to twenty rows as
-the multiline draft grows (`Shift+Enter`), while the chat pane shrinks to make
-room. Past twenty lines the view auto-follows the caret, keeping the line you
-are typing on screen; `PgUp`/`PgDn` keep scrolling the chat, and clearing the
-input collapses the block back to a single row. The rename editor grows the
-same way for multiline title drafts.
+> **macOS:** the system binds `Ctrl+↑` / `Ctrl+↓` to Mission Control's
+> *Move between spaces*, so prefer the `Alt+↑` / `Alt+↓` variant there (in
+> Terminal.app, enable **Use Option as Meta Key** under *Settings → Profiles
+> → Keys* so Option reaches the app), or uncheck *Move left / right a space*
+> under **System Settings → Keyboard → Keyboard Shortcuts → Mission Control**
+> to keep using the Ctrl chords.
 
 ### Renaming threads
 
@@ -343,10 +276,9 @@ holds focus):
   file (append mode; parent directories are created). Unset (the default)
   means memory only. A file that cannot be opened/created is silently
   ignored — diagnostics never break the app.
-- **Honest limitation** — only the backend's **stderr** reaches the buffer.
-  The backend's loguru logging currently writes to its **stdout** (the
-  protocol channel), so backend log lines do not appear here; the
-  backend-side log sink fix is a separate backend task.
+- **Known limitation** — only the backend's **stderr** reaches the buffer.
+  The backend's own logging currently writes to its **stdout** (the
+  protocol channel), so backend log lines do not appear here.
 
 ### Status strip
 
@@ -406,9 +338,9 @@ file: a restart restores messages only, without traces. Answers without
 reasoning, whitespace-only traces, or the toggle off render exactly as they
 did before the feature existed.
 
-chibi-tui advertises both wave-2 features at the version handshake
-(`{"thoughts": true, "subagents": true}`); the protocol version itself is
-unchanged and older backends simply tolerate the unknown keys.
+These features are optional: chibi-tui announces support for thoughts and
+subagent progress when connecting, and older backends simply ignore the
+announcement.
 
 ### Subagent counter
 
@@ -417,9 +349,7 @@ subagent progress, the spinner line above the input gains a trailing
 `· subagents working: n` segment (n = currently active subagents). The
 segment follows the active chat only: background chats keep showing their
 work in the sidebar dot, and without live subagents the spinner line is
-byte-for-byte unchanged. The backend emits subagent progress only to
-clients that declared the `subagents` capability at the handshake, which
-chibi-tui always does.
+byte-for-byte unchanged.
 
 ### Model picker
 
