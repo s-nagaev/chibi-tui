@@ -1,0 +1,16 @@
+version: '3'
+
+vars:
+  TAG: dev
+  IMAGE: pysergio/chibi
+
+tasks:
+  build:lfull:
+    desc: "Build full backend+TUI image locally (amd64) with specified tag"
+    cmds:
+      - docker buildx build
+          --load
+          --build-context backend-src=../chibi
+          -t {{.IMAGE}}:full-{{.TAG}}
+          -f full.Dockerfile
+          .
