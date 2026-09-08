@@ -387,6 +387,14 @@ fn thoughts_block_lines(thoughts: &str, theme: &Theme) -> Vec<markdown::MdLine> 
 }
 
 fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_line: Rect) {
+    // chat surface tint: the FULL chat pane (border row included) carries
+    // `theme.bg` BEFORE any widget renders, so empty transcript space stops
+    // showing the terminal profile background and the panel < chat < input
+    // ladder is app-painted. Mirrors the input zone's tint in render_input;
+    // the border/title and message spans carry fg-only styles, so they patch
+    // over this bg without erasing it (only code chips set their own bg).
+    f.buffer_mut().set_style(area, Style::new().bg(theme.bg));
+
     let title = app.chat_title().replace('\n', " ");
     let left_title = format!(
         " #{}/{} \u{00b7} {} ",
@@ -3183,6 +3191,52 @@ mod tests {
             assert_ne!(buf[(0, y)].bg, theme.input_panel_bg, "sidebar tinted");
             assert_ne!(buf[(119, y)].bg, theme.input_panel_bg, "margin tinted");
         }
+    }
+
+    /// Chat transcript surface carries `theme.bg` across the FULL chat pane —
+    /// top-border row, empty transcript space and the pane's right margin
+    /// column included — while sidebar/divider keep `theme.panel` and the
+    /// input zone keeps `theme.input_panel_bg` (the app-painted
+    /// panel < chat < input ladder, independent of the terminal profile).
+    #[test]
+    fn chat_surface_tints_full_column_with_theme_bg() {
+        let theme = Theme::tokyo_night();
+        // A fresh empty chat: every inner cell is blank transcript space —
+        // exactly the surface the terminal background used to show through.
+        let mut app = App::new(vec![Chat::new("chat")]);
+
+        let (_, buf) = render_grid_with_buffer(&mut app);
+        // Pane spans x 26..=119; the 1-row editor block puts the pane at
+        // rows 0..=30 (row 31 spinner, 32 input, 33 hints).
+        for (x, y) in [
+            (26u16, 0u16),
+            (60, 0),
+            (119, 0),
+            (26, 15),
+            (60, 15),
+            (119, 15),
+            (118, 30),
+        ] {
+            assert_eq!(
+                buf[(x, y)].bg,
+                theme.bg,
+                "chat surface not tinted at ({x},{y})"
+            );
+        }
+        // Neighbors keep their own surfaces: sidebar + divider panel, input
+        // zone panel tint, input-band margin cell untouched by either fill.
+        assert_eq!(buf[(10, 15)].bg, theme.panel, "sidebar must stay panel");
+        assert_eq!(buf[(25, 15)].bg, theme.panel, "divider must stay panel");
+        assert_eq!(
+            buf[(60, 32)].bg,
+            theme.input_panel_bg,
+            "input zone tint lost"
+        );
+        assert_ne!(
+            buf[(119, 32)].bg,
+            theme.bg,
+            "input margin must not take chat tint"
+        );
     }
 
     /// Cap + auto-scroll: a 23-line draft caps the block at MAX_INPUT_LINES
