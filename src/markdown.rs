@@ -391,6 +391,7 @@ fn flush_code_block(out: &mut Vec<MdLine>, body: &str, lang: &str, theme: &Theme
                 break 'tokens;
             }
         }
+        // Right padding seals the line to exactly `width` cells,
         // mirroring the 2-column left gutter.
         if inner_width > used {
             row_spans.push(Span::styled(" ".repeat(inner_width - used), panel_bg));
