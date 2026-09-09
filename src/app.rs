@@ -449,15 +449,17 @@ pub struct Chat {
     /// model and hidden `/model <n>` switches both refresh it. `None` for
     /// fresh chats and for snapshots recorded before the field existed.
     pub last_model: Option<String>,
-    /// This thread's own latest reasoning trace, rendered as the dim block
-    /// above the chat's last assistant message. Written ONLY by a visible
-    /// terminal result of THIS chat that carries thoughts — hidden
-    /// model-picker exchanges and fieldless command results never touch it —
-    /// and cleared when a new visible request starts in THIS chat only. The
-    /// renderer reads the ACTIVE chat's field, so a background reply lands
-    /// in its own chat and the view can never show another thread's
-    /// reasoning. Session-only: never persisted (reasoning is heavy and the
-    /// contract keeps the block restart-fresh).
+    /// This thread's own latest reasoning chain, rendered as the dim block
+    /// above the chat's last assistant message. Written ONLY by visible
+    /// answers of THIS chat that carry thoughts — the turn's terminal result
+    /// and every background continuation APPEND their payload
+    /// ([`Self::retain_thoughts`] via the event handlers; hidden
+    /// model-picker exchanges and fieldless command results never touch it) —
+    /// and the chain resets when a new visible request starts in THIS chat
+    /// only. The renderer reads the ACTIVE chat's field, so a background
+    /// reply lands in its own chat and the view can never show another
+    /// thread's reasoning. Session-only: never persisted (reasoning is heavy
+    /// and the contract keeps the block restart-fresh).
     pub last_thoughts: Option<String>,
     /// live subagent progress for THIS thread, keyed by
     /// the numeric protocol request id → (active, total). Populated from
@@ -2918,13 +2920,14 @@ impl App {
                         self.last_turn_usage = Some(u);
                     }
                     // Thoughts are sticky per chat: only a VISIBLE result
-                    // carrying reasoning replaces the owning chat's trace —
+                    // carrying reasoning extends the owning chat's trace —
                     // hidden exchanges (model picker) and fieldless frames
                     // (command results) never touch it, so the block survives
-                    // the plumbing between two LLM answers.
+                    // the plumbing between two LLM answers. Chain members
+                    // APPEND (see `retain_thoughts`), never overwrite.
                     if purpose.is_none() {
                         if let Some(t) = thoughts {
-                            self.chats[chat_index].last_thoughts = Some(t);
+                            retain_thoughts(&mut self.chats[chat_index], &t);
                         }
                     }
                     self.chats[chat_index].lifecycle = ChatLifecycle::Idle;
@@ -3037,9 +3040,9 @@ impl App {
     /// any, is still in flight), never touches the sticky ctx/usage state
     /// (the frame carries no usage), and never changes the lifecycle. A
     /// model label stamps the message AND the chat's last-known model (the
-    /// continuation really was produced by that model); reasoning writes the
-    /// chat's per-chat thoughts block like any other visible answer of the
-    /// owning chat. Empty/pure-ACK continuations are absorbed invisibly,
+    /// continuation really was produced by that model); reasoning APPENDS to
+    /// the chat's per-chat thoughts chain like any other visible answer of
+    /// the owning chat. Empty/pure-ACK continuations are absorbed invisibly,
     /// same as results.
     fn apply_background_message(
         &mut self,
@@ -3073,8 +3076,10 @@ impl App {
             chat.messages.push(message);
             // Per-chat thoughts: a visible answer of the owning chat
             // carrying reasoning is a legitimate writer of its block.
+            // Continuation reasoning is a CHAIN member, not a replacement:
+            // it APPENDS to the trace (see `retain_thoughts`).
             if let Some(t) = thoughts {
-                chat.last_thoughts = Some(t);
+                retain_thoughts(chat, &t);
             }
         }
         if let Some(label) = stamped {
@@ -3339,6 +3344,31 @@ fn drop_live_pending_placeholder(chat: &mut Chat) {
     }
 }
 
+/// Retain one more member of the chat's reasoning chain.
+///
+/// A turn's reasoning arrives as a CHAIN of payloads: the terminal result
+/// frame carries the request's own accumulated trace, and every background
+/// continuation answer (`message` frame) adds its reasoning delta
+/// afterwards. Each payload APPENDS to the retained trace (newline-joined)
+/// instead of replacing it, so the whole chain stays visible above the
+/// latest answer; the renderer's trailing-window cap
+/// (`ui::THOUGHTS_DISPLAY_LINES`) bounds the block. The chain resets where
+/// a new visible request starts in THIS chat (`begin_request` /
+/// `dequeue_next_for`) or on /reset. Whitespace-only payloads never touch
+/// the retained trace: they must neither extend it nor wipe it.
+fn retain_thoughts(chat: &mut Chat, thoughts: &str) {
+    let piece = thoughts.trim();
+    if piece.is_empty() {
+        return;
+    }
+    match &chat.last_thoughts {
+        Some(prev) if !prev.trim().is_empty() => {
+            chat.last_thoughts = Some(format!("{prev}\n{piece}"));
+        }
+        _ => chat.last_thoughts = Some(piece.to_owned()),
+    }
+}
+
 /// Does a numeric [`BackendEvent`] id refer to the tracked protocol request?
 /// The live glue task derives event ids from the protocol UUID
 /// (see [`crate::live::submitted_event_id`]).
@@ -3463,6 +3493,85 @@ mod tests {
         });
         assert_eq!(app.last_turn_usage, Some(sample_usage()));
         assert_eq!(app.chats[0].last_thoughts.as_deref(), Some("thinking..."));
+    }
+    /// A CHAIN of thoughts — the turn's terminal result plus every
+    /// background continuation's reasoning delta — must ACCUMULATE in the
+    /// chat's retained trace (append, never overwrite), so every chain
+    /// member stays visible above the latest answer. Regression for the
+    /// owner report: with plain overwrite only one payload of the chain
+    /// was ever retained.
+    #[test]
+    fn thought_chain_accumulates_across_result_and_continuations() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "do the thing");
+        let thread_id = submitted.thread_id.clone();
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "step one done".into(),
+            thread_id: thread_id.clone(),
+            model: None,
+            usage: None,
+            thoughts: Some("first thought".into()),
+        });
+        assert_eq!(
+            app.chats[0].last_thoughts.as_deref(),
+            Some("first thought"),
+            "the result frame seeds the chain"
+        );
+
+        // Two continuation answers, each carrying its reasoning delta: the
+        // chain must GROW, not replace.
+        for (markdown, thought) in [
+            ("step two done", "second thought"),
+            ("step three done", "third thought"),
+        ] {
+            app.apply_backend_event(BackendEvent::BackgroundMessage {
+                wire_thread_id: crate::live::wire_thread_id(&thread_id),
+                markdown: markdown.into(),
+                model: None,
+                thoughts: Some(thought.into()),
+            });
+        }
+        assert_eq!(
+            app.chats[0].last_thoughts.as_deref(),
+            Some("first thought\nsecond thought\nthird thought"),
+            "every chain member must be retained in arrival order"
+        );
+
+        // The next visible request in THIS chat still resets the chain.
+        let _next = submit_text(&mut app, "again");
+        assert_eq!(
+            app.chats[0].last_thoughts, None,
+            "a new visible request clears the accumulated chain"
+        );
+    }
+
+    /// A whitespace-only thoughts payload must neither extend the retained
+    /// chain nor wipe it: the block the user is reading survives blanks.
+    #[test]
+    fn blank_thoughts_payload_never_wipes_the_chain() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "hello");
+        let thread_id = submitted.thread_id.clone();
+        app.apply_backend_event(BackendEvent::Result {
+            request_id: event_id_of(&submitted.request_id),
+            markdown: "answer".into(),
+            thread_id: thread_id.clone(),
+            model: None,
+            usage: None,
+            thoughts: Some("real reasoning".into()),
+        });
+        app.apply_backend_event(BackendEvent::BackgroundMessage {
+            wire_thread_id: crate::live::wire_thread_id(&thread_id),
+            markdown: "continuation".into(),
+            model: None,
+            thoughts: Some("   \n  ".into()),
+        });
+        assert_eq!(
+            app.chats[0].last_thoughts.as_deref(),
+            Some("real reasoning"),
+            "a blank payload must not destroy the retained chain"
+        );
     }
 
     #[test]

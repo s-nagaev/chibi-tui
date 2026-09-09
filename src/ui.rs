@@ -4182,7 +4182,62 @@ mod tests {
         );
     }
 
-    /// Absent or whitespace-only thoughts render NOTHING: the transcript is
+    /// A CHAIN of thoughts (terminal result + background continuation
+    /// deltas) accumulates in the dim block: driving the REAL event path
+    /// with three payloads, all three thoughts render above the latest
+    /// answer. Regression for the owner report: continuation thoughts used
+    /// to overwrite the block, so only one payload of the chain was ever
+    /// visible.
+    #[test]
+    fn thought_chain_renders_all_members_above_the_latest_answer() {
+        let mut app = App::new(vec![Chat::new("t")]);
+        let thread_id = app.chats[0].id.clone();
+        app.chats[0].messages.push(Message::user("do the thing"));
+        app.chats[0].messages.push(Message::assistant_pending());
+        app.chats[0].lifecycle = ChatLifecycle::Awaiting {
+            request_id: "req-chain".into(),
+        };
+
+        app.apply_backend_event(crate::backend::BackendEvent::Result {
+            request_id: crate::live::wire_thread_id("req-chain") as u64,
+            markdown: "step one".into(),
+            thread_id: thread_id.clone(),
+            model: None,
+            usage: None,
+            thoughts: Some("first thought".into()),
+        });
+        for (markdown, thought) in [
+            ("step two", "second thought"),
+            ("step three", "third thought"),
+        ] {
+            app.apply_backend_event(crate::backend::BackendEvent::BackgroundMessage {
+                wire_thread_id: crate::live::wire_thread_id(&thread_id),
+                markdown: markdown.into(),
+                model: None,
+                thoughts: Some(thought.into()),
+            });
+        }
+
+        let rows = render_grid(&mut app);
+        let flat = rows.join("\n");
+        for thought in ["first thought", "second thought", "third thought"] {
+            assert!(flat.contains(thought), "chain member missing: {thought}");
+        }
+        let last_answer_row = rows
+            .iter()
+            .position(|r| r.contains("step three"))
+            .expect("latest answer renders");
+        let first_thought_row = rows
+            .iter()
+            .position(|r| r.contains("first thought"))
+            .expect("first chain member renders");
+        assert!(
+            first_thought_row < last_answer_row,
+            "the accumulated chain must sit ABOVE the latest answer"
+        );
+    }
+
+    /// Absent or whitespace-only thoughts render NOTHING: the transcript is    /// Absent or whitespace-only thoughts render NOTHING: the transcript is
     /// byte-identical to the no-thoughts baseline (zero layout impact), and
     /// toggle OFF reproduces that baseline even with thoughts retained. The
     /// STATUS line is excluded from the comparison: the `^S on/off` state

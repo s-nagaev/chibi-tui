@@ -774,8 +774,9 @@ async fn background_message_frame_renders_continuation_answer() {
     app.apply_backend_event(bg);
 
     // A NEW assistant bubble (the parent answer stays untouched), the
-    // per-chat thoughts block replaced by the continuation's reasoning, the
-    // model label stamped, and NO lifecycle or sticky-usage side effects.
+    // per-chat thoughts chain EXTENDED by the continuation's reasoning
+    // (append, never overwrite), the model label stamped, and NO lifecycle
+    // or sticky-usage side effects.
     assert_eq!(
         app.chats[0].messages.len(),
         messages_before + 1,
@@ -787,8 +788,23 @@ async fn background_message_frame_renders_continuation_answer() {
     );
     assert_eq!(
         app.chats[0].last_thoughts.as_deref(),
-        Some(thoughts.as_str()),
-        "continuation reasoning writes the owning chat's thoughts block"
+        Some(
+            format!(
+                "{}\n{}",
+                events
+                    .iter()
+                    .find_map(|e| match e {
+                        BackendEvent::Result {
+                            thoughts: Some(t), ..
+                        } => Some(t.clone()),
+                        _ => None,
+                    })
+                    .expect("parent turn carries thoughts"),
+                thoughts
+            )
+            .as_str()
+        ),
+        "continuation reasoning APPENDS to the owning chat's thoughts chain"
     );
     assert_eq!(app.chats[0].last_model.as_deref(), Some("gpt-example"));
     assert_eq!(
