@@ -4237,7 +4237,7 @@ mod tests {
         );
     }
 
-    /// Absent or whitespace-only thoughts render NOTHING: the transcript is    /// Absent or whitespace-only thoughts render NOTHING: the transcript is
+    /// Absent or whitespace-only thoughts render NOTHING: the transcript is
     /// byte-identical to the no-thoughts baseline (zero layout impact), and
     /// toggle OFF reproduces that baseline even with thoughts retained. The
     /// STATUS line is excluded from the comparison: the `^S on/off` state
