@@ -355,22 +355,42 @@ fn flush_code_block(out: &mut Vec<MdLine>, body: &str, lang: &str, theme: &Theme
         let mut row_spans: Vec<Span<'static>> = vec![Span::styled("\u{2502}", border_style)];
         row_spans.push(Span::styled("  ", panel_bg));
         let mut used = 2usize;
-        for (style, chunk) in regions {
+        'tokens: for (style, chunk) in regions {
             let trimmed = chunk.trim_end_matches(['\n', '\r']);
             if trimmed.is_empty() {
                 continue;
             }
-            let w = UnicodeWidthStr::width(trimmed);
-            if used + w > inner_width {
-                break; // line too long: clip here, keep the right border intact
+            // Room left between the left gutter and the right border.
+            let room = inner_width.saturating_sub(used);
+            if room == 0 {
+                break;
             }
-            used += w;
+            // Clip the chunk to the remaining room (display columns): an
+            // oversized token must still paint its fitting PREFIX. Dropping
+            // the whole chunk used to leave the row visually blank inside
+            // the frame (badge + borders present, zero code text).
+            let mut take = 0usize;
+            let mut taken_w = 0usize;
+            for (byte_i, ch) in trimmed.char_indices() {
+                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if taken_w + cw > room {
+                    break;
+                }
+                taken_w += cw;
+                take = byte_i + ch.len_utf8();
+            }
+            if take == 0 {
+                break;
+            }
+            used += taken_w;
             row_spans.push(Span::styled(
-                trimmed.to_string(),
+                trimmed[..take].to_string(),
                 panel_bg.fg(ratatui_color(style.foreground)),
             ));
+            if used >= inner_width {
+                break 'tokens;
+            }
         }
-        // Right padding seals the line to exactly `width` cells,
         // mirroring the 2-column left gutter.
         if inner_width > used {
             row_spans.push(Span::styled(" ".repeat(inner_width - used), panel_bg));

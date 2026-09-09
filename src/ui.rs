@@ -2951,6 +2951,47 @@ mod tests {
         rows.iter().any(|r| r.contains(needle))
     }
 
+    /// Regression (code_block_empty_render_bug): a fenced block containing a
+    /// line WIDER than the panel's clamped interior (~70 cols) must CLIP the
+    /// line to the interior, not drop it whole. The old token loop `break`-ed
+    /// on the first chunk that did not fit, so an over-long line rendered as
+    /// a fully BLANK interior row inside the frame (language badge and
+    /// borders present, zero code text) — exactly the user-reported empty
+    /// tsx box.
+    #[test]
+    fn code_block_long_line_clips_into_panel_not_blank_row() {
+        let mut app = App::new(vec![Chat::new("code")]);
+        let long_line =
+            "<Item label=\"Alpha sector lightweight visible panel trim kit\" value={42} />";
+        assert!(long_line.chars().count() > 70);
+        let md = format!("```tsx\nconst a = 1;\nconst b = 2;\n{long_line}\n```\n");
+        app.chats[0].messages.push(Message::assistant(md));
+
+        let (rows, _) = render_grid_with_buffer(&mut app);
+
+        // Short body lines must be fully visible inside the panel.
+        assert!(
+            grid_contains(&rows, "const a = 1;"),
+            "short code line missing: {:?}",
+            rows.iter()
+                .filter(|r| r.contains('\u{2502}'))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            grid_contains(&rows, "const b = 2;"),
+            "short code line missing: {:?}",
+            rows.iter()
+                .filter(|r| r.contains('\u{2502}'))
+                .collect::<Vec<_>>()
+        );
+        // The over-long line must show its CLIPPED PREFIX, never a blank row.
+        let prefix = &long_line[..24];
+        assert!(
+            grid_contains(&rows, prefix),
+            "over-long code line rendered as a blank interior row (prefix {prefix:?} absent)"
+        );
+    }
+
     /// THE regression: with several exchanges plus a long wrapped final
     /// reply, follow-bottom must show the END of the last reply above the
     /// input band. The old logical-line total clipped it away.
