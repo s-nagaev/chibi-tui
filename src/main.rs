@@ -176,6 +176,7 @@ async fn main() -> io::Result<()> {
     // connection (a reconnect spawns its own pump in `connect_live`).
     if let Source::Live(live) = &source {
         live.pump_background_messages(event_tx.clone());
+        live.pump_cwd_updates(event_tx.clone());
     }
 
     let res = run_loop(
@@ -246,7 +247,8 @@ async fn connect_live(
             app.dismiss_error();
             // Session-scoped continuation answers ride the new connection's
             // own pump; the old pump retired with its closed channel.
-            live.pump_background_messages(event_tx);
+            live.pump_background_messages(event_tx.clone());
+            live.pump_cwd_updates(event_tx);
             *source = Source::Live(live);
         }
         Err(e) => {

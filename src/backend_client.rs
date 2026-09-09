@@ -263,6 +263,7 @@ impl BackendClient {
                 thoughts: true,
                 subagents: true,
                 background_messages: true,
+                cwd_updates: true,
             }),
         };
         let line = serde_json::to_string(&initialize)

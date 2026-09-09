@@ -105,6 +105,11 @@ pub struct ClientCapabilities {
     /// backend produces after a background tool result arrives (the parent
     /// request's lifecycle is already over, so there is no request id).
     pub background_messages: bool,
+    /// Opts in to `cwd_update` frames: the backend reports the effective
+    /// working directory of the agent state per thread (including runtime
+    /// changes made by the `set_working_dir` tool). Old backends ignore the
+    /// unknown flag, so the field is safe to always send.
+    pub cwd_updates: bool,
 }
 
 /// Kind of a mid-turn `agent_event` frame: a subagent spawn began or ended
@@ -182,6 +187,12 @@ pub enum ClientMessage {
         #[serde(default)]
         language_id: Option<String>,
     },
+    /// Lightweight catch-up: ask the backend to re-emit the effective
+    /// working directory of a thread as a `cwd_update` frame (opt-in via
+    /// `capabilities.cwd_updates`; the backend answers `unknown_message`
+    /// otherwise, which the reader tolerates). Lets a client resync without
+    /// the backend tracking re-emission state.
+    GetCwd { thread_id: i64 },
     /// Cancel one in-flight request, targeted by id.
     Cancel { request_id: String },
     /// Graceful termination.
@@ -277,6 +288,13 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thoughts: Option<String>,
     },
+    /// Effective working directory of the agent state for a thread (opt-in
+    /// via `capabilities.cwd_updates` at handshake). NON-terminal,
+    /// thread-scoped, pure frontend-state update: like `status`/`agent_event`
+    /// it must never affect a request lifecycle. `cwd` is the value the
+    /// backend's `get_effective_working_dir` chain resolves to (thread
+    /// override → user default → application default, expanduser-normalized).
+    CwdUpdate { thread_id: i64, cwd: String },
     /// Failure for a request or a global failure (`request_id: null`).
     Error {
         /// `None` serializes as explicit `request_id: null` (global error),
@@ -478,7 +496,8 @@ mod tests {
 
     /// Handshake: the client's initialize frame carries
     /// `capabilities: {"thoughts": true, "subagents": true,
-    /// "background_messages": true}` on the wire, protocol_version 1.
+    /// "background_messages": true, "cwd_updates": true}` on the wire,
+    /// protocol_version 1.
     #[test]
     fn initialize_serializes_client_capabilities() {
         let msg = ClientMessage::Initialize {
@@ -491,6 +510,7 @@ mod tests {
                 thoughts: true,
                 subagents: true,
                 background_messages: true,
+                cwd_updates: true,
             }),
         };
         let line = serde_json::to_string(&msg).expect("initialize serializes");
@@ -499,6 +519,7 @@ mod tests {
         assert_eq!(value["capabilities"]["thoughts"], true);
         assert_eq!(value["capabilities"]["subagents"], true);
         assert_eq!(value["capabilities"]["background_messages"], true);
+        assert_eq!(value["capabilities"]["cwd_updates"], true);
 
         // Deserializing it back keeps the capabilities (round-trip sanity).
         match serde_json::from_str::<ClientMessage>(&line).expect("round-trips") {
@@ -509,6 +530,7 @@ mod tests {
                         thoughts: true,
                         subagents: true,
                         background_messages: true,
+                        cwd_updates: true,
                     })
                 );
             }
@@ -726,6 +748,40 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("scout"));
             }
             other => panic!("expected AgentEvent, got {other:?}"),
+        }
+    }
+
+    /// The `cwd_update` frame parses exactly (thread-scoped, non-terminal)
+    /// and round-trips with `cwd_update` as the type tag.
+    #[test]
+    fn cwd_update_frame_parses_and_round_trips() {
+        let frame = r#"{"type":"cwd_update","thread_id":42,"cwd":"/Users/dev/chibi"}"#;
+        let msg: ServerMessage = serde_json::from_str(frame).expect("cwd_update parses");
+        assert_eq!(
+            msg,
+            ServerMessage::CwdUpdate {
+                thread_id: 42,
+                cwd: "/Users/dev/chibi".into(),
+            }
+        );
+        let line = serde_json::to_string(&msg).expect("serializes");
+        assert_eq!(
+            line,
+            r#"{"type":"cwd_update","thread_id":42,"cwd":"/Users/dev/chibi"}"#
+        );
+    }
+
+    /// The `get_cwd` catch-up frame serializes the exact wire shape and
+    /// round-trips; unknown extra fields are tolerated on parse.
+    #[test]
+    fn get_cwd_frame_serializes_and_parses() {
+        let msg = ClientMessage::GetCwd { thread_id: 42 };
+        let line = serde_json::to_string(&msg).expect("get_cwd serializes");
+        assert_eq!(line, r#"{"type":"get_cwd","thread_id":42}"#);
+        let with_extra = r#"{"type":"get_cwd","thread_id":7,"future_field":1}"#;
+        match serde_json::from_str::<ClientMessage>(with_extra).expect("parses") {
+            ClientMessage::GetCwd { thread_id } => assert_eq!(thread_id, 7),
+            other => panic!("expected GetCwd, got {other:?}"),
         }
     }
 }

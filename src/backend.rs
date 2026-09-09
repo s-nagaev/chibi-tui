@@ -68,6 +68,12 @@ pub enum BackendEvent {
         model: Option<String>,
         thoughts: Option<String>,
     },
+    /// Effective working directory of the agent state for a thread (opt-in
+    /// via `capabilities.cwd_updates`): a `cwd_update` frame forwarded by
+    /// the pump. Carries the WIRE thread id (i64 hash) — the consumer maps
+    /// it to the owning chat. NON-terminal by construction: it must never
+    /// resolve any request lifecycle, spinner or queue state.
+    CwdUpdate { wire_thread_id: i64, cwd: String },
     /// The event source itself reported the transport link down (no
     /// particular request to blame). Flips the connection indicator; never
     /// opens the popup by itself.

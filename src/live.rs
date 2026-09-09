@@ -129,6 +129,36 @@ impl LiveBackend {
             }
         });
     }
+
+    /// Forward effective-working-directory updates into the shared UI event
+    /// channel for the lifetime of this connection.
+    ///
+    /// `cwd_update` frames are thread-scoped (no request id), so they cannot
+    /// ride the per-request glue tasks: an update may arrive while NO
+    /// request is in flight. The spawned pump subscribes once and
+    /// translates every broadcast update into a
+    /// [`BackendEvent::CwdUpdate`]; it retires itself when the channel
+    /// closes (backend dropped / replaced by a reconnect pump).
+    pub fn pump_cwd_updates(&self, tx: mpsc::Sender<BackendEvent>) {
+        let mut rx = self.pipeline.subscribe_cwd_updates();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(update) => {
+                        let event = BackendEvent::CwdUpdate {
+                            wire_thread_id: update.thread_id,
+                            cwd: update.cwd,
+                        };
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
 }
 
 impl Backend for LiveBackend {
@@ -829,6 +859,7 @@ mod tests {
                 | BackendEvent::QueueDrain { .. } => continue,
                 BackendEvent::Result { .. } => panic!("cancelled request must not yield Result"),
                 BackendEvent::BackgroundMessage { .. } => continue,
+                BackendEvent::CwdUpdate { .. } => continue,
                 BackendEvent::Disconnected => continue,
             }
         }

@@ -652,6 +652,13 @@ pub struct App {
     /// today it is CLI-only and never changes. `None` renders as the `—`
     /// placeholder.
     pub workspace_root: Option<String>,
+    /// Live effective working directories reported by the backend's
+    /// `cwd_update` frames (opt-in via `capabilities.cwd_updates`), keyed by
+    /// the WIRE thread id. The status strip reads the ACTIVE thread's entry
+    /// (falling back to [`App::workspace_root`] when the thread has no
+    /// report yet), so the cwd readout follows the agent state instead of
+    /// the launch directory.
+    pub thread_cwds: HashMap<i64, String>,
     /// hidden exchange bundle staged by the key
     /// handlers (`^M` open, Enter selection) for the event loop to hand to
     /// the backend source via the SAME `send_submitted` path as any prompt.
@@ -854,6 +861,7 @@ impl App {
             log_seen_total: 0,
             status_strip_visible: false,
             workspace_root: None,
+            thread_cwds: HashMap::new(),
             picker_submission: None,
             hidden_requests: HashMap::new(),
             hidden_queue: VecDeque::new(),
@@ -959,10 +967,12 @@ impl App {
     }
 
     /// the strip's cwd segment, the LAST THREE components
-    /// of the workspace root ([`App::workspace_root`], wired from the CLI at
-    /// startup; the TUI knows the root from the request frames / CLI and
-    /// today it never changes at runtime, but the value is read reactively
-    /// here so a future runtime change shows up on the next frame), joined
+    /// of the thread's effective working directory: the live value the
+    /// backend reported for the ACTIVE thread via `cwd_update` frames
+    /// ([`App::thread_cwds`], opt-in `capabilities.cwd_updates`) when one
+    /// exists, falling back to the CLI workspace root
+    /// ([`App::workspace_root`], wired at startup; the backend never spoke
+    /// about that thread yet), joined
     /// with `/` and prefixed with a leading `/`: the path-tail format
     /// `/Develop/personal/chibi-tui` instead of the bare `chibi-tui`, so
     /// sibling workspaces tell themselves apart at a glance. Paths with
@@ -972,7 +982,12 @@ impl App {
     /// non-UTF-8 component. `None` (only before startup wiring) yields
     /// `None` and the renderer shows the `—` placeholder.
     pub fn status_cwd(&self) -> Option<String> {
-        let root = self.workspace_root.as_deref()?;
+        let live = self
+            .active_thread_id()
+            .and_then(|tid| self.thread_cwds.get(&crate::live::wire_thread_id(tid)))
+            .cloned();
+        let root = live.or_else(|| self.workspace_root.clone())?;
+        let root = root.as_str();
         let path = std::path::Path::new(root);
         if !path.is_absolute() {
             return Some(root.to_string());
@@ -2553,8 +2568,8 @@ impl App {
             }
             // Not control-related (or no lifecycle frame at all).
             BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => false,
-            // Unreachable: handled by the early return in apply_backend_event.
-            BackendEvent::BackgroundMessage { .. } => false,
+            // Unreachable: handled by the early returns in apply_backend_event.
+            BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => false,
         }
     }
 
@@ -2721,8 +2736,8 @@ impl App {
             }
             // Not clone-related (or no lifecycle frame at all).
             BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => false,
-            // Unreachable: handled by the early return in apply_backend_event.
-            BackendEvent::BackgroundMessage { .. } => false,
+            // Unreachable: handled by the early returns in apply_backend_event.
+            BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => false,
         }
     }
 
@@ -2830,6 +2845,18 @@ impl App {
             return;
         }
 
+        // Effective-cwd update: session-scoped, keyed by the wire thread
+        // id, never by a request. It must not pass through the
+        // request-lifecycle routing below (it carries no request id at all).
+        if let BackendEvent::CwdUpdate {
+            wire_thread_id,
+            cwd,
+        } = event
+        {
+            self.apply_cwd_update(wire_thread_id, cwd);
+            return;
+        }
+
         // Route to the owning chat by thread id (empty → active chat).
         let route_thread_id: Option<String> = match &event {
             BackendEvent::Queued { thread_id, .. } => Some(thread_id.clone()),
@@ -2839,8 +2866,8 @@ impl App {
             BackendEvent::Error { thread_id, .. } => thread_id.clone(),
             // Internal pump signal: handled by the event loop, never here.
             BackendEvent::QueueDrain { .. } => return,
-            // Unreachable: handled by the early return above.
-            BackendEvent::BackgroundMessage { .. } => return,
+            // Unreachable: handled by the early returns above.
+            BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => return,
             BackendEvent::Disconnected => None,
         };
         let target = match route_thread_id {
@@ -3027,9 +3054,22 @@ impl App {
             BackendEvent::AgentProgress { .. }
             | BackendEvent::QueueDrain { .. }
             | BackendEvent::Disconnected => {}
-            // Unreachable: handled by the early return above.
-            BackendEvent::BackgroundMessage { .. } => {}
+            // Unreachable: handled by the early returns above.
+            BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => {}
         }
+    }
+
+    /// Apply an effective-working-directory update (`cwd_update` frame) to
+    /// the per-thread live-cwd map.
+    ///
+    /// The update is a NEW value for the thread's agent cwd: it never
+    /// touches any chat transcript, lifecycle or sticky state — it only
+    /// refreshes the readout the status strip shows for the owning thread
+    /// (see [`App::status_cwd`]). Unknown thread ids are still recorded:
+    /// the frame is authoritative backend state, and the thread may become
+    /// active later in the session.
+    fn apply_cwd_update(&mut self, wire_thread_id: i64, cwd: String) {
+        self.thread_cwds.insert(wire_thread_id, cwd);
     }
 
     /// Apply an out-of-band continuation answer (`message` frame) to the
@@ -4860,6 +4900,54 @@ mod tests {
 
         app.workspace_root = Some(".".into());
         assert_eq!(app.status_cwd().as_deref(), Some("."));
+    }
+
+    /// The cwd segment prefers the LIVE effective cwd the backend reported
+    /// for the ACTIVE thread via `cwd_update` frames, falls back to the CLI
+    /// workspace root when the thread has no report yet, and follows the
+    /// thread when the active chat switches.
+    #[test]
+    fn status_cwd_prefers_live_thread_cwd() {
+        let mut app = app_with_chats(2);
+        app.workspace_root = Some("/Users/sergio/Develop/personal/chibi-tui".into());
+        let active_wire = crate::live::wire_thread_id(app.active_thread_id().unwrap());
+
+        // A report for an unrelated thread must not move the readout.
+        app.apply_backend_event(BackendEvent::CwdUpdate {
+            wire_thread_id: active_wire.wrapping_add(99),
+            cwd: "/elsewhere".into(),
+        });
+        assert_eq!(
+            app.status_cwd().as_deref(),
+            Some("/Develop/personal/chibi-tui"),
+            "no report for the active thread yet → workspace fallback"
+        );
+
+        // The active thread's live report wins over the workspace root.
+        app.apply_backend_event(BackendEvent::CwdUpdate {
+            wire_thread_id: active_wire,
+            cwd: "/Users/sergio/Develop/personal/chibi".into(),
+        });
+        assert_eq!(
+            app.status_cwd().as_deref(),
+            Some("/Develop/personal/chibi"),
+            "live thread cwd takes precedence"
+        );
+
+        // Switching to a chat with no report falls back, and its own report
+        // takes over once it arrives.
+        app.select_chat(1);
+        assert_eq!(
+            app.status_cwd().as_deref(),
+            Some("/Develop/personal/chibi-tui"),
+            "the entered thread has no report → workspace fallback"
+        );
+        let other_wire = crate::live::wire_thread_id(app.active_thread_id().unwrap());
+        app.apply_backend_event(BackendEvent::CwdUpdate {
+            wire_thread_id: other_wire,
+            cwd: "/Users/sergio/other".into(),
+        });
+        assert_eq!(app.status_cwd().as_deref(), Some("/Users/sergio/other"));
     }
 
     /// Model segment: `None` until a labelled result resolves, then the

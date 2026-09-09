@@ -39,7 +39,9 @@ pub use crate::protocol::{
 pub use crate::backend_client::{BackendClient, BackendError};
 
 // Public re-exports: request correlation surface of the real client.
-pub use crate::request_pipeline::{AgentEventUpdate, RequestArgs, RequestPipeline, StatusUpdate};
+pub use crate::request_pipeline::{
+    AgentEventUpdate, CwdUpdateUpdate, RequestArgs, RequestPipeline, StatusUpdate,
+};
 
 // Public re-exports: application-state surface bridging backend → UI.
 pub use crate::app::{App, Chat, Connection, Submitted};
