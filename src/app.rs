@@ -639,7 +639,7 @@ pub struct App {
     /// total is race-free by construction — no counter resets to coordinate.
     pub log_seen_total: u64,
     /// visibility of the one-row status strip (workspace
-    /// cwd · active chat's model), toggled with ^O. Default HIDDEN. Pure
+    /// cwd · active chat's model), toggled with ^O. Default VISIBLE. Pure
     /// VIEW state like [`Focus`] — deliberately NOT a [`Mode`]: it never
     /// captures keys and survives every modal open/close untouched.
     pub status_strip_visible: bool,
@@ -859,7 +859,7 @@ impl App {
             picker_visible_rows: 20,
             help_visible_rows: 20,
             log_seen_total: 0,
-            status_strip_visible: false,
+            status_strip_visible: true,
             workspace_root: None,
             thread_cwds: HashMap::new(),
             picker_submission: None,
@@ -4816,18 +4816,18 @@ mod tests {
 
     // strip state + segments --------------------------
 
-    /// Default hidden; ^O flips visibility round-trip.
+    /// Default visible; ^O flips visibility round-trip.
     #[test]
-    fn status_strip_starts_hidden_and_toggles_round_trip() {
+    fn status_strip_starts_visible_and_toggles_round_trip() {
         let mut app = app_with_chats(1);
         assert!(
-            !app.status_strip_visible,
-            "strip must start hidden (task contract)"
+            app.status_strip_visible,
+            "strip must start visible (task contract)"
         );
         app.toggle_status_strip();
-        assert!(app.status_strip_visible);
-        app.toggle_status_strip();
         assert!(!app.status_strip_visible);
+        app.toggle_status_strip();
+        assert!(app.status_strip_visible);
     }
 
     /// View state like Focus: opening and closing every modal family must
@@ -4835,7 +4835,6 @@ mod tests {
     #[test]
     fn status_strip_visibility_survives_modal_open_close() {
         let mut app = app_with_chats(1);
-        app.toggle_status_strip();
 
         app.begin_search();
         assert!(matches!(app.mode, Mode::Searching { .. }));

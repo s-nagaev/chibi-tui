@@ -227,7 +227,6 @@ async fn usage_ctx_segment_renders_in_status_strip() {
     let mut app = app_with_one_chat();
     let submitted = submitted_for(&app, "count tokens");
     submit_and_fold(&live, &mut app, submitted).await;
-    app.toggle_status_strip();
 
     let rows = render_grid(&mut app);
     assert!(
@@ -241,7 +240,6 @@ async fn usage_ctx_segment_renders_in_status_strip() {
     let mut app = app_with_one_chat();
     let submitted = submitted_for(&app, "count tokens again");
     submit_and_fold(&live, &mut app, submitted).await;
-    app.toggle_status_strip();
 
     let rows = render_grid(&mut app);
     assert!(

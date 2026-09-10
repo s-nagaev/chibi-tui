@@ -1249,8 +1249,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         }
         // Ctrl+O: TOGGLE THE STATUS STRIP, the dim
         // one-row `cwd: <workspace> · <model>` readout on the chat pane's
-        // top border. Hidden by default; pure view state (like ^T's Focus),
-        // modals swallow the chord like every other one.
+        // top border. Visible by default; pure view state (like ^T's
+        // Focus), modals swallow the chord like every other one.
         //
         // Chord verification (feat task discipline, see the executor report
         // for the full audit): ^G was already taken by the log viewer, so
@@ -3999,18 +3999,18 @@ mod tests {
 
     // ^O toggle ---------------------------------------
 
-    /// ^O toggles the status strip, default hidden, round-trip.
+    /// ^O toggles the status strip, default visible, round-trip.
     #[test]
     fn ctrl_o_toggles_status_strip_round_trip() {
         let mut app = app_with_chats(1);
         assert!(
-            !app.status_strip_visible,
-            "strip must start hidden (task contract)"
+            app.status_strip_visible,
+            "strip must start visible (task contract)"
         );
         press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert!(app.status_strip_visible);
-        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
         assert!(!app.status_strip_visible);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.status_strip_visible);
     }
 
     /// View state like Focus: the strip survives modal open/close, and the
@@ -4018,7 +4018,6 @@ mod tests {
     #[test]
     fn ctrl_o_survives_modals_and_is_swallowed_while_one_is_open() {
         let mut app = app_with_chats(1);
-        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
         assert!(app.status_strip_visible);
 
         // Open the search popup: strip stays visible underneath it.
@@ -4048,9 +4047,9 @@ mod tests {
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
         press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert!(app.status_strip_visible);
-        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
         assert!(!app.status_strip_visible);
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.status_strip_visible);
     }
 
     // ^S toggle -----------------------------------------
@@ -4206,7 +4205,10 @@ mod tests {
         ));
         assert_eq!(app.chats.len(), 1, "no new chat from swallowed ^N");
         assert!(app.error_popup.is_none());
-        assert!(!app.status_strip_visible);
+        assert!(
+            app.status_strip_visible,
+            "swallowed ^O must not toggle the strip"
+        );
         assert_eq!(
             app.input.lines().join(""),
             "precious draft",

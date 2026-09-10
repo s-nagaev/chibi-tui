@@ -6095,20 +6095,20 @@ mod tests {
 
     // cwd + model strip -------------------------------
 
-    /// Default contract: the strip is HIDDEN — the chat header border
-    /// carries no `cwd:` readout until ^O toggles it on.
+    /// Default contract: the strip is VISIBLE — the chat header border
+    /// carries the `cwd:` readout on startup; ^O toggles it off.
     #[test]
-    fn status_strip_is_hidden_by_default() {
+    fn status_strip_is_visible_by_default() {
         let mut app = App::new(mock::initial_chats());
         let rows = render_grid(&mut app);
         assert!(
-            !rows[0].contains("cwd:"),
-            "strip must be hidden by default: {:?}",
+            rows[0].contains("cwd:"),
+            "strip must be visible by default: {:?}",
             rows[0]
         );
     }
 
-    /// Toggled on: the readout rides the SAME top-border row as the chat
+    /// Visible by default: the readout rides the SAME top-border row as the chat
     /// header title — right-aligned into the pane's last columns and
     /// dim-styled (theme-driven). Mock chats carry no model labels and the
     /// workspace root is unwired here, so both segments show `—`.
@@ -6116,16 +6116,19 @@ mod tests {
     fn status_strip_renders_right_aligned_and_dim_on_the_header_border() {
         let mut app = App::new(mock::initial_chats());
         let theme = Theme::tokyo_night();
-        // Zero vertical cost: render with the strip hidden, then visible —
-        // ONLY the header border row (row 0) may change; every other row is
-        // untouched, proving the strip never steals a content row.
+        // Zero vertical cost: render with the strip visible (the default),
+        // then toggle it off — ONLY the header border row (row 0) may
+        // change; every other row is untouched, proving the strip never
+        // steals a content row.
         let (before, _) = render_grid_with_buffer(&mut app);
         app.toggle_status_strip();
-        let (rows, buf) = render_grid_with_buffer(&mut app);
+        let (rows, _) = render_grid_with_buffer(&mut app);
         for (y, (b, a)) in before.iter().zip(rows.iter()).enumerate().skip(1) {
             assert_eq!(b, a, "row {y} must be untouched by the strip");
         }
 
+        app.toggle_status_strip();
+        let (rows, buf) = render_grid_with_buffer(&mut app);
         let header = &rows[0];
         let text = "cwd: \u{2014} \u{00b7} \u{2014}";
         assert!(header.contains(text), "strip text missing: {header:?}");
@@ -6153,7 +6156,6 @@ mod tests {
         app.chats[0]
             .messages
             .push(Message::assistant_with_model("labelled answer", "glm-5.2"));
-        app.toggle_status_strip();
 
         let rows = render_grid(&mut app);
         assert!(
@@ -6186,7 +6188,6 @@ mod tests {
             output_tokens: 512,
             context_window: Some(131_072),
         });
-        app.toggle_status_strip();
 
         // A command answer arrives: model-less message, no new usage.
         app.chats[0].messages.push(Message::assistant("done"));
@@ -6211,7 +6212,6 @@ mod tests {
     fn status_strip_truncates_long_paths_with_ellipsis() {
         let mut app = App::new(mock::initial_chats());
         app.workspace_root = Some(format!("/tmp/{}", "w".repeat(120)));
-        app.toggle_status_strip();
 
         let rows = render_grid(&mut app);
         let header = &rows[0];
@@ -6240,7 +6240,6 @@ mod tests {
     fn status_strip_shows_the_cwd_path_tail() {
         let mut app = App::new(mock::initial_chats());
         app.workspace_root = Some("/Users/sergio/Develop/personal/chibi-tui".into());
-        app.toggle_status_strip();
 
         let rows = render_grid(&mut app);
         assert!(
@@ -6258,7 +6257,6 @@ mod tests {
     fn status_strip_left_truncates_the_cwd_tail_but_keeps_the_directory() {
         let mut app = App::new(mock::initial_chats());
         app.workspace_root = Some(format!("/Users/sergio/{}/personal/chibi", "d".repeat(100)));
-        app.toggle_status_strip();
 
         let rows = render_grid(&mut app);
         let header = &rows[0];
@@ -6311,7 +6309,6 @@ mod tests {
             output_tokens: 512,
             context_window: Some(131_072),
         });
-        app.toggle_status_strip();
 
         let rows = render_grid(&mut app);
         assert!(
@@ -6331,7 +6328,6 @@ mod tests {
             output_tokens: 512,
             context_window: None,
         });
-        app.toggle_status_strip();
 
         let rows = render_grid(&mut app);
         assert!(
@@ -6362,7 +6358,6 @@ mod tests {
     #[test]
     fn status_strip_omits_the_usage_segment_without_usage() {
         let mut app = App::new(mock::initial_chats());
-        app.toggle_status_strip();
 
         let rows = render_grid(&mut app);
         assert!(
@@ -6383,7 +6378,6 @@ mod tests {
     #[test]
     fn strip_with_usage_differs_from_without_only_by_the_segment() {
         let mut app = App::new(mock::initial_chats());
-        app.toggle_status_strip();
         let (rows, _) = render_grid_with_buffer(&mut app);
         let without = &rows[0][rows[0].find("cwd:").unwrap()..];
 
@@ -6401,8 +6395,8 @@ mod tests {
         );
     }
 
-    /// Ctrl+O parity: the segment rides INSIDE the existing strip — hidden
-    /// by default even when usage is known, shown only after the toggle.
+    /// Ctrl+O parity: the segment rides INSIDE the existing strip — shown
+    /// by default together with the strip, hidden once ^O turns it off.
     #[test]
     fn usage_segment_inherits_ctrl_o_visibility() {
         let mut app = App::new(mock::initial_chats());
@@ -6414,16 +6408,16 @@ mod tests {
 
         let rows = render_grid(&mut app);
         assert!(
-            !rows[0].contains("ctx"),
-            "usage must stay hidden with the strip: {:?}",
+            rows[0].contains("ctx"),
+            "usage rides the visible strip by default: {:?}",
             rows[0]
         );
 
         app.toggle_status_strip();
         let rows = render_grid(&mut app);
         assert!(
-            rows[0].contains("ctx"),
-            "usage must appear once the strip is toggled on: {:?}",
+            !rows[0].contains("ctx"),
+            "usage must hide together with the strip: {:?}",
             rows[0]
         );
     }
@@ -6448,7 +6442,6 @@ mod tests {
     #[test]
     fn status_strip_skips_when_the_chat_pane_cannot_host_it() {
         let mut app = App::new(mock::initial_chats());
-        app.toggle_status_strip();
         let (rows, _) = render_grid_at_with_buffer(&mut app, 40, 20);
         assert!(
             !rows[0].contains("cwd:"),
