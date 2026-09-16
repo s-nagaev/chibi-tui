@@ -379,7 +379,7 @@ pub enum Mode {
     /// selection by one viewport of visible rows, Enter selects,
     /// Esc closes, everything else is swallowed. The listing arrives through
     /// the NORMAL request pipeline as a hidden exchange — see
-    /// [`HiddenPurpose`] and [`App::begin_model_picker`].
+    /// `HiddenPurpose` and [`App::begin_model_picker`].
     ModelPicking { state: ModelPickerState },
     /// The F1 keybindings help modal is open.
     /// Modal isolation like the popup family: ↑/↓ (and PgUp/PgDn) scroll the
@@ -397,7 +397,7 @@ impl Mode {
         matches!(self, Mode::Normal)
     }
 }
-/// which pane owns the keyboard. NOT an [`AppMode`] —
+/// which pane owns the keyboard. NOT a [`Mode`] —
 /// the rename/delete/search modals remain [`Mode`]s layered above focus:
 /// opening one never changes focus, and closing one always resets it to
 /// [`Focus::Chat`] so the editor regains typing immediately.
@@ -440,7 +440,7 @@ pub struct Chat {
     pub queue: VecDeque<String>,
     /// a visible reply (or an inline error)
     /// landed in this chat while it was NOT the selected one. Cleared the
-    /// moment the chat is selected (see [`App::select_chat`]). Session-only:
+    /// moment the chat is selected (see `App::select_chat`). Session-only:
     /// never persisted, a restart starts every thread clean.
     pub unread: bool,
     /// Thread's last known turn usage, carried across restarts: the event
@@ -458,7 +458,7 @@ pub struct Chat {
     /// above the chat's last assistant message. Written ONLY by visible
     /// answers of THIS chat that carry thoughts — the turn's terminal result
     /// and every background continuation APPEND their payload
-    /// ([`Self::retain_thoughts`] via the event handlers; hidden
+    /// (`retain_thoughts` via the event handlers; hidden
     /// model-picker exchanges and fieldless command results never touch it) —
     /// and the chain resets when a new visible request starts in THIS chat
     /// only. The renderer reads the ACTIVE chat's field, so a background
@@ -947,7 +947,7 @@ impl App {
 
     /// Restore seam (remember-last-thread): open the app on a specific
     /// thread id exactly as if the user had picked it — the same selection
-    /// semantics as [`App::select_chat`], whose sticky ctx-segment seeding
+    /// semantics as `App::select_chat`, whose sticky ctx-segment seeding
     /// re-seeds the readout from that thread's snapshot (the readout is
     /// seeded from the initially selected chat, so a restored thread that
     /// is not the first must reseed it; the per-thread panel model is
@@ -1050,14 +1050,14 @@ impl App {
     /// switching chats re-labels from that chat's own message history.
     /// The override map is never written to disk, but startup restore
     /// seeds it from each thread's persisted last-known model (see
-    /// [`App::picker_model_labels`]); per-message labels themselves
+    /// `App::picker_model_labels`); per-message labels themselves
     /// persist with the snapshot, so a restored chat re-labels the strip
     /// from its own newest answer once the override retires.
     /// `None` renders as the `—` placeholder.
     ///
     /// a hidden `/model <n>` switch has no transcript
     /// bubble to derive from, so it stages a session-scoped override (see
-    /// [`App::picker_model_labels`]) that this getter prefers; the chat's
+    /// `App::picker_model_labels`) that this getter prefers; the chat's
     /// next visible labeled reply retires it and message-derived truth
     /// resumes.
     ///
@@ -2645,7 +2645,7 @@ impl App {
     /// or a clone is already in flight.
     ///
     /// The clone chat is minted here with a fresh UUID but NOT listed yet:
-    /// it waits in [`App::pending_clone`] until the backend acks, so a
+    /// it waits in `App::pending_clone` until the backend acks, so a
     /// failed request can never leave an orphan thread in the sidebar. The
     /// staged submission goes out through the event loop (same seam as the
     /// model picker's hidden exchange).
@@ -3454,7 +3454,7 @@ fn retain_thoughts(chat: &mut Chat, thoughts: &str) {
 
 /// Does a numeric [`BackendEvent`] id refer to the tracked protocol request?
 /// The live glue task derives event ids from the protocol UUID
-/// (see [`crate::live::submitted_event_id`]).
+/// (see `crate::live::submitted_event_id`).
 fn event_matches_request(event_id: u64, tracked_request_id: &str) -> bool {
     event_id == crate::live::wire_thread_id(tracked_request_id) as u64
 }

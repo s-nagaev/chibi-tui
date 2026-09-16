@@ -708,7 +708,8 @@ fn render_scroll_hint(f: &mut Frame, at_bottom: bool, theme: &Theme, spinner_lin
 /// marker on its FIRST row. The typed text renders INSIDE the remaining
 /// columns over the full block height — tui-textarea keeps the cursor
 /// visible inside that viewport automatically, scrolling the LAST visible
-/// row toward the caret once the buffer exceeds [`MAX_INPUT_LINES`] lines.
+/// row toward the caret once the buffer exceeds
+/// [`MAX_INPUT_LINES`](crate::app::MAX_INPUT_LINES) lines.
 fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) {
     // Panel tint confined to the CHAT COLUMN (cols 26..width @120): the
     // divider cell and the sidebar strip keep `theme.panel` (approved

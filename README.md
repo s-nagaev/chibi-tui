@@ -1,6 +1,6 @@
 <h1 align="center"><img width=150 src="https://github.com/s-nagaev/chibi/raw/main/docs/logo.png" alt="Chibi Logo"></h1>
 
-# chibi-tui
+# Chibi TUI
 
 <p align="center">
   <a href="https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml"><img src="https://github.com/s-nagaev/chibi-tui/actions/workflows/ci.yml/badge.svg" alt="Build"></a>
@@ -35,7 +35,7 @@ release ships a binary per platform plus a `SHA256SUMS.txt` with the
 checksums of all archives:
 
 | Platform | Archive |
-|---|---|
+| --- | --- |
 | Linux x86_64 | `chibi-tui-<version>-x86_64-unknown-linux-gnu.tar.gz` |
 | macOS Apple Silicon | `chibi-tui-<version>-aarch64-apple-darwin.tar.gz` |
 | macOS Intel | `chibi-tui-<version>-x86_64-apple-darwin.tar.gz` |
@@ -90,7 +90,7 @@ chibi-tui --workspace /path/to/project
 Options:
 
 | Flag | Meaning |
-|---|---|
+| --- | --- |
 | `--workspace <dir>` | Workspace root passed to the backend (default: current dir). |
 | `--mock` | Run fully on mocks — no backend process, no I/O; development/screenshot mode. |
 | `--history-dir <dir>` | Override the chat-history directory. |
@@ -100,7 +100,7 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 ## Keybindings
 
 | Key | Action |
-|---|---|
+| --- | --- |
 | `Ctrl+↑` / `Ctrl+↓` | Switch to the previous / next thread (the chat scroll resets on every switch; on stock macOS use `Alt+↑` / `Alt+↓` instead — see the macOS note below) |
 | `Ctrl+T` | Toggle keyboard focus between the Chat pane (the prompt editor, default) and the Sidebar (the thread list) — while the Sidebar holds focus, `↑`/`↓` move the thread selection with live switching, `Enter`/`Esc` return to the editor with the draft untouched, and `PgUp`/`PgDn` keep scrolling the chat |
 | `↑` / `↓` | Move the text cursor up/down inside the multi-line input (they move the thread selection instead while the Sidebar holds focus) |
