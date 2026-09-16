@@ -49,6 +49,15 @@ pub fn new_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Current unix time in whole seconds; 0 if the clock is before the epoch
+/// (never in practice, but a degraded clock must not panic).
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Default storage root: `<data dir>/chibi-tui`.
 fn default_root() -> Option<PathBuf> {
     dirs::data_dir().map(|p| p.join("chibi-tui"))
@@ -79,6 +88,14 @@ fn resolve_dir(override_dir: Option<&Path>) -> PathBuf {
 struct StoredChat {
     name: String,
     id: String,
+    /// Last-activity timestamp (unix seconds) driving the sidebar's
+    /// newest-first order. Strictly additive optional field:
+    /// `#[serde(default)]` keeps snapshots from before the field parsing
+    /// (a missing key loads as `0`, and the loader then falls back to the
+    /// snapshot file's modification time, so legacy history keeps a sane
+    /// recency order).
+    #[serde(default)]
+    updated_at: u64,
     messages: Vec<Message>,
     /// Thread's last known turn usage, restored into the ctx segment on the
     /// next launch. Strictly additive optional field: `#[serde(default)]`
@@ -100,6 +117,7 @@ impl From<&Chat> for StoredChat {
         Self {
             name: chat.name.clone(),
             id: chat.id.clone(),
+            updated_at: chat.updated_at,
             // Pending placeholders are never persisted as pending: a chat
             // saved mid-request reloads with a resolved (empty) answer row.
             messages: chat
@@ -118,6 +136,7 @@ impl From<StoredChat> for Chat {
         Self {
             name: stored.name,
             id: stored.id,
+            updated_at: stored.updated_at,
             messages: stored.messages,
             // Restored chats always start idle: a snapshot saved mid-request
             // has no live request to resume (see Message::normalized_for_storage).
@@ -174,10 +193,13 @@ pub fn delete_chat_file_in(override_dir: Option<&Path>, chat_id: &str) -> std::i
     }
 }
 
-/// Load every persisted chat, ordered by file name (UUIDs are random, so this
-/// is not recency order — it is merely deterministic). Corrupt or unreadable
-/// files are skipped silently: one bad snapshot must not hide the rest.
-/// Chats without an id get one assigned so they can be re-saved later.
+/// Load every persisted chat, ordered by last activity — `updated_at`
+/// descending, newest first (ties break by thread id, so the order is
+/// deterministic). Snapshots from before the `updated_at` field existed
+/// fall back to the snapshot file's modification time, so legacy history
+/// keeps a sensible recency order. Corrupt or unreadable files are skipped
+/// silently: one bad snapshot must not hide the rest. Chats without an id
+/// get one assigned so they can be re-saved later.
 pub fn load_chats() -> Vec<Chat> {
     load_chats_from(None)
 }
@@ -194,7 +216,7 @@ pub fn load_chats_from(override_dir: Option<&Path>) -> Vec<Chat> {
         .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
         .collect();
     files.sort();
-    files
+    let mut chats: Vec<Chat> = files
         .iter()
         .filter_map(|path| {
             let raw = fs::read_to_string(path).ok()?;
@@ -203,12 +225,36 @@ pub fn load_chats_from(override_dir: Option<&Path>) -> Vec<Chat> {
                     if stored.id.trim().is_empty() {
                         stored.id = new_thread_id();
                     }
-                    Some(Chat::from(stored))
+                    let mut chat = Chat::from(stored);
+                    if chat.updated_at == 0 {
+                        // Legacy snapshot (no `updated_at` key): the file's
+                        // own modification time is the best recency proxy.
+                        chat.updated_at = file_mtime_secs(path);
+                    }
+                    Some(chat)
                 }
                 Err(_) => None,
             }
         })
-        .collect()
+        .collect();
+    // Sidebar order: newest activity first; equal timestamps (and the
+    // all-zero legacy corner) break deterministically by thread id.
+    chats.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    chats
+}
+
+/// Snapshot file's last-modified time as unix seconds; 0 when unreadable.
+fn file_mtime_secs(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// File name of the last-active-thread pointer inside the storage root.
@@ -421,8 +467,8 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec!["id", "messages", "name"],
-            "persisted format carries nothing beyond id/name/messages: {raw}"
+            vec!["id", "messages", "name", "updated_at"],
+            "persisted format carries nothing beyond id/name/messages/updated_at: {raw}"
         );
         assert!(
             !raw.contains("thought"),
@@ -460,8 +506,8 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            vec!["id", "messages", "name"],
-            "a thread with nothing recorded keeps the legacy key set: {raw}"
+            vec!["id", "messages", "name", "updated_at"],
+            "a thread with nothing recorded keeps the additive key set: {raw}"
         );
     }
 
@@ -552,6 +598,96 @@ mod tests {
 
         let fresh_but_empty = temp_root("empty");
         assert!(load_chats_from(Some(&fresh_but_empty)).is_empty());
+    }
+
+    // updated_at ordering (sidebar newest-first) ------------------
+
+    /// The whole point of the ordering contract: loaded chats come back
+    /// newest-first by `updated_at`, and equal timestamps break by thread
+    /// id, so the order is deterministic for tests and stable across runs.
+    #[test]
+    fn load_chats_orders_by_updated_at_desc_with_id_tiebreak() {
+        let root = temp_root("order");
+        let mut old = sample_chat("old");
+        let mut mid_a = sample_chat("mid-a");
+        let mut mid_b = sample_chat("mid-b");
+        let mut fresh = sample_chat("fresh");
+
+        let (a_id, b_id) = (mid_a.id.clone(), mid_b.id.clone());
+        old.updated_at = 100;
+        // Same stamp: the id decides, ascending.
+        mid_a.updated_at = 500;
+        mid_b.updated_at = 500;
+        fresh.updated_at = 900;
+        let chats = vec![old, mid_a, mid_b, fresh];
+        for chat in &chats {
+            save_chat_in(Some(&root), chat).expect("save");
+        }
+
+        let loaded = load_chats_from(Some(&root));
+        let names: Vec<_> = loaded.iter().map(|c| c.name.as_str()).collect();
+        let expected_mid_order: Vec<&str> = if a_id < b_id {
+            vec!["mid-a", "mid-b"]
+        } else {
+            vec!["mid-b", "mid-a"]
+        };
+        let mut expected = vec!["fresh"];
+        expected.extend(expected_mid_order);
+        expected.push("old");
+        assert_eq!(names, expected, "newest first, id tie-break ascending");
+    }
+
+    /// Backward compatibility: a snapshot written before `updated_at`
+    /// existed parses fine and falls back to the file's own modification
+    /// time, so legacy history keeps a sensible recency order instead of
+    /// collapsing to the id tie-break.
+    #[test]
+    fn legacy_snapshot_without_updated_at_falls_back_to_file_mtime() {
+        let root = temp_root("legacy-mtime");
+        let mut fresh = sample_chat("fresh");
+        fresh.updated_at = 900;
+        save_chat_in(Some(&root), &fresh).expect("save fresh chat");
+
+        let legacy_id = new_thread_id();
+        let legacy = format!(
+            r#"{{"name":"legacy","id":"{legacy_id}","messages":[
+                {{"role":"User","markdown":"question","pending":false}}]}}"#
+        );
+        std::fs::create_dir_all(root.join("threads")).expect("threads dir");
+        let legacy_path = root.join("threads").join(format!("{legacy_id}.json"));
+        std::fs::write(&legacy_path, legacy).expect("write legacy snapshot");
+        // Backdate the legacy file: last modified long before `fresh`.
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&legacy_path)
+            .expect("open for mtime");
+        f.set_modified(past).expect("set mtime");
+
+        let loaded = load_chats_from(Some(&root));
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded[0].name, "fresh",
+            "the stamped snapshot outranks the mtime-fallback one"
+        );
+        assert_eq!(loaded[1].name, "legacy");
+        assert_eq!(loaded[1].updated_at, 100, "mtime proxy picked up");
+    }
+
+    /// The stamp round-trips: a saved `updated_at` comes back exactly, not
+    /// reinvented from the (now newer) file mtime.
+    #[test]
+    fn updated_at_roundtrips_exactly() {
+        let root = temp_root("stamp-roundtrip");
+        let mut chat = sample_chat("stamped");
+        chat.updated_at = 1234567890;
+        save_chat_in(Some(&root), &chat).expect("save");
+
+        // The write itself bumps the file mtime way past 1234567890; the
+        // stored value must win regardless.
+        let loaded = load_chats_from(Some(&root));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].updated_at, 1234567890);
     }
 
     #[test]

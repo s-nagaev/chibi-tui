@@ -116,6 +116,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the `CHIBI_TUI_LOG` file mirror stays plain text with no ANSI codes.
 
 ### Changed
+- Sidebar threads are now ordered by last activity, newest first: every new
+  user or assistant message in a thread (request start, queued prompt,
+  visible reply, inline error, background continuation) lifts that thread to
+  the top of the sidebar, and the ordering survives restarts — snapshots
+  persist an additive `updated_at` stamp (snapshots from before the field
+  fall back to the file's modification time, so legacy history keeps a sane
+  recency order; equal timestamps break deterministically by thread id).
+  New threads (^N, thread clone) also start on top, with the selection
+  following a thread the user acted in and never being stolen by background
+  activity. The previous order was file-name (random UUID) order, which
+  made the sidebar arrangement unstable and unrelated to what the user
+  touched last.
 - Backend launch command: live mode now spawns the backend as
   `chibi stdio --tui` instead of `chibi ide --stdio` (the backend removed the
   `ide` subcommand). The JSONL protocol v1 handshake, capability exchange and

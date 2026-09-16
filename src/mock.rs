@@ -10,9 +10,16 @@ pub const MOCK_REPLIES: &[&str] = &[
 ];
 
 fn chat(name: &str, messages: Vec<Message>) -> crate::app::Chat {
+    // Staggered newest-first stamps: the demo sidebar keeps its authored
+    // order (first chat on top) under the updated_at ordering.
+    static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = crate::history::now_unix();
+    let updated_at = base.saturating_sub(seq);
     crate::app::Chat {
         name: name.to_string(),
         id: crate::history::new_thread_id(),
+        updated_at,
         messages,
         lifecycle: crate::model::ChatLifecycle::Idle,
         queue: std::collections::VecDeque::new(),

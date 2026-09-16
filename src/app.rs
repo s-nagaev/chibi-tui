@@ -427,6 +427,11 @@ pub struct ReconnectRequest {}
 pub struct Chat {
     pub name: String,
     pub id: String,
+    /// Last-activity timestamp (unix seconds): refreshed on every new user
+    /// or assistant message in the thread and persisted with the snapshot.
+    /// The sidebar is ordered by it, newest first (ties break by id), so a
+    /// thread with fresh activity rises to the top.
+    pub updated_at: u64,
     pub messages: Vec<Message>,
     /// This chat's own request lifecycle (`Idle` / `Awaiting` / `Running`).
     pub lifecycle: ChatLifecycle,
@@ -478,6 +483,7 @@ impl Chat {
         Self {
             name: name.into(),
             id: crate::history::new_thread_id(),
+            updated_at: crate::history::now_unix(),
             messages: Vec::new(),
             lifecycle: ChatLifecycle::Idle,
             queue: VecDeque::new(),
@@ -730,12 +736,12 @@ pub struct App {
     pub thoughts_visible: bool,
 }
 
-/// a clone request in flight. The `chat` waits here until
-/// the backend acks; `source_id` anchors the insert-after-source placement.
+/// a clone request in flight. The `chat` waits here until the backend
+/// acks; the ack lists the clone at the sidebar top, so the source is not
+/// tracked.
 struct PendingClone {
     chat: Chat,
     request_id: String,
-    source_id: String,
 }
 
 /// which destructive command the stop/reset
@@ -916,6 +922,29 @@ impl App {
         self.select_chat(self.active.saturating_sub(1));
     }
 
+    /// Record fresh activity on the chat at `index` and lift the thread to
+    /// the top of the sidebar (the list IS the render order — newest first).
+    /// A no-op for out-of-range indexes. The selection follows the move:
+    /// a chat that was active stays active after landing on top, and the
+    /// indexes of the chats it jumped over are fixed up so every other
+    /// selection stays put.
+    pub fn touch_chat(&mut self, index: usize) {
+        if index >= self.chats.len() {
+            return;
+        }
+        self.chats[index].updated_at = crate::history::now_unix();
+        if index == 0 {
+            return;
+        }
+        let chat = self.chats.remove(index);
+        self.chats.insert(0, chat);
+        if self.active == index {
+            self.active = 0;
+        } else if self.active < index {
+            self.active += 1;
+        }
+    }
+
     /// Restore seam (remember-last-thread): open the app on a specific
     /// thread id exactly as if the user had picked it — the same selection
     /// semantics as [`App::select_chat`], whose sticky ctx-segment seeding
@@ -1052,8 +1081,10 @@ impl App {
     /// Chat so typing goes straight into the prompt.
     pub fn new_chat(&mut self) {
         let n = self.chats.len() + 1;
-        self.chats.push(Chat::new(format!("New chat {n}")));
-        self.select_chat(self.chats.len() - 1);
+        // A new thread starts on top of the sidebar (newest-first order)
+        // and is selected immediately.
+        self.chats.insert(0, Chat::new(format!("New chat {n}")));
+        self.select_chat(0);
         self.focus = Focus::Chat;
     }
 
@@ -2175,6 +2206,9 @@ impl App {
         if chat.lifecycle.is_busy() {
             // Enqueue into THIS chat's FIFO; other chats are unaffected.
             enqueue_prompt(chat, text);
+            // A queued prompt is still fresh user activity: lift the
+            // thread to the sidebar top (selection follows the move).
+            self.touch_chat(self.active);
             return None;
         }
         Some(Submitted {
@@ -2193,6 +2227,9 @@ impl App {
     /// loop needs it for background chats) and swaps the queued marker in
     /// place rather than appending a duplicate user bubble.
     pub fn begin_request(&mut self, submitted: &Submitted) {
+        // Fresh user activity lifts the thread to the top of the sidebar;
+        // after the lift the chat sits at index 0 and stays selected.
+        self.touch_chat(self.active);
         if let Some(chat) = self.chats.get_mut(self.active) {
             // A new VISIBLE request starts in THIS chat: its previous turn's
             // reasoning leaves the view. Other chats' thoughts are untouched.
@@ -2226,6 +2263,12 @@ impl App {
     /// Note: unlike [`App::begin_request`] this works on ANY chat — the event
     /// loop uses it after terminal events, including for background chats.
     pub fn dequeue_next_for(&mut self, thread_id: &str) -> Option<Submitted> {
+        // A dequeued prompt is fresh user activity: lift the thread to the
+        // sidebar top before touching its transcript (background chats
+        // included; the selection of other threads is preserved).
+        if let Some(index) = self.chats.iter().position(|c| c.id == thread_id) {
+            self.touch_chat(index);
+        }
         let chat = self.chats.iter_mut().find(|c| c.id == thread_id)?;
         let prompt = chat.queue.pop_front()?;
         // A dequeued prompt is a VISIBLE request start for THIS chat only:
@@ -2627,8 +2670,7 @@ impl App {
             self.show_status("can't clone \u{2014} busy");
             return;
         }
-        let source_id = source.id.clone();
-        let source_wire = crate::live::wire_thread_id(&source_id);
+        let source_wire = crate::live::wire_thread_id(source.id.as_str());
         // Fresh UUID, copied display mirror. The messages travel in the
         // clone's own JSON snapshot for the sidebar and restarts, while the
         // backend DB stays the context truth (the command re-keys it).
@@ -2650,7 +2692,6 @@ impl App {
         self.pending_clone = Some(PendingClone {
             chat: clone,
             request_id,
-            source_id,
         });
         self.clone_submission = Some(submitted);
     }
@@ -2698,20 +2739,12 @@ impl App {
                 {
                     return false;
                 }
-                // Ack: list the clone right after its source and select it.
-                // A source deleted mid-flight degrades to appending at the
-                // end of the list.
-                let PendingClone {
-                    chat, source_id, ..
-                } = self.pending_clone.take().expect("pending checked above");
-                let at = self
-                    .chats
-                    .iter()
-                    .position(|c| c.id == source_id)
-                    .map(|i| i + 1)
-                    .unwrap_or(self.chats.len());
-                self.chats.insert(at, chat);
-                self.select_chat(at);
+                // Ack: list the clone at the sidebar top (newest-first
+                // order: a clone is brand-new activity) and select it.
+                let PendingClone { chat, .. } =
+                    self.pending_clone.take().expect("pending checked above");
+                self.chats.insert(0, chat);
+                self.select_chat(0);
                 true
             }
             BackendEvent::Error {
@@ -3002,6 +3035,10 @@ impl App {
                                 self.picker_model_labels.remove(&thread_id);
                             }
                             self.scroll = 0;
+                            // A visible reply is fresh thread activity: lift
+                            // it to the sidebar top (done last: the reply
+                            // handlers above still use the pre-move index).
+                            self.touch_chat(chat_index);
                         }
                     }
                 }
@@ -3048,6 +3085,9 @@ impl App {
                         self.show_error(message);
                     }
                     self.scroll = 0;
+                    // An inline failure is a reply in the thread: lift it to
+                    // the sidebar top (after the index-based handling above).
+                    self.touch_chat(chat_index);
                 }
             }
             // Handled by the early returns above; arms kept for exhaustiveness.
@@ -3128,6 +3168,9 @@ impl App {
         }
         self.mark_unread_if_background(chat_index);
         self.scroll = 0;
+        // A continuation answer is fresh thread activity: lift it to the
+        // sidebar top (after the index-based handling above).
+        self.touch_chat(chat_index);
     }
 
     /// resolve a hidden bare-`/model` result.
@@ -3475,6 +3518,16 @@ mod tests {
         App::new(chats)
     }
 
+    /// Current sidebar index of the chat named `name`. Activity lifts
+    /// threads to the top, so tests must look chats up by their stable
+    /// name instead of by a position captured earlier.
+    fn idx(app: &App, name: &str) -> usize {
+        app.chats
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("chat {name} not in the sidebar"))
+    }
+
     fn type_in(app: &mut App, text: &str) {
         for ch in text.chars() {
             app.input.input(tui_textarea::Input {
@@ -3699,9 +3752,9 @@ mod tests {
         let mut app = app_with_chats(2);
         finish_turn_with_thoughts(&mut app, 0, "alpha reasoning");
 
-        app.select_next();
+        app.select_chat(idx(&app, "chat-1"));
         let background = submit_text(&mut app, "background question");
-        app.select_prev();
+        app.select_chat(idx(&app, "chat-0"));
         app.apply_backend_event(BackendEvent::Result {
             usage: None,
             thoughts: Some("beta reasoning".into()),
@@ -3712,12 +3765,12 @@ mod tests {
         });
 
         assert_eq!(
-            app.chats[1].last_thoughts.as_deref(),
+            app.chats[idx(&app, "chat-1")].last_thoughts.as_deref(),
             Some("beta reasoning"),
             "the owning chat mirrors its own reasoning"
         );
         assert_eq!(
-            app.chats[0].last_thoughts.as_deref(),
+            app.chats[idx(&app, "chat-0")].last_thoughts.as_deref(),
             Some("alpha reasoning"),
             "the viewed chat must not show a background chat's thoughts"
         );
@@ -3731,15 +3784,16 @@ mod tests {
         finish_turn_with_thoughts(&mut app, 0, "alpha reasoning");
         finish_turn_with_thoughts(&mut app, 1, "beta reasoning");
 
-        app.select_chat(0);
+        app.select_chat(idx(&app, "chat-0"));
         submit_text(&mut app, "second question");
 
         assert_eq!(
-            app.chats[0].last_thoughts, None,
+            app.chats[idx(&app, "chat-0")].last_thoughts,
+            None,
             "a new request start clears the requesting chat's thoughts"
         );
         assert_eq!(
-            app.chats[1].last_thoughts.as_deref(),
+            app.chats[idx(&app, "chat-1")].last_thoughts.as_deref(),
             Some("beta reasoning"),
             "other chats' thoughts are not the requester's business"
         );
@@ -3751,11 +3805,11 @@ mod tests {
         let mut app = app_with_chats(2);
         finish_turn_with_thoughts(&mut app, 0, "alpha reasoning");
 
-        app.select_chat(1);
+        app.select_chat(idx(&app, "chat-1"));
         let first = submit_text(&mut app, "first");
         type_in(&mut app, "queued behind it");
         assert!(app.take_input().is_none(), "busy chat enqueues");
-        app.select_prev();
+        app.select_chat(idx(&app, "chat-0"));
         app.apply_backend_event(BackendEvent::Result {
             usage: None,
             thoughts: Some("beta reasoning".into()),
@@ -3765,17 +3819,18 @@ mod tests {
             model: None,
         });
 
-        let background_thread = app.chats[1].id.clone();
+        let background_thread = app.chats[idx(&app, "chat-1")].id.clone();
         let drained = app
             .dequeue_next_for(&background_thread)
             .expect("queued prompt drained");
         assert_eq!(drained.prompt, "queued behind it");
         assert_eq!(
-            app.chats[1].last_thoughts, None,
+            app.chats[idx(&app, "chat-1")].last_thoughts,
+            None,
             "the dequeued start clears that chat's thoughts"
         );
         assert_eq!(
-            app.chats[0].last_thoughts.as_deref(),
+            app.chats[idx(&app, "chat-0")].last_thoughts.as_deref(),
             Some("alpha reasoning"),
             "the other chat keeps its trace"
         );
@@ -4061,7 +4116,9 @@ mod tests {
             output_tokens: 1,
             context_window: Some(100_000),
         });
-        let beta = Chat::new("beta");
+        let mut beta = Chat::new("beta");
+        // Deterministic order: alpha on top, beta behind (newest-first).
+        beta.updated_at = alpha.updated_at.saturating_sub(1);
 
         let mut app = App::new(vec![alpha, beta]);
         assert_eq!(app.last_turn_usage.map(|u| u.input_tokens), Some(10));
@@ -4088,10 +4145,14 @@ mod tests {
             output_tokens: 1,
             context_window: Some(100_000),
         });
-        let beta = Chat::new("beta");
+        let mut beta = Chat::new("beta");
+        // Deterministic order: alpha on top, beta behind (newest-first).
+        beta.updated_at = alpha.updated_at.saturating_sub(1);
 
         let mut app = App::new(vec![alpha, beta]);
-        app.select_next();
+        // Selections go by NAME: activity lifts threads to the top, so
+        // positional arrows are not stable here.
+        app.select_chat(idx(&app, "beta"));
         assert_eq!(app.last_turn_usage, None, "neutral after the switch");
 
         finish_llm_turn(&mut app, "glm-5.2", sample_usage());
@@ -4101,13 +4162,13 @@ mod tests {
             "an incoming usage frame overwrites the ctx segment after a switch"
         );
 
-        app.select_prev();
+        app.select_chat(idx(&app, "alpha"));
         assert_eq!(
             app.last_turn_usage.map(|u| u.input_tokens),
             Some(10),
             "switching away reads the per-thread mirror, not the sticky field"
         );
-        app.select_next();
+        app.select_chat(idx(&app, "beta"));
         assert_eq!(
             app.last_turn_usage,
             Some(sample_usage()),
@@ -4260,14 +4321,18 @@ mod tests {
         app.active = 1;
         submit_text(&mut app, "background request");
 
-        // Both chats run concurrently with their own counters.
-        agent_event(&mut app, 0, AgentEventKind::Started, 2, 4);
-        agent_event(&mut app, 1, AgentEventKind::Started, 1, 4);
+        // Both chats run concurrently with their own counters (sidebar
+        // positions may have shifted — look them up by name).
+        let a = idx(&app, "chat-0");
+        let b = idx(&app, "chat-1");
+        agent_event(&mut app, a, AgentEventKind::Started, 2, 4);
+        agent_event(&mut app, b, AgentEventKind::Started, 1, 4);
 
-        // The active chat (1) sees only its own counter…
+        // The active chat (chat-1) sees only its own counter…
+        app.select_chat(b);
         assert_eq!(app.active_chat_subagents(), Some(1));
-        // …and switching back to chat 0 sees only chat 0's.
-        app.active = 0;
+        // …and switching back to chat-0 sees only chat-0's.
+        app.select_chat(a);
         assert_eq!(app.active_chat_subagents(), Some(2));
     }
 
@@ -4398,14 +4463,14 @@ mod tests {
     // creation / switching --------------------------------
 
     #[test]
-    fn new_chat_appends_selects_and_gets_fresh_uuid() {
+    fn new_chat_inserts_on_top_selects_and_gets_fresh_uuid() {
         let mut app = app_with_chats(2);
         let existing_ids: Vec<String> = app.chats.iter().map(|c| c.id.clone()).collect();
         app.new_chat();
         assert_eq!(app.chats.len(), 3);
-        assert_eq!(app.active, 2, "the fresh chat must be selected");
+        assert_eq!(app.active, 0, "the fresh chat must be selected");
         assert_eq!(app.chat_title(), "New chat 3");
-        let fresh = &app.chats[2];
+        let fresh = &app.chats[0];
         assert!(!fresh.id.is_empty());
         assert!(!existing_ids.contains(&fresh.id), "thread ids are unique");
         assert!(fresh.messages.is_empty());
@@ -4613,7 +4678,7 @@ mod tests {
         app.focus = Focus::Sidebar;
         app.new_chat();
         assert_eq!(app.focus, Focus::Chat);
-        assert_eq!(app.active, 2, "new chat is selected");
+        assert_eq!(app.active, 0, "new chat is selected (and on top)");
     }
 
     // ---- lifecycle (per chat) --------------------------------------------
@@ -4996,14 +5061,20 @@ mod tests {
     fn switching_chats_relabels_from_that_chats_last_model() {
         let mut app = app_with_chats(2);
         submit_text(&mut app, "chat0");
-        finish_chat_with_model(&mut app, 0, Some("glm-5.2"));
+        {
+            let i = idx(&app, "chat-0");
+            finish_chat_with_model(&mut app, i, Some("glm-5.2"));
+        }
 
-        app.select_next();
+        app.select_chat(idx(&app, "chat-1"));
         submit_text(&mut app, "chat1");
-        finish_chat_with_model(&mut app, 1, Some("kimi-k2.7"));
+        {
+            let i = idx(&app, "chat-1");
+            finish_chat_with_model(&mut app, i, Some("kimi-k2.7"));
+        }
 
         assert_eq!(app.active_model_label(), Some("kimi-k2.7"));
-        app.select_prev();
+        app.select_chat(idx(&app, "chat-0"));
         assert_eq!(
             app.active_model_label(),
             Some("glm-5.2"),
@@ -5163,16 +5234,32 @@ mod tests {
     #[test]
     fn absorbed_result_in_background_chat_is_invisible() {
         let mut app = app_with_chats(2);
-        app.select_next(); // active = chat 1 (the "background" one)
+        app.select_chat(idx(&app, "chat-1")); // the "background" one
         submit_text(&mut app, "background question");
-        app.select_prev(); // foreground chat 0 stays empty
+        app.select_chat(idx(&app, "chat-0")); // foreground stays empty
 
-        finish_chat_with_content(&mut app, 1, ACK_MARKER);
+        {
+            let i = idx(&app, "chat-1");
+            finish_chat_with_content(&mut app, i, ACK_MARKER);
+        }
 
-        assert_eq!(app.chats[1].messages.len(), 1, "no bubble in bg chat");
-        assert!(app.chats[1].messages.iter().all(|m| !m.pending));
-        assert_eq!(app.chats[1].lifecycle, ChatLifecycle::Idle);
-        assert!(app.chats[0].messages.is_empty(), "foreground untouched");
+        assert_eq!(
+            app.chats[idx(&app, "chat-1")].messages.len(),
+            1,
+            "no bubble in bg chat"
+        );
+        assert!(app.chats[idx(&app, "chat-1")]
+            .messages
+            .iter()
+            .all(|m| !m.pending));
+        assert_eq!(
+            app.chats[idx(&app, "chat-1")].lifecycle,
+            ChatLifecycle::Idle
+        );
+        assert!(
+            app.chats[idx(&app, "chat-0")].messages.is_empty(),
+            "foreground untouched"
+        );
         assert!(app.error_popup.is_none());
     }
 
@@ -5198,11 +5285,21 @@ mod tests {
             "mid-typing draft untouched by the background arrival"
         );
 
-        // The active chat's own reply is on screen: no flag.
+        // The active chat's own reply is on screen: no flag. (Submitting
+        // lifts chat-1 to the top, so look it up by name, not position.)
         submit_text(&mut app, "foreground work");
-        finish_chat(&mut app, 1);
-        assert!(!app.chats[1].unread, "selected chat never flags itself");
-        assert!(app.chats[0].unread, "other flag survives unrelated traffic");
+        {
+            let i = idx(&app, "chat-1");
+            finish_chat(&mut app, i);
+        }
+        assert!(
+            !app.chats[idx(&app, "chat-1")].unread,
+            "selected chat never flags itself"
+        );
+        assert!(
+            app.chats[idx(&app, "chat-0")].unread,
+            "other flag survives unrelated traffic"
+        );
     }
 
     /// Selecting the flagged thread clears its marker (the single
@@ -5319,8 +5416,8 @@ mod tests {
             thread_id: submitted.thread_id,
             model: None,
         });
-        assert_eq!(app.active, 1, "clone selected");
-        assert!(!app.chats[1].unread, "fresh clone carries no marker");
+        assert_eq!(app.active, 0, "clone selected");
+        assert!(!app.chats[0].unread, "fresh clone carries no marker");
     }
 
     #[test]
@@ -5385,19 +5482,25 @@ mod tests {
         let first = submit_text(&mut app, "long running in A");
 
         // Switch to chat B and submit while A runs — never blocked.
-        app.select_next();
+        app.select_chat(idx(&app, "chat-1"));
         let second = submit_text(&mut app, "parallel in B");
         assert_ne!(first.thread_id, second.thread_id);
         assert!(matches!(
-            app.chats[0].lifecycle,
+            app.chats[idx(&app, "chat-0")].lifecycle,
             ChatLifecycle::Awaiting { .. }
         ));
         assert!(matches!(
-            app.chats[1].lifecycle,
+            app.chats[idx(&app, "chat-1")].lifecycle,
             ChatLifecycle::Awaiting { .. }
         ));
-        assert!(app.chats[0].queue.is_empty(), "A's queue untouched");
-        assert!(app.chats[1].queue.is_empty(), "B started immediately");
+        assert!(
+            app.chats[idx(&app, "chat-0")].queue.is_empty(),
+            "A's queue untouched"
+        );
+        assert!(
+            app.chats[idx(&app, "chat-1")].queue.is_empty(),
+            "B started immediately"
+        );
 
         // B's answer lands first and only touches B.
         let second_req = second.request_id.clone();
@@ -5409,11 +5512,24 @@ mod tests {
             thread_id: second.thread_id.clone(),
             model: None,
         });
-        assert_eq!(app.chats[0].messages.len(), 2, "A still pending");
-        assert_eq!(app.chats[1].messages[1].markdown, "B done");
-        assert_eq!(app.chats[1].lifecycle, ChatLifecycle::Idle);
+        assert_eq!(
+            app.chats[idx(&app, "chat-0")].messages.len(),
+            2,
+            "A still pending"
+        );
+        assert_eq!(
+            app.chats[idx(&app, "chat-1")].messages[1].markdown,
+            "B done"
+        );
+        assert_eq!(
+            app.chats[idx(&app, "chat-1")].lifecycle,
+            ChatLifecycle::Idle
+        );
         assert!(
-            matches!(app.chats[0].lifecycle, ChatLifecycle::Awaiting { .. }),
+            matches!(
+                app.chats[idx(&app, "chat-0")].lifecycle,
+                ChatLifecycle::Awaiting { .. }
+            ),
             "A keeps running across B's completion"
         );
     }
@@ -5565,7 +5681,7 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for _ in 0..50 {
             app.new_chat();
-            ids.insert(app.chats.last().unwrap().id.clone());
+            ids.insert(app.chats.first().unwrap().id.clone());
         }
         assert_eq!(ids.len(), 50, "every new chat gets a unique thread id");
     }
@@ -6224,7 +6340,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_ack_inserts_after_source_selects_and_copies_mirror() {
+    fn clone_ack_inserts_on_top_selects_and_copies_mirror() {
         let mut app = clone_capable_app(3);
         app.select_next(); // active = 1 (chat-1)
         app.chats[1].messages.push(Message::user("question"));
@@ -6244,11 +6360,11 @@ mod tests {
 
         assert_eq!(app.chats.len(), 4);
         assert_eq!(
-            app.chats[2].name, "chat-1 (copy)",
-            "clone listed right after its source"
+            app.chats[0].name, "chat-1 (copy)",
+            "clone listed on top (newest-first sidebar)"
         );
-        assert_eq!(app.chats[2].messages.len(), 2, "display mirror copied");
-        assert_eq!(app.active, 2, "clone selected");
+        assert_eq!(app.chats[0].messages.len(), 2, "display mirror copied");
+        assert_eq!(app.active, 0, "clone selected");
         assert_eq!(app.scroll, 0, "follow-bottom for the new chat");
         assert!(app.pending_clone.is_none(), "flight state cleared");
     }
@@ -6344,7 +6460,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_ack_after_source_deleted_appends_at_the_end() {
+    fn clone_ack_lists_on_top_even_if_source_deleted() {
         let mut app = clone_capable_app(2);
         app.begin_clone_thread();
         let submitted = app.take_clone_submission().expect("staged");
@@ -6362,10 +6478,10 @@ mod tests {
 
         assert_eq!(app.chats.len(), 2);
         assert_eq!(
-            app.chats[1].name, "chat-0 (copy)",
-            "source gone: clone appends at the end"
+            app.chats[0].name, "chat-0 (copy)",
+            "source gone: clone still lists on top (newest-first)"
         );
-        assert_eq!(app.active, 1);
+        assert_eq!(app.active, 0);
     }
 
     #[test]
@@ -8055,5 +8171,116 @@ mod tests {
             panic!("picker open");
         };
         assert_eq!(state.selected, 0, "preselected via the staged override");
+    }
+
+    // ---- sidebar ordering: updated_at DESC, activity lifts to top -------
+
+    /// Fresh user activity (request start) lifts the thread to the sidebar
+    /// top and the selection follows it; other chats keep their order.
+    #[test]
+    fn begin_request_lifts_active_thread_to_top() {
+        let mut app = app_with_chats(3);
+        app.select_chat(2);
+        let submitted = submit_text(&mut app, "top please");
+
+        assert_eq!(app.chats[0].id, submitted.thread_id, "thread on top");
+        assert_eq!(app.active, 0, "selection follows the lifted thread");
+        assert_eq!(app.chats[1].name, "chat-0", "others keep their order");
+        assert_eq!(app.chats[2].name, "chat-1", "others keep their order");
+    }
+
+    /// A visible reply in a BACKGROUND thread lifts it to the top WITHOUT
+    /// stealing the selection, and the lifted thread carries its snapshot
+    /// stamp (updated_at) for the next persistence round.
+    #[test]
+    fn visible_reply_lifts_background_thread_to_top() {
+        let mut app = app_with_chats(3);
+        submit_text(&mut app, "work in chat 0");
+        app.select_chat(idx(&app, "chat-1"));
+        let background = submit_text(&mut app, "background request");
+        app.select_chat(idx(&app, "chat-2")); // user reads chat-2
+        {
+            let i = idx(&app, "chat-1");
+            finish_chat(&mut app, i);
+        }
+
+        assert_eq!(
+            app.chats[0].id, background.thread_id,
+            "the answered thread is on top"
+        );
+        assert_eq!(
+            app.chats[app.active].id,
+            app.chats[idx(&app, "chat-2")].id,
+            "selection stays on the thread the user was reading"
+        );
+    }
+
+    /// A queued prompt (busy chat) is activity too: the thread lifts to the
+    /// top at enqueue time.
+    #[test]
+    fn queued_prompt_lifts_thread_to_top() {
+        let mut app = app_with_chats(2);
+        submit_text(&mut app, "first in chat 0");
+        app.select_chat(idx(&app, "chat-1"));
+        submit_text(&mut app, "second in chat 1"); // chat-1 lifts to the top
+        app.select_chat(idx(&app, "chat-0")); // user goes back to busy chat-0
+        type_in(&mut app, "queued behind the running turn");
+        assert!(app.take_input().is_none(), "busy chat enqueues");
+
+        assert_eq!(
+            app.chats[0].name, "chat-0",
+            "the enqueued thread is back on top"
+        );
+        assert_eq!(
+            app.chats[app.active].name, "chat-0",
+            "selection follows the enqueued thread"
+        );
+        assert_eq!(app.chats[1].name, "chat-1", "the other busy thread below");
+    }
+
+    /// A background continuation (`message` frame) lifts its thread to the
+    /// top as well.
+    #[test]
+    fn background_continuation_lifts_thread_to_top() {
+        let mut app = app_with_chats(2);
+        let target = app.chats[1].id.clone();
+        app.apply_backend_event(BackendEvent::BackgroundMessage {
+            wire_thread_id: crate::live::wire_thread_id(&target),
+            markdown: "continuation".into(),
+            model: None,
+            thoughts: None,
+        });
+
+        assert_eq!(app.chats[0].id, target, "continuation lifts the thread");
+    }
+
+    /// touch_chat: the moved chat keeps its selection, chats it jumped over
+    /// shift right by one, and the stamp is refreshed.
+    #[test]
+    fn touch_chat_lifts_thread_and_fixes_indexes() {
+        let mut app = app_with_chats(3);
+        app.select_chat(2);
+        let before = app.chats[2].updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        app.touch_chat(2);
+
+        assert_eq!(app.chats[0].name, "chat-2", "lifted to the top");
+        assert_eq!(app.active, 0, "the lifted chat stays selected");
+        assert_eq!(app.chats[1].name, "chat-0", "shifted right");
+        assert_eq!(app.chats[2].name, "chat-1", "shifted right");
+        assert!(
+            app.chats[0].updated_at > before,
+            "the activity stamp is refreshed"
+        );
+    }
+
+    /// touch_chat is a safe no-op for an out-of-range index.
+    #[test]
+    fn touch_chat_out_of_range_is_a_noop() {
+        let mut app = app_with_chats(2);
+        let snapshot: Vec<String> = app.chats.iter().map(|c| c.name.clone()).collect();
+        app.touch_chat(9);
+        let after: Vec<String> = app.chats.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(snapshot, after, "nothing moved");
     }
 }

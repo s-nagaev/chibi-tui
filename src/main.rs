@@ -2840,7 +2840,7 @@ mod tests {
         press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
 
         assert_eq!(app.focus, chibi_tui::app::Focus::Chat, "^N lands on Chat");
-        assert_eq!(app.active, 2, "the new chat is selected");
+        assert_eq!(app.active, 0, "the new chat is selected (and on top)");
         assert_eq!(app.chats.len(), 3);
         assert!(app.at_bottom(), "scroll reset to follow-bottom");
     }
