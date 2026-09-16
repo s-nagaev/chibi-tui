@@ -24,7 +24,7 @@ use crate::theme::Theme;
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Minimum time the splash stays visible (any keypress skips the remainder).
-const MIN_HOLD: Duration = Duration::from_millis(1500);
+const MIN_HOLD: Duration = Duration::from_millis(500);
 
 /// Logo grid width in columns.
 const LOGO_WIDTH: u16 = 35;
