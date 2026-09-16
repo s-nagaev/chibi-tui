@@ -6,8 +6,9 @@ description = "Terminal UI client for Chibi — an AI assistant (IDE protocol v1
 license = "MIT"
 repository = "https://github.com/s-nagaev/chibi-tui"
 readme = "README.md"
-keywords = ["terminal", "tui", "ai", "chat", "chibi"]
+keywords = ["terminal", "tui", "ai-agent", "llm", "chat"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["docs/", "tests/", "full.Dockerfile", "Taskfile.yml", "AGENTS.md", "CHANGELOG.md", "dist/"]
 
 [dependencies]
 ratatui = "0.29"
