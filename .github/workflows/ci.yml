@@ -86,9 +86,6 @@ jobs:
         with:
           context: .
           file: full.Dockerfile
-          # The backend source is the public chibi repository.
-          build-contexts: |
-            backend-src=https://github.com/s-nagaev/chibi
           # amd64 only for now: multiarch full images (QEMU rust cross-build of the TUI) are a follow-up decision.
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
