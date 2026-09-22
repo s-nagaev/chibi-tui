@@ -1675,6 +1675,11 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
     },
     HotkeyRow {
         group: "Global",
+        chord: "Ctrl-chords",
+        action: "work under RU / UA keyboard layouts",
+    },
+    HotkeyRow {
+        group: "Global",
         chord: "Esc",
         action: "clear the input · dismiss popups",
     },

@@ -7,6 +7,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Ctrl-chords work under the Russian (ЙЦУКЕН) and Ukrainian keyboard
+  layouts. Crossterm reports the LAYOUT character for modified keys, so
+  `Ctrl+Ф` never matched the `Ctrl+A` arm and every chord silently died
+  until the layout was switched; the key dispatch now normalizes the
+  Cyrillic character to its Latin counterpart before any chord matching
+  (letter-for-key across the full ЙЦУКЕН mapping, `і` → `s` and the
+  Ukrainian-only `ї`/`є`/`ґ` keys included), preserving case so the
+  shifted `Ctrl+Д` = `Shift+Ctrl+L` reset keeps its case-sensitive
+  semantics. Plain typing, characters outside both layouts and every Latin
+  chord behave exactly as before; plain-letter hotkeys (`y`/`n`, `k`/`j`,
+  …) stay Latin-only by design. Documented in the README and the F1 help
+  modal.
 - Mouse text selection in the chat view. A left press inside the chat pane
   anchors a selection, dragging extends it (reversed highlight painted over
   the wrapped rows — markdown/syntect styling of the unselected text is

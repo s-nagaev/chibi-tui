@@ -936,6 +936,90 @@ fn should_submit(key: &crossterm::event::KeyEvent) -> bool {
     key.code == KeyCode::Enter && key.modifiers.is_empty()
 }
 
+/// Map one Cyrillic character onto its Latin counterpart for the Russian
+/// (ЙЦУКЕН) and Ukrainian keyboard layouts, preserving case for letters
+/// (uppercase Cyrillic → uppercase Latin, so the case-sensitive
+/// `Char('L')` reset shape keeps working). Characters outside both layouts
+/// return `None` and pass through unchanged.
+fn cyrillic_latin_counterpart(c: char) -> Option<char> {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped = match lower {
+        // Shared ЙЦУКЕН top row (the Latin q..p keys).
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        // Home row. ы (Russian) and і (Ukrainian) share the Latin `s` key;
+        // ї / є / ґ are the Ukrainian-only keys on `]` / `'` / `\`.
+        'ф' => 'a',
+        'ы' | 'і' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'ь' => 'm',
+        // Bottom row (the Latin z..m keys).
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        // Non-letter keys keep their physical Latin twins so the input
+        // behavior matches a Latin keyboard key-for-key.
+        'х' => '[',
+        'ъ' | 'ї' => ']',
+        'ж' => ';',
+        'э' | 'є' => '\'',
+        'б' => ',',
+        'ю' => '.',
+        'ё' => '`',
+        'ґ' => '\\',
+        _ => return None,
+    };
+    if c.is_uppercase() && mapped.is_ascii_alphabetic() {
+        Some(mapped.to_ascii_uppercase())
+    } else {
+        Some(mapped)
+    }
+}
+
+/// Normalize a Ctrl-chord reported under a Cyrillic keyboard layout onto
+/// the Latin chord the key dispatch matches.
+///
+/// Crossterm reports the LAYOUT character for modified keys, so under
+/// ЙЦУКЕН `Ctrl+A` arrives as `Ctrl+Ф` and every chord match silently
+/// failed until the user switched layouts. Applied at the very top of
+/// [`handle_key`], BEFORE any chord matching, and ONLY to events carrying
+/// CONTROL: plain typing (the textarea, the rename and search editors) is
+/// returned untouched, characters outside both layouts pass through
+/// unchanged, and every modifier rides along — so a normalized chord
+/// behaves byte-for-byte like its Latin original, including the
+/// case-sensitive `Char('L')` / `Char('l')` stop/reset split and the
+/// Ctrl+Shift+F global-search shape.
+fn normalize_cyrillic_ctrl_chord(
+    mut key: crossterm::event::KeyEvent,
+) -> crossterm::event::KeyEvent {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return key;
+    }
+    if let KeyCode::Char(c) = key.code {
+        if let Some(mapped) = cyrillic_latin_counterpart(c) {
+            key.code = KeyCode::Char(mapped);
+        }
+    }
+    key
+}
+
 /// Apply key handling to app state. Backend interactions (submit, cancel,
 /// reconnect) happen in the event loop by observing state changes, keeping
 /// this function synchronous and testable.
@@ -943,6 +1027,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return;
     }
+    // Ctrl-chords arrive with the LAYOUT character under the Russian
+    // (ЙЦУКЕН) and Ukrainian keyboard layouts (Ctrl+Ф instead of Ctrl+A),
+    // which left every chord dead until the layout was switched. Rewrite
+    // the char to its Latin counterpart before ANY matching; events without
+    // CONTROL are returned untouched, so plain typing into the textarea
+    // never sees a changed keystroke.
+    let key = normalize_cyrillic_ctrl_chord(key);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Alt+↑/↓ are a full synonym of Ctrl+↑/↓ thread
     // switching (see the match below); macOS Mission Control hijacks
@@ -4771,6 +4862,11 @@ mod tests {
             "Drag-select",
             "highlight chat text · release copies it",
         ),
+        (
+            "Global",
+            "Ctrl-chords",
+            "work under RU / UA keyboard layouts",
+        ),
         ("Global", "Esc", "clear the input · dismiss popups"),
         ("Input", "Enter", "send the message (queues while busy)"),
         ("Input", "⇧↵ / ⌥↵", "insert a newline"),
@@ -5300,6 +5396,204 @@ mod tests {
             app.help_scroll_down();
         }
         assert_eq!(scroll(&app), total.saturating_sub(page));
+    }
+
+    // ---- Cyrillic Ctrl-chord normalization -----------------------------------
+
+    /// The full Russian (ЙЦУКЕН) letter mapping, case-preserving on both
+    /// sides: lowercase layout char → lowercase Latin twin, uppercase →
+    /// uppercase (the case-sensitive `Char('L')` reset shape depends on it).
+    #[test]
+    fn cyrillic_table_maps_the_full_russian_layout_case_preserving() {
+        let ru: &[(char, char)] = &[
+            ('й', 'q'),
+            ('ц', 'w'),
+            ('у', 'e'),
+            ('к', 'r'),
+            ('е', 't'),
+            ('н', 'y'),
+            ('г', 'u'),
+            ('ш', 'i'),
+            ('щ', 'o'),
+            ('з', 'p'),
+            ('ф', 'a'),
+            ('ы', 's'),
+            ('в', 'd'),
+            ('а', 'f'),
+            ('п', 'g'),
+            ('р', 'h'),
+            ('о', 'j'),
+            ('л', 'k'),
+            ('д', 'l'),
+            ('ь', 'm'),
+            ('я', 'z'),
+            ('ч', 'x'),
+            ('с', 'c'),
+            ('м', 'v'),
+            ('и', 'b'),
+            ('т', 'n'),
+        ];
+        for &(cyr, lat) in ru {
+            assert_eq!(cyrillic_latin_counterpart(cyr), Some(lat), "{cyr}");
+            let upper = cyr.to_uppercase().next().unwrap_or(cyr);
+            assert_eq!(
+                cyrillic_latin_counterpart(upper),
+                Some(lat.to_ascii_uppercase()),
+                "{upper}"
+            );
+        }
+    }
+
+    /// Ukrainian-only keys: і shares the Latin `s` key with the Russian ы,
+    /// ї / є / ґ sit on the `]` / `'` / `\` keys of the layout.
+    #[test]
+    fn cyrillic_table_covers_the_ukrainian_only_keys() {
+        assert_eq!(cyrillic_latin_counterpart('і'), Some('s'));
+        assert_eq!(cyrillic_latin_counterpart('І'), Some('S'));
+        assert_eq!(cyrillic_latin_counterpart('ї'), Some(']'));
+        assert_eq!(cyrillic_latin_counterpart('Ї'), Some(']'));
+        assert_eq!(cyrillic_latin_counterpart('є'), Some('\''));
+        assert_eq!(cyrillic_latin_counterpart('Є'), Some('\''));
+        assert_eq!(cyrillic_latin_counterpart('ґ'), Some('\\'));
+        assert_eq!(cyrillic_latin_counterpart('Ґ'), Some('\\'));
+    }
+
+    /// Normalization touches ONLY Ctrl-chords: characters outside both
+    /// layouts pass through unchanged, and events without CONTROL — plain
+    /// typing, Alt-decorated keys — are never rewritten.
+    #[test]
+    fn cyrillic_normalization_touches_ctrl_chords_only_and_passes_unknown_through() {
+        let norm = |c: char, mods: KeyModifiers| {
+            normalize_cyrillic_ctrl_chord(key_event(KeyCode::Char(c), mods))
+        };
+        // Lowercase and uppercase shapes, modifiers preserved.
+        let key = norm('ф', KeyModifiers::CONTROL);
+        assert_eq!(key.code, KeyCode::Char('a'));
+        assert!(key.modifiers.contains(KeyModifiers::CONTROL));
+        let key = norm('Д', KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(key.code, KeyCode::Char('L'));
+        assert!(key.modifiers.contains(KeyModifiers::SHIFT));
+        // Characters outside both layouts pass through unchanged…
+        assert_eq!(norm('λ', KeyModifiers::CONTROL).code, KeyCode::Char('λ'));
+        assert_eq!(norm('q', KeyModifiers::CONTROL).code, KeyCode::Char('q'));
+        // …and so does EVERYTHING without CONTROL.
+        assert_eq!(norm('ф', KeyModifiers::NONE).code, KeyCode::Char('ф'));
+        assert_eq!(norm('ф', KeyModifiers::ALT).code, KeyCode::Char('ф'));
+    }
+
+    #[test]
+    fn cyrillic_ctrl_s_and_ukrainian_ctrl_i_toggle_thoughts() {
+        let mut app = app_with_chats(1);
+        assert!(app.thoughts_visible);
+        // ы is the ЙЦУКЕН twin of the Latin `s` key (see the table test)…
+        press(&mut app, KeyCode::Char('ы'), KeyModifiers::CONTROL);
+        assert!(!app.thoughts_visible, "Ctrl+ы (RU) toggles like Ctrl+S");
+        // …і its Ukrainian counterpart.
+        press(&mut app, KeyCode::Char('і'), KeyModifiers::CONTROL);
+        assert!(app.thoughts_visible, "Ctrl+і (UA) toggles like Ctrl+S too");
+    }
+
+    /// Layout-equivalence: a Cyrillic chord must leave the app in EXACTLY
+    /// the state its Latin original would — including the uppercase
+    /// Shift-decorated shapes, which tui-textarea treats as unknown ctrl
+    /// combos (a no-op here) in BOTH flavors.
+    #[test]
+    fn cyrillic_chords_reach_the_identical_state_as_their_latin_originals() {
+        // Lowercase Ctrl+A vs Ctrl+ф (the ЙЦУКЕН `a`-position key): caret
+        // to the line head in both.
+        let mut cyr = app_with_chats(1);
+        type_in(&mut cyr, "abcdef");
+        press(&mut cyr, KeyCode::Char('ф'), KeyModifiers::CONTROL);
+        let mut lat = app_with_chats(1);
+        type_in(&mut lat, "abcdef");
+        press(&mut lat, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(cyr.input.cursor(), lat.input.cursor(), "lowercase shape");
+        assert_eq!(cyr.input.cursor(), (0, 0), "Ctrl+A semantics reached");
+
+        // Uppercase Shift-decorated Ctrl+А vs Ctrl+Shift+A: identical
+        // (byte-for-byte the same normalized event, same no-op outcome).
+        let mut cyr = app_with_chats(1);
+        type_in(&mut cyr, "abcdef");
+        press(
+            &mut cyr,
+            KeyCode::Char('А'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let mut lat = app_with_chats(1);
+        type_in(&mut lat, "abcdef");
+        press(
+            &mut lat,
+            KeyCode::Char('A'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(cyr.input.cursor(), lat.input.cursor(), "uppercase shape");
+        assert_eq!(
+            cyr.input.lines(),
+            lat.input.lines(),
+            "no keystroke rewritten beyond the layout translation"
+        );
+    }
+
+    /// The task's headline example: Ctrl+Ф (the ЙЦУКЕН key on the Latin `a`
+    /// position) reaches the textarea's readline head-of-line mapping like
+    /// Ctrl+A does.
+    #[test]
+    fn cyrillic_ctrl_f_moves_the_caret_to_line_head_like_ctrl_a() {
+        let mut app = app_with_chats(1);
+        for ch in "abc".chars() {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('ф'), KeyModifiers::CONTROL);
+        assert_eq!(app.input.cursor(), (0, 0), "Ctrl+ф behaves like Ctrl+A");
+    }
+
+    /// The case-sensitive stop/reset split survives the translation:
+    /// lowercase д → the plain ^L stop confirm, uppercase Д → the
+    /// `Char('L')` reset shape (Shift+Ctrl+L).
+    #[test]
+    fn cyrillic_stop_and_reset_chords_keep_their_case_semantics() {
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(&mut app, KeyCode::Char('д'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Stop
+            }
+        ));
+
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(
+            &mut app,
+            KeyCode::Char('Д'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Reset
+            }
+        ));
+    }
+
+    #[test]
+    fn cyrillic_ctrl_c_cancels_the_inflight_request_like_latin_ctrl_c() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "in flight");
+        press(&mut app, KeyCode::Char('с'), KeyModifiers::CONTROL);
+        let (request_id, _) = app.pending_cancel.expect("cancel requested");
+        assert_eq!(request_id, submitted.request_id);
+        assert!(!app.should_quit, "busy Ctrl+с must not quit");
+    }
+
+    /// Plain Cyrillic typing must never be rewritten: the textarea receives
+    /// the layout characters verbatim (normalization is Ctrl-chord-only).
+    #[test]
+    fn plain_cyrillic_typing_lands_in_the_draft_untouched() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "привет, мир");
+        assert_eq!(app.input.lines().join(""), "привет, мир");
+        assert!(!app.should_quit);
+        assert!(app.active_request_id().is_none());
     }
 
     // ---- mouse wheel routing --------------------------------------------

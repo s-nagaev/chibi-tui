@@ -128,6 +128,15 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 | `Shift+Ctrl+L` | Reset the current thread behind a confirmation popup (same confirm/cancel keys): the thread's history is dropped and the local dialog cleared, both while running and when idle (on legacy terminals this degrades to `Ctrl+L` — type `/reset` at the prompt instead) |
 | `F1` | Toggle the keybindings help modal — a centered, scrollable popup listing every active chord |
 
+> **Keyboard layouts:** all `Ctrl`-chords work under the Russian (ЙЦУКЕН)
+> and Ukrainian keyboard layouts — the app normalizes the layout character
+> crossterm reports (`Ctrl+Ф` → `Ctrl+A`, `Ctrl+С` → `Ctrl+C`,
+> `Ctrl+І` → `Ctrl+S`, …), including the shifted uppercase shapes
+> (`Shift+Ctrl+Д` is the `Shift+Ctrl+L` reset). Plain-letter hotkeys
+> (`R` reconnect, `y`/`n` confirmations, `k`/`j`/`g`/`w` in the log viewer)
+> still require a Latin layout; typing text into the draft, the rename
+> editor and the search popups works with any layout.
+
 > **Terminal support:** `Shift+Enter` / `Alt+Enter`, `Ctrl+Shift+F`,
 > `Shift+Ctrl+L` and `Ctrl+M` require a terminal that implements the
 > [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
