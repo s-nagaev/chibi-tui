@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use ratatui::layout::{Position, Rect};
+
 use crate::backend::BackendEvent;
 use crate::diag::LogEntry;
 use crate::markdown;
@@ -11,6 +13,7 @@ use crate::popup::ErrorPopup;
 use crate::protocol::{AgentEventKind, Usage};
 use crate::theme::Theme;
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthChar;
 
 /// Liveness of the backend link as shown by the status-bar indicator.
 ///
@@ -555,6 +558,121 @@ pub struct Submitted {
     pub prompt: String,
 }
 
+/// One endpoint of a mouse text selection, in CHAT DISPLAY-ROW space.
+///
+/// `row` is the index of the wrapped display row within the FULL
+/// transcript (the same row list `ui::render_chat` paints —
+/// scroll-independent, so scrolling during a drag never moves a stored
+/// point) and `col` the 0-based CHAR offset inside that row's visible
+/// text (clamped at the row length by the hit-test).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionPoint {
+    /// Wrapped display row within the full transcript.
+    pub row: usize,
+    /// Char offset inside the row's visible text.
+    pub col: usize,
+}
+
+/// Mouse text selection over the chat transcript: an anchor (press
+/// point) plus a head (current drag point). Session-only VIEW state —
+/// never persisted, never written to history snapshots, cleared on
+/// Esc / a plain click / a thread switch like every other view state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatSelection {
+    /// Position of the initial press.
+    pub anchor: SelectionPoint,
+    /// Position of the latest drag (the selection extends here).
+    pub head: SelectionPoint,
+    /// True between press and release: the drag is live and further
+    /// drag events move the head.
+    pub dragging: bool,
+}
+
+impl ChatSelection {
+    /// Endpoints in ascending (row, col) order — the normalized
+    /// selection range every consumer (highlight, text extraction)
+    /// works with, regardless of the drag direction.
+    pub fn ordered(&self) -> (SelectionPoint, SelectionPoint) {
+        if (self.head.row, self.head.col) < (self.anchor.row, self.anchor.col) {
+            (self.head, self.anchor)
+        } else {
+            (self.anchor, self.head)
+        }
+    }
+}
+
+/// Hit-test metadata of ONE wrapped display row: which logical line it
+/// belongs to and which char range of that line it shows. Produced by
+/// the renderer's own wrap (so hit-testing and painting can never
+/// disagree) and cached per frame on [`App::chat_geometry`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatRowMeta {
+    /// Index of the owning logical line (role header, rendered markdown
+    /// line, thoughts line, trailing blank).
+    pub logical: usize,
+    /// Char offset of the row within its logical line, INCLUSIVE. Break
+    /// spaces dropped by the wrap are covered by no row, so ranges may
+    /// have gaps — matching the wrap exactly.
+    pub start: usize,
+    /// Char offset of the row's end within its logical line, EXCLUSIVE.
+    pub end: usize,
+    /// Plain text of the row (span styles stripped) — the plain-text
+    /// extraction source for the clipboard copy.
+    pub text: String,
+}
+
+/// Render-fed geometry seam for mouse hit-testing (same pattern as
+/// [`App::chat_visible_rows`]): the renderer caches the wrapped-row
+/// model of the frame it just painted, so the mouse router can map a
+/// cursor position onto the exact document position. `chat_id` guards
+/// against a one-iteration staleness window (a mouse event arriving
+/// after a thread switch but before the next draw): a geometry from a
+/// foreign chat is rejected by the consumers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatGeometry {
+    /// Stable thread id the geometry was built for.
+    pub chat_id: String,
+    /// Inner rect of the chat pane the transcript was rendered into.
+    pub inner: Rect,
+    /// Display rows hidden from the top by the current scroll
+    /// (`ui::scroll_skip`), so terminal rows map to document rows.
+    pub skip: usize,
+    /// Per-display-row metadata (same length as the painted row list).
+    pub rows: Vec<ChatRowMeta>,
+}
+
+impl ChatGeometry {
+    /// Map a terminal position onto a document [`SelectionPoint`].
+    /// `None` outside the chat pane's inner rect or with no rows (the
+    /// pane is hit-tested by `ui::panel_region` first; this adds the
+    /// inner-rect and content guards). Terminal rows inside the pane
+    /// but past the last document row clamp to it — dragging below the
+    /// transcript end extends to the end, the conventional behavior.
+    pub fn position_at(&self, column: u16, row: u16) -> Option<SelectionPoint> {
+        if self.rows.is_empty() || !self.inner.contains(Position { x: column, y: row }) {
+            return None;
+        }
+        let visible_row = (row - self.inner.y) as usize;
+        let doc_row = (self.skip + visible_row).min(self.rows.len() - 1);
+        let meta = &self.rows[doc_row];
+        let x = (column - self.inner.x) as usize;
+        // Column → char index: count the chars fully LEFT of the pointer
+        // (display width via unicode-width, so a wide glyph is taken
+        // whole, never half-selected).
+        let mut used = 0usize;
+        let mut col = 0usize;
+        for ch in meta.text.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if used + cw > x {
+                break;
+            }
+            used += cw;
+            col += 1;
+        }
+        Some(SelectionPoint { row: doc_row, col })
+    }
+}
+
 /// Whole UI state.
 ///
 /// There is deliberately NO app-level busy flag: with per-thread async every
@@ -734,6 +852,19 @@ pub struct App {
     /// and flipping it never touches the retained thoughts (render-only
     /// switch).
     pub thoughts_visible: bool,
+    /// mouse text selection over the chat transcript (anchor + head in
+    /// display-row space). Session-only view state: never persisted,
+    /// never written to history snapshots, cleared by Esc / a plain
+    /// click (press+release without drag) / a thread switch (the
+    /// `App::select_chat` seam). `dragging` marks the live press →
+    /// release window.
+    pub selection: Option<ChatSelection>,
+    /// the wrapped-row geometry the renderer painted THIS frame
+    /// ([`ChatGeometry`]), the hit-test seam the mouse router maps
+    /// cursor positions through. Refreshed on every `render_chat`;
+    /// rejected by consumers when its `chat_id` no longer matches the
+    /// active thread.
+    pub chat_geometry: Option<ChatGeometry>,
 }
 
 /// a clone request in flight. The `chat` waits here until the backend
@@ -879,6 +1010,8 @@ impl App {
             pending_control: None,
             last_turn_usage,
             thoughts_visible: true,
+            selection: None,
+            chat_geometry: None,
         }
     }
 
@@ -912,6 +1045,9 @@ impl App {
         }
         self.last_turn_usage = self.chats.get(self.active).and_then(|chat| chat.last_usage);
         self.scroll = 0;
+        // The mouse selection is per-thread view state like the scroll:
+        // entering a thread never shows a selection made in another one.
+        self.selection = None;
     }
 
     pub fn select_next(&mut self) {
@@ -3286,6 +3422,98 @@ impl App {
     /// True when the user is at the bottom (auto-follow new messages).
     pub fn at_bottom(&self) -> bool {
         self.scroll == 0
+    }
+
+    // ---- mouse text selection --------------------------------------------
+
+    /// Start a drag selection: the press point becomes BOTH the anchor and
+    /// the head. Called from the mouse router for a left press inside the
+    /// chat pane (Normal mode, no error popup).
+    pub fn begin_selection(&mut self, point: SelectionPoint) {
+        self.selection = Some(ChatSelection {
+            anchor: point,
+            head: point,
+            dragging: true,
+        });
+    }
+
+    /// Extend the live drag to `point` (moves the head). A no-op without a
+    /// live drag — a drag event after a release must not resurrect the
+    /// selection.
+    pub fn drag_selection(&mut self, point: SelectionPoint) {
+        if let Some(sel) = &mut self.selection {
+            if sel.dragging {
+                sel.head = point;
+            }
+        }
+    }
+
+    /// Finalize the drag (mouse release). A REAL selection (anchor ≠ head)
+    /// is kept on screen and its plain text returned for the clipboard
+    /// copy; a press+release without drag is a PLAIN CLICK: the selection
+    /// clears and nothing is copied. `None` without a live drag.
+    pub fn release_selection(&mut self) -> Option<String> {
+        if !self.selection.as_ref().is_some_and(|sel| sel.dragging) {
+            return None;
+        }
+        let sel = self.selection.as_mut().expect("live drag checked above");
+        sel.dragging = false;
+        if sel.anchor == sel.head {
+            self.selection = None; // plain click
+            return None;
+        }
+        self.selection_text()
+    }
+
+    /// Clear the selection (Esc / a plain click / a thread switch).
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Plain text of the current selection: chars of the wrapped rows
+    /// between the ordered endpoints, CONCATENATED across wrap points of
+    /// the same logical line and newline-SEPARATED at real line breaks
+    /// (a change of the owning logical line). The geometry must belong to
+    /// the active thread, else `None` (the one-iteration staleness guard).
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        let (lo, hi) = sel.ordered();
+        let geom = self.chat_geometry.as_ref()?;
+        if Some(geom.chat_id.as_str()) != self.active_thread_id() {
+            return None;
+        }
+        let last = geom.rows.len().saturating_sub(1);
+        let (lo_row, hi_row) = (lo.row.min(last), hi.row.min(last));
+        let mut out = String::new();
+        let mut prev_end: Option<(usize, usize)> = None; // (logical, row end)
+        for r in lo_row..=hi_row {
+            let meta = &geom.rows[r];
+            match prev_end {
+                // Newline at real line breaks only — never at wrap points.
+                Some((prev_logical, _)) if prev_logical != meta.logical => out.push('\n'),
+                // Same logical line: the wrap may have dropped break space
+                // between the rows (a gap in the char ranges) — restore one
+                // space so words never glue together in the copy.
+                Some((_, prev_row_end)) if meta.start > prev_row_end => out.push(' '),
+                _ => {}
+            }
+            let chars: Vec<char> = meta.text.chars().collect();
+            let start = if r == lo_row {
+                lo.col.min(chars.len())
+            } else {
+                0
+            };
+            let end = if r == hi_row {
+                hi.col.min(chars.len())
+            } else {
+                chars.len()
+            };
+            if end > start {
+                out.extend(&chars[start..end]);
+            }
+            prev_end = Some((meta.logical, meta.end));
+        }
+        Some(out).filter(|text| !text.is_empty())
     }
 }
 
@@ -8282,5 +8510,206 @@ mod tests {
         app.touch_chat(9);
         let after: Vec<String> = app.chats.iter().map(|c| c.name.clone()).collect();
         assert_eq!(snapshot, after, "nothing moved");
+    }
+
+    // ---- mouse text selection --------------------------------------------
+
+    use crate::app::{ChatGeometry, ChatRowMeta, SelectionPoint};
+
+    fn row_meta(logical: usize, start: usize, end: usize, text: &str) -> ChatRowMeta {
+        ChatRowMeta {
+            logical,
+            start,
+            end,
+            text: text.to_owned(),
+        }
+    }
+
+    fn geometry_with_rows(chat_id: &str, rows: Vec<ChatRowMeta>) -> ChatGeometry {
+        ChatGeometry {
+            chat_id: chat_id.to_owned(),
+            inner: Rect::new(26, 1, 94, 10),
+            skip: 0,
+            rows,
+        }
+    }
+
+    fn point(row: usize, col: usize) -> SelectionPoint {
+        SelectionPoint { row, col }
+    }
+
+    /// THE plain-text extraction criterion: chars of the wrapped rows
+    /// between the ordered endpoints, concatenated ACROSS wrap points of
+    /// one logical line and newline-SEPARATED at real line breaks.
+    #[test]
+    fn selection_text_joins_wraps_and_breaks_at_logical_lines() {
+        let mut app = app_with_chats(1);
+        // Logical line 0 ("alpha beta gamma delta") wrapped at width 10
+        // into three rows; logical line 1 is a separate line.
+        app.chat_geometry = Some(geometry_with_rows(
+            &app.chats[0].id,
+            vec![
+                row_meta(0, 0, 10, "alpha beta"),
+                row_meta(0, 11, 16, "gamma"),
+                row_meta(0, 17, 22, "delta"),
+                row_meta(1, 0, 6, "second"),
+            ],
+        ));
+
+        // Wrap-spanning drag within ONE logical line: rows concatenate
+        // without newlines, reverse drag normalized.
+        app.selection = Some(crate::app::ChatSelection {
+            anchor: point(2, 5),
+            head: point(0, 6),
+            dragging: false,
+        });
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some("beta gamma delta"),
+            "wrap points join without newlines"
+        );
+
+        // A drag crossing into the NEXT logical line: the real line break
+        // becomes a newline (mid-word cut included); the wrap gap between
+        // "gamma" and "delta" restores one space.
+        app.selection = Some(crate::app::ChatSelection {
+            anchor: point(1, 0),
+            head: point(3, 4),
+            dragging: false,
+        });
+        assert_eq!(app.selection_text().as_deref(), Some("gamma delta\nseco"));
+
+        // Same logical line only: no newline even across rows.
+        app.selection = Some(crate::app::ChatSelection {
+            anchor: point(1, 0),
+            head: point(2, 5),
+            dragging: false,
+        });
+        assert_eq!(app.selection_text().as_deref(), Some("gamma delta"));
+    }
+
+    /// The extraction is guarded against a geometry from a foreign thread
+    /// (the one-iteration staleness window after a thread switch).
+    #[test]
+    fn selection_text_rejects_a_foreign_chats_geometry() {
+        let mut app = app_with_chats(1);
+        app.chat_geometry = Some(geometry_with_rows(
+            "some-other-thread",
+            vec![row_meta(0, 0, 5, "hello")],
+        ));
+        app.selection = Some(crate::app::ChatSelection {
+            anchor: point(0, 0),
+            head: point(0, 5),
+            dragging: false,
+        });
+        assert_eq!(app.selection_text(), None, "stale geometry is rejected");
+    }
+
+    /// Lifecycle: press starts a live drag, drag moves the head only while
+    /// live, release with a real selection keeps it and extracts the text,
+    /// a plain click (release without drag) clears instead.
+    #[test]
+    fn selection_lifecycle_press_drag_release_and_plain_click() {
+        let mut app = app_with_chats(1);
+        app.chat_geometry = Some(geometry_with_rows(
+            &app.chats[0].id,
+            vec![row_meta(0, 0, 11, "hello world")],
+        ));
+
+        app.begin_selection(point(0, 0));
+        let sel = app.selection.expect("press starts the selection");
+        assert!(sel.dragging);
+
+        app.drag_selection(point(0, 5));
+        app.drag_selection(point(0, 11));
+        assert_eq!(
+            app.selection.expect("still live").head,
+            point(0, 11),
+            "drag moves the head"
+        );
+
+        let text = app.release_selection().expect("real selection copies");
+        assert_eq!(text, "hello world");
+        let sel = app.selection.expect("held after release");
+        assert!(!sel.dragging, "released");
+
+        // Drag AFTER the release must not resurrect/move the selection.
+        app.drag_selection(point(0, 2));
+        assert_eq!(app.selection.expect("held").head, point(0, 11));
+
+        // Plain click: press + release at the same point clears, no copy.
+        app.begin_selection(point(0, 3));
+        assert_eq!(app.release_selection(), None, "plain click copies nothing");
+        assert!(app.selection.is_none(), "plain click clears");
+    }
+
+    /// A selection is cleared by a thread switch (the single
+    /// [`App::select_chat`] seam behind every switching path) and by the
+    /// explicit clear (Esc), and it never lands in the persisted snapshot:
+    /// it lives on [`App`], not on [`Chat`].
+    #[test]
+    fn selection_clears_on_thread_switch_and_is_never_chat_state() {
+        let mut app = app_with_chats(2);
+        app.begin_selection(point(0, 0));
+        app.drag_selection(point(0, 4));
+        assert!(app.selection.is_some());
+
+        app.clear_selection();
+        assert!(app.selection.is_none(), "explicit clear (Esc)");
+
+        app.begin_selection(point(0, 0));
+        app.select_next();
+        assert!(
+            app.selection.is_none(),
+            "thread switch clears the selection"
+        );
+        // The chat struct carries no selection: serialization of a message
+        // snapshot (the persisted unit) is unaffected by the feature.
+        let mut chat = Chat::new("clean");
+        chat.messages.push(crate::model::Message::user("hello"));
+        let json = serde_json::to_string(&chat.messages).unwrap();
+        assert!(
+            !json.contains("selection"),
+            "nothing selection-shaped persisted"
+        );
+    }
+
+    /// [`ChatGeometry::position_at`]: terminal rows map to document rows
+    /// through the scroll offset (skip), columns to char offsets through
+    /// display width, the right edge clamps at the row end, and points
+    /// outside the inner rect are rejected.
+    #[test]
+    fn chat_geometry_position_at_maps_rows_columns_and_clamps() {
+        let rows: Vec<ChatRowMeta> = (0..5)
+            .map(|i| row_meta(i, 0, 4, &format!("r{i}")))
+            .chain([
+                row_meta(5, 0, 11, "hello world"),
+                row_meta(5, 12, 15, "abc"),
+            ])
+            .collect();
+        let geom = ChatGeometry {
+            chat_id: "t".into(),
+            inner: Rect::new(26, 1, 10, 2),
+            skip: 5,
+            rows,
+        };
+        // First visible row = document row 5 (skip); col 0 at the pane edge.
+        assert_eq!(geom.position_at(26, 1), Some(point(5, 0)));
+        // 6 columns in → 6 chars ("hello ") fully left of the pointer.
+        assert_eq!(geom.position_at(32, 1), Some(point(5, 6)));
+        // Second visible row = document row 6; past its end clamps at 3.
+        assert_eq!(geom.position_at(35, 2), Some(point(6, 3)));
+        // Below the pane: rejected (the router clamps drags separately).
+        assert_eq!(geom.position_at(30, 3), None);
+        // Outside the pane horizontally (divider column) too.
+        assert_eq!(geom.position_at(25, 1), None);
+        // No rows at all: nothing to hit.
+        let empty = ChatGeometry {
+            chat_id: "t".into(),
+            inner: Rect::new(26, 1, 10, 2),
+            skip: 0,
+            rows: Vec::new(),
+        };
+        assert_eq!(empty.position_at(26, 1), None);
     }
 }

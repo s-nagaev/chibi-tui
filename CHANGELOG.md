@@ -7,6 +7,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Mouse text selection in the chat view. A left press inside the chat pane
+  anchors a selection, dragging extends it (reversed highlight painted over
+  the wrapped rows — markdown/syntect styling of the unselected text is
+  untouched) and releasing copies the selected PLAIN text to the clipboard
+  through the same transport the log viewer's `y` uses (OSC 52 plus the
+  `CHIBI_TUI_COPY_CMD` fallback; a failed write degrades silently). The
+  extracted text concatenates wrap points of one logical line and puts
+  newlines only at real line breaks. Hit-testing maps the cursor through a
+  render-fed geometry seam (`App::chat_geometry`) built from the renderer's
+  own wrap math, so what you point at is what gets selected. The selection
+  is session-only view state — never persisted — and is cleared by `Esc`, a
+  plain click (press + release without dragging) or a thread switch.
+  Presses under a modal popup or the error popup are swallowed, and the
+  wheel keeps scrolling during a live drag without moving the selection
+  head (it lives in document-row space; the next drag event re-extends it).
+  Documented in the README table and the F1 help modal.
 - Mouse wheel scrolling. The previously dropped `Mouse` events are now
   routed: the wheel over the chat view scrolls it three lines per notch
   through the existing follow-bottom semantics (an upscroll unpins from the

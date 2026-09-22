@@ -785,20 +785,49 @@ enum WheelSurface {
     Panels,
 }
 
-/// Route a crossterm mouse event. Only wheel notches are interpreted —
-/// every other mouse kind (motion, drag, click) is ignored for now.
+/// Route a crossterm mouse event. Wheel notches scroll (chat, sidebar,
+/// modals); left press/drag/release inside the chat pane drive the text
+/// selection (see below). Everything else is ignored.
 ///
 /// Routing rules:
 /// - an open log viewer / help modal / model picker consumes the wheel
 ///   regardless of cursor position, mirroring how those modals swallow
-///   every key;
+///   every key — and their other mouse events stay ignored (a modal owns
+///   the whole screen, so no pointer selection can start under it);
 /// - cursor over the CHAT panel scrolls the chat (`App::scroll_up` unpins
 ///   from follow-bottom, `scroll_down` re-pins at 0; `ui::scroll_skip`
 ///   clamps at render);
 /// - cursor over the SIDEBAR moves the thread selection ONLY while the
 ///   sidebar holds keyboard focus — hovering without focus intentionally
-///   does nothing (hover-switching threads was judged too noisy UX).
+///   does nothing (hover-switching threads was judged too noisy UX);
+/// - a left PRESS inside the chat pane (Normal mode, no error popup)
+///   starts a drag selection through the render-fed `App::chat_geometry`
+///   hit-test seam; DRAG moves the head; RELEASE copies the selected
+///   plain text through the SAME clipboard path as the log viewer's `y`
+///   (`App::release_selection` turns a press+release without drag into a
+///   plain click that clears). Presses outside the chat pane clear the
+///   selection too, and a release is finalized anywhere in the base
+///   surface — the cursor commonly leaves the pane before the button
+///   comes up.
 fn handle_mouse(app: &mut chibi_tui::app::App, mouse: MouseEvent, area: Rect) {
+    handle_mouse_with_copy(app, mouse, area, &|text| {
+        // Selection copy rides the SAME clipboard path as the log
+        // viewer's `y` (OSC 52 + the env fallback); the outcome is
+        // deliberately ignored — a failed write must not disturb the UI.
+        let _ = chibi_tui::clipboard::copy_text(text);
+    });
+}
+
+/// Testable form of [`handle_mouse`]: the clipboard write arrives as a
+/// closure (production passes [`chibi_tui::clipboard::copy_text`], tests
+/// capture into a buffer), so the dispatch flow can assert the copy
+/// without touching a real clipboard.
+fn handle_mouse_with_copy(
+    app: &mut chibi_tui::app::App,
+    mouse: MouseEvent,
+    area: Rect,
+    copy: &dyn Fn(&str),
+) {
     let surface = match &app.mode {
         Mode::LogViewer { .. } => WheelSurface::LogViewer,
         Mode::HelpViewing { .. } => WheelSurface::Help,
@@ -839,17 +868,64 @@ fn handle_mouse(app: &mut chibi_tui::app::App, mouse: MouseEvent, area: Rect) {
         },
         WheelSurface::Panels => {
             let rects = ui::layout_rects(area, app.input_lines_height());
-            match ui::panel_region(&rects, mouse.column, mouse.row) {
-                ui::PanelRegion::Chat => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_up(WHEEL_STEP),
-                    MouseEventKind::ScrollDown => app.scroll_down(WHEEL_STEP),
-                    _ => {}
-                },
-                ui::PanelRegion::Sidebar if app.focus == Focus::Sidebar => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.select_prev(),
-                    MouseEventKind::ScrollDown => app.select_next(),
-                    _ => {}
-                },
+            // Selection presses/drags/releases are Normal-mode-only and
+            // popup-free: popups (confirm dialogs, rename, search) and the
+            // error popup own the whole screen — the pointer must not draw
+            // a selection under them, and events under them are swallowed
+            // (same isolation as the keyboard). A selection started before
+            // a popup opened stays held underneath; a stale live drag is
+            // harmless — the next Normal-mode click or Esc clears it.
+            // The wheel keeps its pre-existing routing below.
+            let selectable = app.mode.is_normal() && app.error_popup.is_none();
+            match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    match ui::panel_region(&rects, mouse.column, mouse.row) {
+                        ui::PanelRegion::Chat => match mouse.kind {
+                            MouseEventKind::ScrollUp => app.scroll_up(WHEEL_STEP),
+                            _ => app.scroll_down(WHEEL_STEP),
+                        },
+                        ui::PanelRegion::Sidebar if app.focus == Focus::Sidebar => {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => app.select_prev(),
+                                _ => app.select_next(),
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Finalize the drag anywhere in the base surface (before
+                // the region hit-test: the release point may have left the
+                // pane).
+                MouseEventKind::Up(crossterm::event::MouseButton::Left) if selectable => {
+                    if let Some(text) = app.release_selection() {
+                        copy(&text);
+                    }
+                }
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) if selectable => {
+                    let in_chat =
+                        ui::panel_region(&rects, mouse.column, mouse.row) == ui::PanelRegion::Chat;
+                    let point = in_chat.then(|| {
+                        app.chat_geometry
+                            .as_ref()
+                            .and_then(|g| g.position_at(mouse.column, mouse.row))
+                    });
+                    match point.flatten() {
+                        Some(point) => app.begin_selection(point),
+                        // A press outside the chat pane is a plain click:
+                        // it clears the selection (the release completes
+                        // the click; nothing live to release).
+                        None => app.clear_selection(),
+                    }
+                }
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left) if selectable => {
+                    if let Some(point) = app
+                        .chat_geometry
+                        .as_ref()
+                        .and_then(|g| g.position_at(mouse.column, mouse.row))
+                    {
+                        app.drag_selection(point);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1285,8 +1361,12 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Down => app.select_next(),
             // Apply & return to the editor, with no submit side effect.
             KeyCode::Enter if key.modifiers.is_empty() => app.focus = Focus::Chat,
-            // Return without touching the draft (never clears input).
-            KeyCode::Esc => app.focus = Focus::Chat,
+            // Return without touching the draft (never clears input);
+            // a mouse selection is cleared like in Normal mode.
+            KeyCode::Esc => {
+                app.clear_selection();
+                app.focus = Focus::Chat;
+            }
             // Everything else is swallowed while the sidebar is focused.
             _ => {}
         }
@@ -1548,10 +1628,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         (KeyCode::PageUp, _) => app.scroll_up(app.chat_visible_rows),
         (KeyCode::PageDown, _) => app.scroll_down(app.chat_visible_rows),
         (KeyCode::Esc, _) if !input_is_empty => {
-            // Non-empty input: clear it.
+            // Non-empty input: clear it (and any mouse selection with it).
+            app.clear_selection();
             app.clear_input();
         }
-        // Esc is ignored when input is empty; it never quits.
+        // Esc with an empty input clears the mouse selection (the
+        // keyboard's "deselect"); it still never quits.
+        (KeyCode::Esc, _) => app.clear_selection(),
         // Only Ctrl+C quits (idle) or cancels (busy).
         // BARE Enter is swallowed here and submitted by the loop's
         // should_submit() gate; Shift+Enter / Alt+Enter fall through to the
@@ -4683,6 +4766,11 @@ mod tests {
             "Wheel ↑ / ↓",
             "scroll the chat · select in the focused sidebar",
         ),
+        (
+            "Global",
+            "Drag-select",
+            "highlight chat text · release copies it",
+        ),
         ("Global", "Esc", "clear the input · dismiss popups"),
         ("Input", "Enter", "send the message (queues while busy)"),
         ("Input", "⇧↵ / ⌥↵", "insert a newline"),
@@ -5432,5 +5520,345 @@ mod tests {
             WHEEL_AREA,
         );
         assert_eq!(selected(&app), 6);
+    }
+
+    // ---- mouse text selection dispatch --------------------------------------
+
+    use chibi_tui::app::ChatSelection;
+
+    /// Render one frame so the renderer caches `App::chat_geometry` (the
+    /// hit-test seam the mouse selection maps positions through).
+    fn render_for_geometry(app: &mut chibi_tui::app::App) {
+        let backend = ratatui::backend::TestBackend::new(WHEEL_AREA.width, WHEEL_AREA.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| chibi_tui::ui::draw(f, app, &chibi_tui::theme::Theme::tokyo_night()))
+            .unwrap();
+    }
+
+    /// Left-button press / drag / release at a terminal position.
+    fn button(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        wheel(kind, column, row)
+    }
+
+    /// THE dispatch flow: press in the chat pane anchors, drag extends,
+    /// release finalizes and copies the plain text through the injected
+    /// clipboard seam.
+    #[test]
+    fn press_drag_release_selects_and_copies_through_the_seam() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("hello world from selection"));
+        render_for_geometry(&mut app);
+
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            // Press at the first content cell of the message row, drag
+            // eleven columns right ("hello world"), release.
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    26,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            assert!(
+                app.selection.as_ref().is_some_and(|s| s.dragging),
+                "press starts the live drag"
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    37,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    40,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+        }
+
+        let sel = app.selection.expect("real selection held after release");
+        assert!(!sel.dragging, "released");
+        assert_eq!(
+            copied.borrow().as_slice(),
+            ["hello world"],
+            "the release copied the selected plain text"
+        );
+    }
+
+    /// A press+release without drag is a plain click: the selection clears
+    /// and nothing is copied.
+    #[test]
+    fn plain_click_clears_and_copies_nothing() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        let sink = &copied;
+        let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+        // Start a real selection first, then plain-click it away.
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        assert!(app.selection.is_some(), "drag held a selection");
+        assert_eq!(
+            copied.borrow().as_slice(),
+            ["text"],
+            "the drag release copied the selection"
+        );
+
+        // Fresh sink for the click phase.
+        let click_copied = std::cell::RefCell::new(Vec::<String>::new());
+        let click_sink = &click_copied;
+        let click_copy = |text: &str| click_sink.borrow_mut().push(text.to_owned());
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &click_copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &click_copy,
+        );
+        assert!(app.selection.is_none(), "plain click cleared");
+        assert!(click_sink.borrow().is_empty(), "plain click copied nothing");
+    }
+
+    /// Esc clears the selection (the keyboard's deselect), including a
+    /// live drag, and never quits.
+    #[test]
+    fn esc_clears_the_mouse_selection() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                34,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_some());
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.selection.is_none(), "Esc cleared the selection");
+        assert!(!app.should_quit);
+    }
+
+    /// A press outside the chat pane (sidebar / chrome rows) is a plain
+    /// click: it clears the selection instead of starting one.
+    #[test]
+    fn press_outside_the_chat_pane_clears_the_selection() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_some(), "precondition");
+
+        // Sidebar press (no focus — no thread switch either).
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                10,
+                5,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_none(), "sidebar press cleared");
+        assert_eq!(app.active, 0, "no hover switching");
+    }
+
+    /// Wheel scrolling during a live drag leaves the head in document-row
+    /// space (the documented choice: the next drag event re-extends the
+    /// selection; scroll alone never moves it) and the scroll itself works.
+    #[test]
+    fn wheel_during_a_drag_scrolls_without_moving_the_head() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("hello world"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                34,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        let head_before = app.selection.expect("live drag").head;
+
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, WHEEL_STEP, "the wheel still scrolls");
+        assert_eq!(
+            app.selection.expect("drag survives the wheel").head,
+            head_before,
+            "scroll does not move the head (document-row space choice)"
+        );
+    }
+
+    /// A selection press while a modal owns the screen (delete-confirm
+    /// popup open) is ignored — the popup owns the pointer too — and a
+    /// selection made before the popup stays held underneath.
+    #[test]
+    fn selection_presses_are_ignored_while_a_modal_is_open() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        // Make a selection, then open the delete-confirm popup.
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_some(), "precondition");
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+
+        // Press under the popup: ignored (the selection is untouched —
+        // the popup branch consumes the mouse like the keyboard).
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(
+            matches!(app.selection, Some(ChatSelection { dragging: true, .. })),
+            "popup press must not start a new selection nor clear"
+        );
     }
 }
