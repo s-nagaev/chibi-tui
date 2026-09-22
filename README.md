@@ -126,17 +126,33 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 | `Shift+Ctrl+L` | Reset the current thread behind a confirmation popup (same confirm/cancel keys): the thread's history is dropped and the local dialog cleared, both while running and when idle (on legacy terminals this degrades to `Ctrl+L` — type `/reset` at the prompt instead) |
 | `F1` | Toggle the keybindings help modal — a centered, scrollable popup listing every active chord |
 
-> **Terminal support:** `Shift+Enter` / `Alt+Enter`, `Ctrl+↑` / `Ctrl+↓`,
-> `Alt+↑` / `Alt+↓`, `Ctrl+Shift+F`, `Shift+Ctrl+L` and `Ctrl+M` require a
-> terminal that implements the
+> **Terminal support:** `Shift+Enter` / `Alt+Enter`, `Ctrl+Shift+F`,
+> `Shift+Ctrl+L` and `Ctrl+M` require a terminal that implements the
 > [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 > (kitty, WezTerm, foot, recent Ghostty, iTerm2, …); chibi-tui requests the
-> protocol at startup, and on terminals without support the request is
-> silently ignored: `Shift+Enter` / `Alt+Enter` degrade to plain `Enter`
-> (sending the message), the thread-switching chords may arrive as plain
-> arrows or an Esc + arrow pair and then just move the cursor,
-> `Ctrl+Shift+F` degrades to `Ctrl+F`, `Shift+Ctrl+L` to `Ctrl+L`, and
-> `Ctrl+M` arrives as bare `Enter`.
+> protocol at startup (on non-Windows builds — see the Windows note below),
+> and on terminals without support the request is silently ignored:
+> `Shift+Enter` / `Alt+Enter` degrade to plain `Enter` (sending the
+> message), `Ctrl+Shift+F` degrades to `Ctrl+F`, `Shift+Ctrl+L` to
+> `Ctrl+L`, and `Ctrl+M` arrives as bare `Enter`.
+> `Ctrl+↑` / `Ctrl+↓` and their `Alt+↑` / `Alt+↓` synonyms do **not** need
+> the protocol: terminals emit modifier-aware legacy sequences for them.
+> They fail only where something outside the app intercepts the chord —
+> macOS Mission Control binds `Ctrl+↑` / `Ctrl+↓` system-wide (use the
+> `Alt` variants there; see the macOS note below), and multiplexers or SSH
+> remotes may swallow the modifier, in which case the chord degrades to a
+> plain arrow (caret move).
+>
+> **Windows:** the kitty keyboard protocol is never requested on Windows
+> builds. Crossterm reads Windows console input through the Win32 console
+> API, which cannot represent kitty sequences, so requesting the protocol
+> would only make kitty-capable terminals (recent Windows Terminal among
+> them) encode keys the console path cannot decode — Ctrl+↑ / Ctrl+↓ thread
+> switching broke exactly this way before the gate. On Windows builds the
+> protocol-dependent chords above (`Shift+Enter`, `Ctrl+Shift+F`,
+> `Shift+Ctrl+L`, `Ctrl+M`) therefore degrade even in kitty-capable
+> terminals, while `Ctrl+↑` / `Ctrl+↓` work through the console API's own
+> modifier reporting.
 
 > **macOS:** the system binds `Ctrl+↑` / `Ctrl+↓` to Mission Control's
 > *Move between spaces*, so prefer the `Alt+↑` / `Alt+↓` variant there (in

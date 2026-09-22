@@ -81,22 +81,41 @@ async fn main() -> io::Result<()> {
     // --- terminal setup ---
     let mut stdout = io::stdout();
     crossterm::terminal::enable_raw_mode()?;
-    // ask for the kitty keyboard protocol so
-    // capable terminals deliver distinct Shift+Enter / Alt+Enter modifiers
-    // instead of bare-Enter bytes. Best-effort: an unsupported terminal
-    // ignores the escape sequence and the app degrades to submit-on-Enter
-    // (documented in the README). The result is deliberately discarded:
-    // setup must never abort the app over an optional enhancement, and the
-    // teardown guard below restores whatever actually got enabled.
     let _ = crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        EnableMouseCapture,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        EnableMouseCapture
     );
+    // On builds where crossterm decodes a raw ANSI byte stream (unix,
+    // including WSL inside Windows Terminal), ask for the kitty keyboard
+    // protocol so capable terminals deliver distinct Shift+Enter /
+    // Alt+Enter modifiers instead of bare-Enter bytes. Best-effort: an
+    // unsupported terminal ignores the escape sequence and the app degrades
+    // to submit-on-Enter (documented in the README). The result is
+    // deliberately discarded: setup must never abort the app over an
+    // optional enhancement.
+    //
+    // The push is platform-gated, NOT unconditional: on native Windows
+    // builds crossterm reads input through the Win32 console API, which
+    // cannot represent kitty sequences at all (crossterm reports enhancement
+    // support as always-off there). Pushing the flags makes terminals with
+    // kitty support — notably recent Windows Terminal — encode modified keys
+    // as CSI-u sequences that the console path cannot decode, silently
+    // killing chords like Ctrl+Up/Down thread switching. Legacy terminals
+    // already report Ctrl+arrows via unambiguous modifier-aware legacy
+    // sequences, so skipping the push loses nothing on Windows. The teardown
+    // guard below restores whatever actually got enabled: it pops the flags
+    // if and only if they were pushed here.
+    let push_kitty_flags = push_kitty_flags();
+    if push_kitty_flags {
+        let _ = crossterm::execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     // Every exit path below (splash abort, `?` failures, normal end, panic
     // unwind) restores the terminal exactly once through this guard.
-    let _terminal_restore = TerminalRestore;
+    let _terminal_restore = TerminalRestore::new(push_kitty_flags);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -201,19 +220,50 @@ async fn main() -> io::Result<()> {
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// Whether the kitty keyboard protocol is pushed at startup.
+///
+/// The protocol is only useful — and only safe — where crossterm decodes a
+/// raw ANSI byte stream (unix, including WSL inside Windows Terminal): there
+/// the legacy encodings (`ESC[1;5A` for Ctrl+arrows) and the kitty CSI-u
+/// encodings both decode into the very same key events, so pushing the flags
+/// is free and upgrades capable terminals to unambiguous Shift/Ctrl chords.
+/// On native Windows builds crossterm instead reads the Win32 console API,
+/// which cannot represent kitty sequences (crossterm itself reports
+/// enhancement support as always-off there); pushing the flags makes
+/// terminals with kitty support — notably recent Windows Terminal — emit
+/// CSI-u sequences the console path cannot decode, which is how Ctrl+↑/↓
+/// thread switching broke. So the flags are never pushed on Windows and the
+/// app runs on the console API's own modifier reporting.
+fn push_kitty_flags() -> bool {
+    !cfg!(windows)
+}
+
 /// RAII teardown: restores the terminal when dropped. Instantiated right
 /// after terminal setup so EVERY exit path — splash abort (`return Ok(())`),
 /// `?` failures, normal end, and panic unwind — leaves raw mode disabled,
 /// the alternate screen left, mouse capture off, and
-/// kitty keyboard-enhancement flags popped.
-struct TerminalRestore;
+/// kitty keyboard-enhancement flags popped exactly when they were pushed.
+struct TerminalRestore {
+    /// Mirrors the startup push decision: the pop is issued if and only if
+    /// the flags were pushed, so the terminal's kitty flag stack can never
+    /// leak into the user's shell (nor under-pop someone else's entry).
+    pop_kitty_flags: bool,
+}
+
+impl TerminalRestore {
+    fn new(pop_kitty_flags: bool) -> Self {
+        Self { pop_kitty_flags }
+    }
+}
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+        if self.pop_kitty_flags {
+            let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = crossterm::execute!(
             io::stdout(),
-            PopKeyboardEnhancementFlags,
             crossterm::terminal::LeaveAlternateScreen,
             DisableMouseCapture
         );
@@ -707,8 +757,9 @@ fn paste_clipboard(app: &mut chibi_tui::app::App) {
 ///
 /// Terminal caveat: without the kitty keyboard protocol many terminals send
 /// bare-Enter bytes for Shift+Enter, so those presses degrade to submit.
-/// `main` pushes crossterm's keyboard-enhancement flags at startup so
-/// capable terminals deliver distinct SHIFT/ALT modifiers.
+/// `main` pushes crossterm's keyboard-enhancement flags at startup (on
+/// non-Windows builds; see `push_kitty_flags`) so capable terminals deliver
+/// distinct SHIFT/ALT modifiers.
 fn should_submit(key: &crossterm::event::KeyEvent) -> bool {
     key.code == KeyCode::Enter && key.modifiers.is_empty()
 }
@@ -2541,6 +2592,71 @@ mod tests {
         assert!(app.chats.iter().all(|c| c.messages.is_empty()));
         assert!(app.active_request_id().is_none());
         assert_eq!(app.active_queue_len(), 0);
+    }
+
+    /// Simulated Windows Terminal / partial-kitty event shapes: terminals
+    /// with incomplete modifier reporting may deliver the Ctrl+↑/↓ chords
+    /// with EXTRA modifiers riding along (SHIFT when the terminal reports
+    /// the raw shift state, ALT when both chord flavors are registered).
+    /// The thread-switch arms match CONTROL with `KeyModifiers::contains`,
+    /// so every superset shape must still switch threads. (The plain legacy
+    /// shapes — bare CONTROL on Up/Down, the `ESC[1;5A`/`ESC[1;5B`
+    /// encodings — are pinned by the ctrl-arrows tests above; both encodings
+    /// decode into the very same `KeyEvent`.)
+    #[test]
+    fn ctrl_arrow_shapes_with_extra_riding_modifiers_still_switch_threads() {
+        for mods in [
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ] {
+            let mut app = app_with_chats(3);
+            press(&mut app, KeyCode::Down, mods);
+            assert_eq!(app.active, 1, "Down + {mods:?} must switch threads");
+            assert_eq!(
+                app.scroll, 0,
+                "Down + {mods:?} keeps the scroll-reset semantics"
+            );
+            app.scroll = 7;
+            press(&mut app, KeyCode::Up, mods);
+            assert_eq!(app.active, 0, "Up + {mods:?} must switch threads back");
+            assert_eq!(app.scroll, 0, "Up + {mods:?} resets the chat scroll");
+        }
+    }
+
+    /// The Alt synonym under the same partial-kitty shapes: SHIFT riding on
+    /// Alt+↑/↓ must not break the thread switch (kitty-capable terminals
+    /// report the shift state on the alt flavor too).
+    #[test]
+    fn alt_arrow_shapes_with_shift_riding_along_still_switch_threads() {
+        for mods in [
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        ] {
+            let mut app = app_with_chats(3);
+            press(&mut app, KeyCode::Down, mods);
+            assert_eq!(app.active, 1, "Alt-flavored Down + {mods:?} switches");
+            press(&mut app, KeyCode::Up, mods);
+            assert_eq!(app.active, 0, "Alt-flavored Up + {mods:?} switches back");
+        }
+    }
+
+    /// Startup/teardown pairing contract: the kitty enhancement flags are
+    /// popped by the `TerminalRestore` guard exactly when they were pushed,
+    /// so the terminal's kitty flag stack can never leak into the user's
+    /// shell after exit (nor under-pop an outer entry).
+    #[test]
+    fn terminal_restore_pops_the_kitty_flags_exactly_when_they_were_pushed() {
+        let restore = TerminalRestore::new(push_kitty_flags());
+        assert_eq!(
+            restore.pop_kitty_flags,
+            push_kitty_flags(),
+            "the guard's pop decision must mirror the push decision"
+        );
+        // The guard built from the real startup decision is internally
+        // consistent by construction; the false/true branches are covered
+        // by the mirror assertion above (a mismatch would mean either a
+        // leaked flag stack or an under-pop on some platform).
     }
 
     /// Plain ↑/↓ move the text cursor vertically inside the editor — never

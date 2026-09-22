@@ -136,6 +136,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keep their roles, and reconnect respawns the same new command.
 
 ### Fixed
+- Ctrl+↑ / Ctrl+↓ thread switching works on Windows again: the app pushed
+  the kitty keyboard-protocol enhancement flags unconditionally at startup,
+  but on native Windows crossterm reads input through the Win32 console API,
+  which cannot represent kitty sequences — terminals with kitty support
+  (recent Windows Terminal among them) then encoded modified keys as CSI-u
+  sequences the console path could not decode, silently killing the chord.
+  The protocol is now requested only on non-Windows builds (see
+  `push_kitty_flags()` in `main.rs`), where legacy (`ESC[1;5A`) and kitty
+  CSI-u encodings both decode into the same key events; the exit guard pops
+  the flags if and only if they were pushed, so the terminal's kitty flag
+  stack can never leak into the shell. The README's terminal-support notes
+  now describe this per-platform behavior honestly (the protocol-dependent
+  chords degrade on Windows builds even in kitty-capable terminals, while
+  Ctrl+arrows work everywhere the terminal doesn't intercept them itself).
 - Thoughts now belong to their thread: the dim reasoning block above the
   latest answer was a single app-global field that ANY chat's terminal frame
   wrote and ANY request start wiped, so a hidden model-picker exchange (or a
