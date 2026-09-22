@@ -7,6 +7,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Mouse wheel scrolling. The previously dropped `Mouse` events are now
+  routed: the wheel over the chat view scrolls it three lines per notch
+  through the existing follow-bottom semantics (an upscroll unpins from the
+  tail, scrolling back down re-pins, the render-side clamp bounds the
+  offset); with the sidebar holding keyboard focus, the wheel over it moves
+  the thread selection with the same live-switching behavior as the arrow
+  keys — hovering without focus intentionally does nothing. The open log
+  viewer, help modal and model picker consume the wheel wherever the cursor
+  is, mirroring their modal keyboard isolation. Routing hit-tests the
+  cursor against a shared `ui::layout_rects` / `ui::panel_region` seam that
+  recomputes the exact frame layout (no cached geometry), so rendering and
+  hit-testing can never disagree — and the mouse text-selection work can
+  reuse the same abstraction. The keybindings help modal and the README
+  table document the new interaction.
 - Keybindings help modal (`F1`): a centered popup listing every active chord
   — global keys, input editing, sidebar navigation, rename/delete
   confirmations, model picker, both search popups, the log viewer and the

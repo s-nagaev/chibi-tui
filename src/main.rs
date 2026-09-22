@@ -27,9 +27,11 @@ use std::time::Duration;
 use clap::Parser;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use futures_util::StreamExt;
+use ratatui::layout::Rect;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -562,7 +564,16 @@ async fn run_loop(
                         // for the next event.
                         terminal.draw(|f| ui::draw(f, &mut app, theme))?;
                     }
-                    Some(Ok(_)) => {}                     // mouse etc.
+                    Some(Ok(CtEvent::Mouse(mouse))) => {
+                        // Wheel routing hit-tests against the SAME layout the
+                        // renderer just painted: the panel rectangles are
+                        // recomputed from the live frame size — there is no
+                        // cached geometry anywhere in the render path.
+                        let size = terminal.size()?;
+                        let area = Rect::new(0, 0, size.width, size.height);
+                        handle_mouse(&mut app, mouse, area);
+                    }
+                    Some(Ok(_)) => {} // focus, paste, other crossterm events
                     Some(Err(e)) => return Err(io::Error::other(e)),
                     None => {} // stream ended; keep looping until quit
                 }
@@ -760,6 +771,91 @@ fn paste_clipboard(app: &mut chibi_tui::app::App) {
 /// `main` pushes crossterm's keyboard-enhancement flags at startup (on
 /// non-Windows builds; see `push_kitty_flags`) so capable terminals deliver
 /// distinct SHIFT/ALT modifiers.
+/// Wheel step per notch: chat rows in the chat panel, one step per entry /
+/// line in the modal list surfaces.
+const WHEEL_STEP: u16 = 3;
+
+/// Which surface receives the wheel: a modal that owns the screen gets it
+/// wherever the cursor is (same modal isolation as the keyboard), the base
+/// panels get it routed by cursor position.
+enum WheelSurface {
+    LogViewer,
+    Help,
+    ModelPicker,
+    Panels,
+}
+
+/// Route a crossterm mouse event. Only wheel notches are interpreted —
+/// every other mouse kind (motion, drag, click) is ignored for now.
+///
+/// Routing rules:
+/// - an open log viewer / help modal / model picker consumes the wheel
+///   regardless of cursor position, mirroring how those modals swallow
+///   every key;
+/// - cursor over the CHAT panel scrolls the chat (`App::scroll_up` unpins
+///   from follow-bottom, `scroll_down` re-pins at 0; `ui::scroll_skip`
+///   clamps at render);
+/// - cursor over the SIDEBAR moves the thread selection ONLY while the
+///   sidebar holds keyboard focus — hovering without focus intentionally
+///   does nothing (hover-switching threads was judged too noisy UX).
+fn handle_mouse(app: &mut chibi_tui::app::App, mouse: MouseEvent, area: Rect) {
+    let surface = match &app.mode {
+        Mode::LogViewer { .. } => WheelSurface::LogViewer,
+        Mode::HelpViewing { .. } => WheelSurface::Help,
+        Mode::ModelPicking { .. } => WheelSurface::ModelPicker,
+        _ => WheelSurface::Panels,
+    };
+    match surface {
+        WheelSurface::LogViewer => match mouse.kind {
+            MouseEventKind::ScrollUp => app.log_cursor_up(usize::from(WHEEL_STEP)),
+            MouseEventKind::ScrollDown => app.log_cursor_down(usize::from(WHEEL_STEP)),
+            _ => {}
+        },
+        WheelSurface::Help => match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                for _ in 0..WHEEL_STEP {
+                    app.help_scroll_up();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                for _ in 0..WHEEL_STEP {
+                    app.help_scroll_down();
+                }
+            }
+            _ => {}
+        },
+        WheelSurface::ModelPicker => match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                for _ in 0..WHEEL_STEP {
+                    app.model_picker_select_prev();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                for _ in 0..WHEEL_STEP {
+                    app.model_picker_select_next();
+                }
+            }
+            _ => {}
+        },
+        WheelSurface::Panels => {
+            let rects = ui::layout_rects(area, app.input_lines_height());
+            match ui::panel_region(&rects, mouse.column, mouse.row) {
+                ui::PanelRegion::Chat => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_up(WHEEL_STEP),
+                    MouseEventKind::ScrollDown => app.scroll_down(WHEEL_STEP),
+                    _ => {}
+                },
+                ui::PanelRegion::Sidebar if app.focus == Focus::Sidebar => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.select_prev(),
+                    MouseEventKind::ScrollDown => app.select_next(),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
 fn should_submit(key: &crossterm::event::KeyEvent) -> bool {
     key.code == KeyCode::Enter && key.modifiers.is_empty()
 }
@@ -4582,6 +4678,11 @@ mod tests {
         ),
         ("Global", "Ctrl+↑/↓ · Alt+↑/↓", "switch the active thread"),
         ("Global", "PgUp / PgDn", "scroll the chat view"),
+        (
+            "Global",
+            "Wheel ↑ / ↓",
+            "scroll the chat · select in the focused sidebar",
+        ),
         ("Global", "Esc", "clear the input · dismiss popups"),
         ("Input", "Enter", "send the message (queues while busy)"),
         ("Input", "⇧↵ / ⌥↵", "insert a newline"),
@@ -5111,5 +5212,225 @@ mod tests {
             app.help_scroll_down();
         }
         assert_eq!(scroll(&app), total.saturating_sub(page));
+    }
+
+    // ---- mouse wheel routing --------------------------------------------
+
+    /// Hand-built wheel notch at a terminal position, as crossterm delivers it.
+    fn wheel(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    use crossterm::event::MouseEventKind;
+
+    /// 120×40 frame: sidebar cols 0..=25, chat cols 26.., chrome rows 37..39.
+    const WHEEL_AREA: Rect = Rect::new(0, 0, 120, 40);
+
+    #[test]
+    fn wheel_up_over_the_chat_unpins_from_follow_bottom_by_the_wheel_step() {
+        let mut app = app_with_chats(1);
+        assert!(app.at_bottom(), "opens pinned to the tail");
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 3, "one notch = WHEEL_STEP rows");
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 6);
+        assert!(!app.at_bottom());
+    }
+
+    #[test]
+    fn wheel_down_over_the_chat_returns_to_follow_bottom() {
+        let mut app = app_with_chats(1);
+        app.scroll_up(6);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 3);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 0, "saturates at 0 = follow-bottom re-pinned");
+        assert!(app.at_bottom());
+        // further down-notches stay pinned: scroll can never go negative.
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn wheel_over_the_sidebar_without_focus_does_nothing() {
+        use chibi_tui::app::Focus;
+        let mut app = app_with_chats(3);
+        assert_eq!(app.focus, Focus::Chat);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 10, 5),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.active, 0, "hovering must never switch threads");
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.scroll, 0, "sidebar hover never scrolls the chat either");
+    }
+
+    #[test]
+    fn wheel_over_the_focused_sidebar_moves_the_selection() {
+        use chibi_tui::app::Focus;
+        let mut app = app_with_chats(3);
+        app.focus = Focus::Sidebar;
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 10, 5),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.active, 1, "wheel down = next thread (live switching)");
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(app.active, 0, "wheel up = previous thread");
+        // The top clamp holds: no wraparound past the first thread.
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn wheel_over_the_chrome_rows_is_ignored() {
+        let mut app = app_with_chats(2);
+        // spinner / input / hints rows (y >= 37) are no panel.
+        for row in [37, 38, 39] {
+            handle_mouse(
+                &mut app,
+                wheel(MouseEventKind::ScrollUp, 60, row),
+                WHEEL_AREA,
+            );
+            handle_mouse(
+                &mut app,
+                wheel(MouseEventKind::ScrollDown, 60, row),
+                WHEEL_AREA,
+            );
+        }
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn non_wheel_mouse_events_are_ignored() {
+        let mut app = app_with_chats(2);
+        app.scroll_up(9);
+        let kinds = [
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            MouseEventKind::Moved,
+        ];
+        for kind in kinds {
+            handle_mouse(&mut app, wheel(kind, 60, 10), WHEEL_AREA);
+            handle_mouse(&mut app, wheel(kind, 10, 5), WHEEL_AREA);
+        }
+        assert_eq!(app.scroll, 9, "clicks/drag/motion never touch the scroll");
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn wheel_inside_the_open_help_modal_scrolls_the_table() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        let scroll = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::HelpViewing { state } => state.scroll,
+            _ => panic!("modal must stay open"),
+        };
+        // The modal owns the wheel wherever the cursor is — same isolation
+        // as the keyboard.
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(scroll(&app), 3, "three lines per notch");
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(scroll(&app), 0, "clamped at the top edge");
+    }
+
+    #[test]
+    fn wheel_inside_the_open_log_viewer_moves_the_cursor() {
+        let mut app = app_with_chats(1);
+        app.mode = chibi_tui::app::Mode::LogViewer {
+            state: log_viewer_state(
+                5,
+                vec![
+                    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                ],
+                None,
+            ),
+        };
+        let cursor = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.cursor,
+            _ => panic!("viewer must stay open"),
+        };
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(cursor(&app), 2, "wheel up walks three logical lines up");
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(cursor(&app), 8);
+    }
+
+    #[test]
+    fn wheel_inside_the_open_model_picker_moves_the_selection() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 10);
+        let selected = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::ModelPicking { state } => state.selected,
+            _ => panic!("picker must stay open"),
+        };
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(selected(&app), 3, "wheel down walks three rows");
+        // The bottom clamp holds: no wraparound past the last row.
+        for _ in 0..10 {
+            handle_mouse(
+                &mut app,
+                wheel(MouseEventKind::ScrollDown, 60, 10),
+                WHEEL_AREA,
+            );
+        }
+        assert_eq!(selected(&app), 9);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(selected(&app), 6);
     }
 }

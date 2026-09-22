@@ -118,6 +118,7 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 | `Shift+Enter` / `Alt+Enter` | Insert a newline into the input (multi-line prompts) |
 | `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
 | `PgUp` / `PgDn` | Scroll the chat view up/down one page (on macOS laptops without Page keys, `fn`+`↑` / `fn`+`↓` are equivalent) |
+| Mouse wheel ↑ / ↓ | Scroll the chat view three lines per notch while the cursor is over it (scrolling back down to the end re-pins follow-bottom); with the Sidebar focused, the wheel over it moves the thread selection (no switching on hover without focus). In the log viewer / help modal / model picker, the wheel works wherever the cursor is |
 | `Esc` | Clear the input or dismiss a popup; while the Sidebar holds focus, it just returns focus to Chat without touching the draft |
 | `Ctrl+V` | Paste from the clipboard (macOS: Cmd+V) |
 | `Ctrl+A` / `Ctrl+E` | Move the cursor to the start / end of the line |
