@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyModifiers,
-    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CtEvent, EventStream, KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use futures_util::StreamExt;
 use ratatui::layout::Rect;
@@ -89,6 +89,21 @@ async fn main() -> io::Result<()> {
         crossterm::terminal::EnterAlternateScreen,
         EnableMouseCapture
     );
+    // Bracketed paste: ask the terminal to wrap clipboard pastes in
+    // `\e[200~ ... \e[201~` so a multi-line paste arrives as ONE crossterm
+    // `Event::Paste` instead of a raw keystroke flood. Without the brackets a
+    // three-line paste is decoded as ordinary typing — every embedded newline
+    // becomes a bare Enter key event and fires a submit (the bug this guards
+    // against). Best-effort, same policy as the kitty flags: an unsupported
+    // terminal ignores the escape sequence and `handle_paste` degrades to the
+    // Ctrl+V clipboard path. Platform-gated like the kitty push: on native
+    // Windows crossterm reads input through the Win32 console API, which
+    // never synthesizes `Event::Paste`, so pushing the sequence there is a
+    // no-op at best.
+    let enable_bracketed_paste = !cfg!(windows);
+    if enable_bracketed_paste {
+        let _ = crossterm::execute!(stdout, EnableBracketedPaste);
+    }
     // On builds where crossterm decodes a raw ANSI byte stream (unix,
     // including WSL inside Windows Terminal), ask for the kitty keyboard
     // protocol so capable terminals deliver distinct Shift+Enter /
@@ -118,7 +133,7 @@ async fn main() -> io::Result<()> {
     }
     // Every exit path below (splash abort, `?` failures, normal end, panic
     // unwind) restores the terminal exactly once through this guard.
-    let _terminal_restore = TerminalRestore::new(push_kitty_flags);
+    let _terminal_restore = TerminalRestore::new(push_kitty_flags, enable_bracketed_paste);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -244,18 +259,27 @@ fn push_kitty_flags() -> bool {
 /// RAII teardown: restores the terminal when dropped. Instantiated right
 /// after terminal setup so EVERY exit path — splash abort (`return Ok(())`),
 /// `?` failures, normal end, and panic unwind — leaves raw mode disabled,
-/// the alternate screen left, mouse capture off, and
-/// kitty keyboard-enhancement flags popped exactly when they were pushed.
+/// the alternate screen left, mouse capture off,
+/// kitty keyboard-enhancement flags popped exactly when they were pushed,
+/// and bracketed paste mode disabled exactly when it was enabled.
 struct TerminalRestore {
     /// Mirrors the startup push decision: the pop is issued if and only if
     /// the flags were pushed, so the terminal's kitty flag stack can never
     /// leak into the user's shell (nor under-pop someone else's entry).
     pop_kitty_flags: bool,
+    /// Mirrors the startup enable decision: bracketed paste is a terminal
+    /// MODE (not a stack), so it is turned off if and only if it was turned
+    /// on here — never blind, to avoid un-bracketing someone else's paste
+    /// mode on exit.
+    disable_bracketed_paste: bool,
 }
 
 impl TerminalRestore {
-    fn new(pop_kitty_flags: bool) -> Self {
-        Self { pop_kitty_flags }
+    fn new(pop_kitty_flags: bool, disable_bracketed_paste: bool) -> Self {
+        Self {
+            pop_kitty_flags,
+            disable_bracketed_paste,
+        }
     }
 }
 
@@ -264,6 +288,9 @@ impl Drop for TerminalRestore {
         let _ = crossterm::terminal::disable_raw_mode();
         if self.pop_kitty_flags {
             let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        if self.disable_bracketed_paste {
+            let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
         }
         let _ = crossterm::execute!(
             io::stdout(),
@@ -574,7 +601,14 @@ async fn run_loop(
                         let area = Rect::new(0, 0, size.width, size.height);
                         handle_mouse(&mut app, mouse, area);
                     }
-                    Some(Ok(_)) => {} // focus, paste, other crossterm events
+                    Some(Ok(CtEvent::Paste(text))) => {
+                        // A bracketed paste is NOT a key: it never reaches
+                        // `handle_key`, can never match bare Enter, and can
+                        // never submit. The whole payload — newlines
+                        // included — lands in the draft in one insert.
+                        handle_paste(&mut app, &text);
+                    }
+                    Some(Ok(_)) => {} // focus and other crossterm events
                     Some(Err(e)) => return Err(io::Error::other(e)),
                     None => {} // stream ended; keep looping until quit
                 }
@@ -747,14 +781,38 @@ fn note_active_thread(
     *tracked = current;
 }
 
+/// Paste text into the input draft at the cursor — the shared sink for BOTH
+/// paste entry points: the Ctrl+V / Cmd+V clipboard read and the terminal's
+/// bracketed-paste event (`Event::Paste`).
+///
+/// Never submits. Newlines are hard newlines in the draft (the editor's
+/// `insert_str` splits them into lines), matching tui-textarea 0.7's paste
+/// behavior; `should_submit` stays the ONLY submit path and it runs on bare
+/// Enter key events alone — a paste event carries no key at all.
+///
+/// CRLF (Windows) and bare CR (classic Mac) line endings are normalized to
+/// `\n` before insertion so a foreign clipboard never leaves stray `\r`
+/// characters in the draft.
+///
+/// Paste is editor-scoped: while a modal popup, rename, search viewer or the
+/// sidebar holds the keyboard, the paste is swallowed — a flood of pasted
+/// text must never mutate the message draft that a popup's Enter would
+/// otherwise submit.
+fn handle_paste(app: &mut chibi_tui::app::App, text: &str) {
+    if !app.mode.is_normal() || app.focus != Focus::Chat {
+        return;
+    }
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.is_empty() {
+        app.input.insert_str(&normalized);
+    }
+}
+
 /// Paste text from the system clipboard into the input field at the cursor.
 /// Failures are silent — a locked clipboard must not disturb typing.
 fn paste_clipboard(app: &mut chibi_tui::app::App) {
     if let Some(text) = chibi_tui::clipboard::get_text() {
-        let cleaned: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
-        if !cleaned.is_empty() {
-            app.input.insert_str(&cleaned);
-        }
+        handle_paste(app, &text);
     }
 }
 
@@ -2917,19 +2975,84 @@ mod tests {
     /// Startup/teardown pairing contract: the kitty enhancement flags are
     /// popped by the `TerminalRestore` guard exactly when they were pushed,
     /// so the terminal's kitty flag stack can never leak into the user's
-    /// shell after exit (nor under-pop an outer entry).
+    /// shell after exit (nor under-pop an outer entry). Bracketed paste is
+    /// disabled by the same guard exactly when it was enabled — a terminal
+    /// MODE, not a stack, so the guard must never toggle it blind.
     #[test]
     fn terminal_restore_pops_the_kitty_flags_exactly_when_they_were_pushed() {
-        let restore = TerminalRestore::new(push_kitty_flags());
+        let restore = TerminalRestore::new(push_kitty_flags(), !cfg!(windows));
         assert_eq!(
             restore.pop_kitty_flags,
             push_kitty_flags(),
             "the guard's pop decision must mirror the push decision"
         );
+        assert_eq!(
+            restore.disable_bracketed_paste,
+            !cfg!(windows),
+            "the guard's disable decision must mirror the enable decision"
+        );
         // The guard built from the real startup decision is internally
         // consistent by construction; the false/true branches are covered
         // by the mirror assertion above (a mismatch would mean either a
         // leaked flag stack or an under-pop on some platform).
+    }
+
+    /// A bracketed multi-line paste inserts ALL lines into the draft as hard
+    /// newlines and NEVER submits — the paste event carries no key, so bare
+    /// Enter (the only submit path) can never fire from a paste. Regression
+    /// for the hand-tested bug: a three-line paste used to fire three
+    /// submits because the terminal delivered the paste as raw keystrokes
+    /// (no bracketed-paste mode) and each embedded newline decoded into a
+    /// submitting Enter.
+    #[test]
+    fn bracketed_multiline_paste_inserts_lines_without_submitting() {
+        let mut app = app_with_chats(1);
+        handle_paste(&mut app, "line one\nline two\nline three");
+        assert_eq!(
+            app.input.lines(),
+            ["line one", "line two", "line three"],
+            "the whole paste lands in the draft, newlines intact"
+        );
+        assert_eq!(app.input.cursor(), (2, 10));
+        // No submit happened: the draft is still there for the user to send.
+        assert!(app.take_input().is_some());
+    }
+
+    /// Windows (`\r\n`) and classic-Mac (`\r`) line endings normalize to
+    /// `\n` on paste — a foreign clipboard never leaves stray `\r` chars in
+    /// the draft.
+    #[test]
+    fn paste_normalizes_crlf_and_bare_cr_to_newlines() {
+        let mut app = app_with_chats(1);
+        handle_paste(&mut app, "alpha\r\nbeta\rgamma");
+        assert_eq!(app.input.lines(), ["alpha", "beta", "gamma"]);
+    }
+
+    /// Pasting into a non-empty draft splits lines at the caret: the tail of
+    /// the caret's line wraps to the last pasted line, exactly like
+    /// tui-textarea 0.7's `insert_str`.
+    #[test]
+    fn paste_mid_text_splits_lines_at_caret() {
+        let mut app = app_with_chats(1);
+        for ch in "hello".chars() {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        // Walk the caret back into the middle of "hello" (between 'l' and 'o').
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        handle_paste(&mut app, "X\nY");
+        assert_eq!(app.input.lines(), ["hellX", "Yo"]);
+        assert_eq!(app.input.cursor(), (1, 1));
+    }
+
+    /// Paste is editor-scoped: while the sidebar owns the keyboard, a
+    /// bracketed paste must be swallowed — it can never fill a draft the
+    /// sidebar's own Enter would submit.
+    #[test]
+    fn paste_into_sidebar_focus_is_swallowed() {
+        let mut app = app_with_chats(1);
+        app.focus = Focus::Sidebar;
+        handle_paste(&mut app, "should not land\nanywhere");
+        assert!(app.input.lines().iter().all(|l| l.is_empty()));
     }
 
     /// Plain ↑/↓ move the text cursor vertically inside the editor — never
