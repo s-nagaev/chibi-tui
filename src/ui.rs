@@ -4,7 +4,6 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::block::Title;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -704,7 +703,7 @@ fn context_usage_segment(usage: &Usage) -> String {
     }
 }
 
-/// the strip as a right-aligned top-border [`Title`] for
+/// the strip as a right-aligned top-border title [`Line`] for
 /// the chat pane, dim-styled. Squeezed into the columns LEFT of the
 /// left-aligned header title (1-column gutter): too-narrow panes yield
 /// `None` and the strip simply does not render this frame.
@@ -713,7 +712,7 @@ fn status_strip_title<'a>(
     theme: &Theme,
     area_width: u16,
     left_title: &str,
-) -> Option<Title<'a>> {
+) -> Option<Line<'a>> {
     let gutter = 1u16;
     let available = area_width.saturating_sub(left_title.width() as u16 + gutter) as usize;
     if available == 0 {
@@ -721,10 +720,8 @@ fn status_strip_title<'a>(
     }
     let text = left_truncate_ellipsis(&status_strip_text(app, available), available);
     // Alignment rides on the Line itself (ratatui groups top titles by the
-    // line's own alignment; `Title::alignment` is deprecated in 0.29).
-    Some(Title::from(
-        Line::from(Span::styled(text, Style::new().fg(theme.dim))).alignment(Alignment::Right),
-    ))
+    // line's own alignment; the old `block::Title` struct is gone in 0.30).
+    Some(Line::from(Span::styled(text, Style::new().fg(theme.dim))).alignment(Alignment::Right))
 }
 
 /// left-truncate to at most `max` display columns,
@@ -790,7 +787,7 @@ fn render_scroll_hint(f: &mut Frame, at_bottom: bool, theme: &Theme, spinner_lin
 /// the editor block is tinted with the
 /// input-panel background across EVERY of its rows and carries a cyan `❯`
 /// marker on its FIRST row. The typed text renders INSIDE the remaining
-/// columns over the full block height — tui-textarea keeps the cursor
+/// columns over the full block height — the editor keeps the cursor
 /// visible inside that viewport automatically, scrolling the LAST visible
 /// row toward the caret once the buffer exceeds
 /// [`MAX_INPUT_LINES`](crate::app::MAX_INPUT_LINES) lines.
@@ -1571,7 +1568,7 @@ pub struct HotkeyRow {
 }
 
 /// The SINGLE source of truth for the help modal's content: every chord the
-/// key dispatch (`main.rs::handle_key` + the tui-textarea fall-through)
+/// key dispatch (`main.rs::handle_key` + the readline fall-through)
 /// actually handles, grouped by surface. The dispatch itself is inline match
 /// arms with no action enum to reuse, so this const table sits next to the
 /// render; `main.rs`'s test module pins it against the live handlers with a
@@ -3485,7 +3482,7 @@ mod tests {
     fn textarea_view_follows_caret_beyond_twenty_line_cap() {
         let mut app = App::new(vec![Chat::new("chat")]);
         let lines: Vec<String> = (0..23).map(|i| format!("zzq{i:02}")).collect();
-        app.input.insert_str(lines.join("\n"));
+        app.input.insert_str(&lines.join("\n"));
         assert_eq!(app.input_lines_height(), crate::app::MAX_INPUT_LINES as u16);
 
         let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 50);
@@ -5289,12 +5286,12 @@ mod tests {
 
     // selection auto-scroll ------------------------------
 
-    /// Type into the prompt textarea through tui-textarea directly (test
+    /// Type into the prompt editor through the in-house input directly (test
     /// helper shared by marker tests).
     fn type_text_into_input(app: &mut App, text: &str) {
         for ch in text.chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(crate::input::Input {
+                key: crate::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,

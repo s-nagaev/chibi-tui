@@ -6,13 +6,13 @@ use ratatui::layout::{Position, Rect};
 
 use crate::backend::BackendEvent;
 use crate::diag::LogEntry;
+use crate::input::InputArea;
 use crate::markdown;
 use crate::model::{ChatLifecycle, Message};
 use crate::model_picker::{parse_model_listing, parse_selection_confirmation, ModelEntry};
 use crate::popup::ErrorPopup;
 use crate::protocol::{AgentEventKind, Usage};
 use crate::theme::Theme;
-use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
 /// Liveness of the backend link as shown by the status-bar indicator.
@@ -686,7 +686,7 @@ pub struct App {
     /// PgUp/PgDn can scroll exactly one page of rows. Defaults to 20
     /// (a conservative page size) until the first render.
     pub chat_visible_rows: u16,
-    pub input: TextArea<'static>,
+    pub input: InputArea,
     pub spinner_frame: usize,
     pub should_quit: bool,
     /// Modal error popup (backend failures). When set, it captures input
@@ -959,7 +959,7 @@ pub fn is_transport_failure(message: &str) -> bool {
 
 impl App {
     pub fn new(chats: Vec<Chat>) -> Self {
-        let mut input = TextArea::default();
+        let mut input = InputArea::default();
         input.set_placeholder_text("Type a message…  (\u{23ce} send)");
         // Restore seam: threads carry their last known usage/model across
         // restarts, so the sticky display state is seeded from the snapshot
@@ -2333,8 +2333,8 @@ impl App {
         if text.is_empty() {
             return None;
         }
-        // Reset the TextArea in place, keeping its placeholder.
-        self.input = TextArea::default();
+        // Reset the editor in place, keeping its placeholder.
+        self.input = InputArea::default();
         self.input
             .set_placeholder_text("Type a message…  (\u{23ce} send)");
 
@@ -2465,11 +2465,11 @@ impl App {
     /// Clear the whole input buffer and park the cursor at the start
     /// (`Ctrl+L`).
     ///
-    /// The TextArea is rebuilt in place so its placeholder survives; undo
+    /// The editor is rebuilt in place so its placeholder survives; kill-ring
     /// history is intentionally reset too — a "clear" that can be undone by
     /// a stray Ctrl+U surprises more than it helps.
     pub fn clear_input(&mut self) {
-        self.input = TextArea::default();
+        self.input = InputArea::default();
         self.input
             .set_placeholder_text("Type a message…  (\u{23ce} send)");
     }
@@ -3758,8 +3758,8 @@ mod tests {
 
     fn type_in(app: &mut App, text: &str) {
         for ch in text.chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(crate::input::Input {
+                key: crate::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -4966,7 +4966,7 @@ mod tests {
     #[test]
     fn empty_input_is_never_submitted_and_state_stays_idle() {
         let mut app = app_with_chats(1);
-        app.input.input(tui_textarea::Input::default());
+        app.input.input(crate::input::Input::default());
         assert!(app.take_input().is_none(), "whitespace-only is rejected");
         assert!(!app.is_busy());
         assert!(app.active_request_id().is_none());
@@ -5948,7 +5948,7 @@ mod tests {
         );
         assert_eq!(
             app.input.placeholder_text(),
-            "Type a message…  (\u{23ce} send)"
+            Some("Type a message…  (\u{23ce} send)")
         );
     }
 

@@ -15,8 +15,9 @@
 //!   dismisses, `q`/`Ctrl+C` quit) instead of crashing or being silently dropped;
 //! * connection state is shown in the status bar
 //!   (`● connected / connecting… / disconnected (press R)`);
-//! * readline-style input keys (`Ctrl+A/E/U/L`, word ops via tui-textarea)
-//!   plus clipboard paste (`Ctrl+V`, macOS Cmd+V).
+//! * readline-style input keys (`Ctrl+A/E/U/L`, word ops via the in-house
+//!   readline editor `input.rs`), plus clipboard paste (`Ctrl+V`, macOS
+//!   Cmd+V).
 //!
 //! All logic lives in the library crate (`lib.rs`); this binary only wires
 //! the terminal.
@@ -752,7 +753,7 @@ fn paste_clipboard(app: &mut chibi_tui::app::App) {
     if let Some(text) = chibi_tui::clipboard::get_text() {
         let cleaned: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
         if !cleaned.is_empty() {
-            app.input.insert_str(cleaned);
+            app.input.insert_str(&cleaned);
         }
     }
 }
@@ -1371,7 +1372,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                     // is ignored: the draft is a plain single-line string, so
                     // only typing + backspace exist. Ctrl combos never reach
                     // here except modifiers-only presses, which are no-ops.
-                    let _ = tui_textarea::Input::from(key);
+                    let _ = chibi_tui::input::Input::from(key);
                 }
             }
         }
@@ -1486,13 +1487,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // a plain char falls through to the textarea's `(_, _)` arm and
         // inserts into the draft, so binding it would make a literal
         // question mark untypable in prompts. Ctrl+H was REJECTED too:
-        // tui-textarea 0.7 maps Char('h') + CONTROL to delete_char()
-        // (textarea.rs, the same arm as Backspace), and several terminal
+        // the editor maps Char('h') + CONTROL to backspace (the same
+        // arm as Backspace, kept from tui-textarea 0.7), and several terminal
         // setups deliver the physical Backspace key as ASCII BS, i.e.
         // Char('h') + CONTROL — the chord IS the editor's backspace today.
         // F(1) is verified FREE: no binding anywhere in src/ (no
-        // KeyCode::F hit at all), no tui-textarea mapping (its input match
-        // has no function-key arms, so the fall-through is a no-op), and
+        // KeyCode::F hit at all), no editor mapping (unknown keys are
+        // inert in the readline fall-through), and
         // no degradation cliff — F1 has a dedicated escape sequence on
         // legacy terminals as well, so the chord works with or without the
         // kitty keyboard protocol. Mnemonic: the universal help key.
@@ -1507,9 +1508,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // no-op: nothing to stop, and the retired screen-wipe semantics
         // taught that a visible idle action invites accidental clears.
         // Chord verification (same audit class as ^F/^G/^O/^S/^M): ^L never
-        // reaches the textarea — tui-textarea 0.7 has no Char('l') +
-        // CONTROL mapping (its input match has no ctrl-letter arms beyond
-        // the ones the dispatch claims), so the chord is free.
+        // reaches the editor — the dispatch claims the chord before the
+        // readline fall-through ever sees it, so the chord is free.
         (KeyCode::Char('l'), true) if key.modifiers.contains(KeyModifiers::SHIFT) => {
             // Kitty-protocol variant that reports the unshifted char with
             // the SHIFT flag: reset, same as the ⇧^L arm below.
@@ -1531,8 +1531,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             return;
         }
         (KeyCode::Char('u'), true) => {
-            // Delete from cursor to start of line. tui-textarea maps Ctrl+U
-            // to undo, which surprises readline users. Override it here.
+            // Delete from cursor to start of line. The old tui-textarea
+            // engine mapped Ctrl+U to undo, which surprised readline
+            // users; the in-house editor keeps readline semantics.
             app.input.delete_line_by_head();
             return;
         }
@@ -1552,13 +1553,14 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         //
         // Chord verification (feat task discipline, see the executor report
         // for the full audit): the first-choice ^Y candidate was REJECTED:
-        // tui-textarea 0.7 maps Ctrl+Y to paste-from-internal-yank (src/
-        // textarea.rs:589), and the yank buffer IS populated in this app:
+        // the readline family binds ^Y to paste-from-kill-ring (kept
+        // from tui-textarea 0.7, src/textarea.rs:589), and the kill ring
+        // IS populated in this app:
         // our own ^U override calls delete_line_by_head() → delete_piece()
         // which stores the killed text (textarea.rs:1022), so ^U→^Y (kill
         // line, paste it back) is live behavior today. Taking ^Y would break
         // that readline kill/yank family (^U/^K/^W/^Y). ^G is verified FREE:
-        // no app binding anywhere in src/, no tui-textarea 0.7 mapping, no
+        // no app binding anywhere in src/, no editor mapping, no
         // macOS system hijack, no flow-control semantics, and its readline
         // meaning (abort) has no function in this TUI. Mnemonic: loG.
         (KeyCode::Char('g'), true) => {
@@ -1574,8 +1576,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // for the full audit): ^G was already taken by the log viewer, so
         // the other task candidate ^O was verified FREE: no app binding
         // anywhere in src/ (only `Char('o')` hits are plain typing), no
-        // tui-textarea 0.7 shortcut (its Ctrl table covers a/b/d/e/f/h/j/k/
-        // n/p/r/u/v/w/x/y/<>/[], no 'o'), not part of this app's readline
+        // editor shortcut (the readline table covers a/b/d/e/f/h/j/k/n/p/
+        // u/w/y/<>/[], no 'o'), not part of this app's readline
         // family (^A/^E/^U/^K/^W/^Y/^L; GNU readline's operate-and-get-
         // next is a shell-side binding that never fires inside the TUI), no
         // macOS system hijack (Mission Control only takes ^arrows), and the
@@ -1592,9 +1594,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         //
         // Chord verification (feat task discipline, same audit class as the
         // ^G/^O/^M/^P entries): no app binding anywhere in src/ (the only
-        // `Char('s')` hits are plain typing), no tui-textarea 0.7 shortcut
-        // (its Ctrl table covers a/b/d/e/f/h/j/k/n/p/r/u/v/w/x/y/<>/[],
-        // no 's'), not part of this app's readline family (^A/^E/^U/^K/^W/
+        // `Char('s')` hits are plain typing), no editor shortcut (the
+        // readline table covers a/b/d/e/f/h/j/k/n/p/u/w/y/<>/[], no 's'),
+        // not part of this app's readline family (^A/^E/^U/^K/^W/
         // ^Y/^L), no macOS system hijack (Mission Control only takes
         // ^arrows), and the legacy tty IXON flow-control meaning of ^S is
         // inert under raw mode (crossterm enables raw at startup).
@@ -1609,8 +1611,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // `/model <n>` the same hidden way.
         //
         // Chord verification (feat task discipline, see the executor report
-        // for the full audit): tui-textarea 0.7 maps Ctrl+M to
-        // insert_newline() (textarea.rs:274-286, the same arm as Enter),
+        // for the full audit): the readline editor maps Ctrl+M to
+        // insert_newline() (the same arm as Enter, kept from tui-textarea
+        // 0.7),
         // which this binding deliberately OVERRIDES exactly like the
         // existing ^U undo override: the global match claims the chord and
         // returns before the textarea ever sees it, and no app flow relies
@@ -1636,8 +1639,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         //
         // Chord verification (feat task discipline, same audit class as the
         // ^G/^O/^M entries): no app binding anywhere in src/ (the only `p`
-        // hits are the splash art color table), and tui-textarea 0.7 maps
-        // Ctrl+P to move-cursor-up, which this binding deliberately
+        // hits are the splash art color table), and the readline editor maps
+        // Ctrl+P to move-cursor-up (kept from tui-textarea 0.7), which this
+        // binding deliberately
         // OVERRIDES exactly like the ^U undo override: the global match
         // claims the chord and returns before the textarea ever sees it, and
         // no app flow relies on a ^P caret move (plain ↑ is the caret
@@ -1680,7 +1684,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             app.toggle_focus();
             return;
         }
-        // Ctrl+A / Ctrl+E reach tui-textarea's built-in readline mappings
+        // Ctrl+A / Ctrl+E reach the editor's built-in readline mappings
         // (head/end of line); they fall through untouched below.
         _ => {}
     }
@@ -1695,7 +1699,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     //   zero behavior divergence. Alt exists because macOS Mission Control
     //   hijacks Ctrl+arrows system-wide before they reach the terminal.
     // * Plain ↑ / ↓ move the TEXT CURSOR vertically inside the editor via
-    //   tui-textarea's native Up/Down mapping (CursorMove::Up/Down). They
+    //   the editor's native Up/Down mapping (caret up/down, column
+    //   preserved and clamped). They
     //   never submit and never switch threads; the caret auto-follows the
     //   grown editor viewport because ui::draw renders the widget over
     //   the full grown block every frame.
@@ -1713,7 +1718,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // textarea's readline-compatible handler: caret movement only.
         // Alt+↑/↓ never reach this arm (the synonym arms above take them).
         (KeyCode::Up | KeyCode::Down, _) => {
-            let converted: tui_textarea::Input = key.into();
+            let converted: chibi_tui::input::Input = key.into();
             app.input.input(converted);
         }
         (KeyCode::PageUp, _) => app.scroll_up(app.chat_visible_rows),
@@ -1743,7 +1748,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // Everything else (including Ctrl+A/E, Alt+B/F, Alt+D word ops)
         // goes into the textarea's readline-compatible handler.
         (_, _) => {
-            let converted: tui_textarea::Input = key.into();
+            let converted: chibi_tui::input::Input = key.into();
             app.input.input(converted);
         }
     }
@@ -1772,8 +1777,8 @@ mod tests {
 
     fn submit_text(app: &mut chibi_tui::app::App, text: &str) -> chibi_tui::app::Submitted {
         for ch in text.chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(chibi_tui::input::Input {
+                key: chibi_tui::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -2516,7 +2521,6 @@ mod tests {
 
     #[test]
     fn ctrl_a_and_ctrl_e_reach_textarea_readline_mappings() {
-        use tui_textarea::CursorMove;
         let mut app = app_with_chats(1);
         for ch in "abc".chars() {
             press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
@@ -2527,7 +2531,6 @@ mod tests {
         // Ctrl+E → end of line.
         press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
         assert_eq!(app.input.cursor(), (0, 3), "Ctrl+E moves to line end");
-        let _ = CursorMove::Forward; // keep import used when assertions change
     }
 
     /// Release events are ignored everywhere (macOS emits them).
@@ -2930,8 +2933,8 @@ mod tests {
     }
 
     /// Plain ↑/↓ move the text cursor vertically inside the editor — never
-    /// switching threads. Column preserved across rows (tui-textarea native
-    /// CursorMove), clamped at the first/last row. This exercises the grown
+    /// switching threads. Column preserved across rows (readline-native
+    /// mapping), clamped at the first/last row. This exercises the grown
     /// (MAX_INPUT_LINES-capped) block's caret navigation path.
     #[test]
     fn plain_vertical_arrows_move_caret_not_thread() {
@@ -4563,8 +4566,8 @@ mod tests {
     fn the_picker_modal_swallows_everything_but_nav_confirm_cancel() {
         let mut app = app_with_chats(1);
         for ch in "precious draft".chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(chibi_tui::input::Input {
+                key: chibi_tui::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -4621,8 +4624,8 @@ mod tests {
     fn the_picker_enters_confirm_never_touch_the_message_draft() {
         let mut app = app_with_chats(1);
         for ch in "half typed prompt".chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(chibi_tui::input::Input {
+                key: chibi_tui::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -5495,7 +5498,7 @@ mod tests {
 
     /// Layout-equivalence: a Cyrillic chord must leave the app in EXACTLY
     /// the state its Latin original would — including the uppercase
-    /// Shift-decorated shapes, which tui-textarea treats as unknown ctrl
+    /// Shift-decorated shapes, which the editor treats as unknown ctrl
     /// combos (a no-op here) in BOTH flavors.
     #[test]
     fn cyrillic_chords_reach_the_identical_state_as_their_latin_originals() {
