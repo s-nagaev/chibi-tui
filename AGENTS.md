@@ -140,10 +140,19 @@ session-scoped). Fix the README when touching those areas.
   as the modal error popup (`R` retry, `Esc` dismiss, `q`/Ctrl+C quit) —
   never a panic, never a silent swallow.
 - **Terminal capability degradation.** The kitty keyboard protocol is
-  pushed at startup (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`)
-  and popped on exit. Chords that degrade on legacy terminals (Shift+Enter,
-  Ctrl+M, Ctrl+Shift+F, Ctrl+arrows) are documented in the README keybinding
-  table — keep it honest when touching keybindings.
+  pushed at startup ONLY on non-Windows builds
+  (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`; see
+  `push_kitty_flags()` in `main.rs` — the Win32 console input path cannot
+  represent kitty sequences, and pushing there makes kitty-capable
+  terminals emit keys the console path mis-decodes, which is how
+  Ctrl+↑/↓ thread switching broke). The `TerminalRestore` guard pops the
+  flags if and only if they were pushed — the push/pop decisions always
+  mirror each other. On unix, legacy encodings (`ESC[1;5A`) and kitty
+  CSI-u encodings decode into the same `KeyEvent`, so both flavors work
+  everywhere the byte stream is parsed. Chords that degrade on legacy
+  terminals (Shift+Enter, Ctrl+M, Ctrl+Shift+F, Shift+Ctrl+L) are
+  documented in the README keybinding table — keep it honest when touching
+  keybindings.
 
 ## Wire frames (protocol v1)
 

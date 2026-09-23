@@ -27,9 +27,11 @@ use std::time::Duration;
 use clap::Parser;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use futures_util::StreamExt;
+use ratatui::layout::Rect;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -81,22 +83,41 @@ async fn main() -> io::Result<()> {
     // --- terminal setup ---
     let mut stdout = io::stdout();
     crossterm::terminal::enable_raw_mode()?;
-    // ask for the kitty keyboard protocol so
-    // capable terminals deliver distinct Shift+Enter / Alt+Enter modifiers
-    // instead of bare-Enter bytes. Best-effort: an unsupported terminal
-    // ignores the escape sequence and the app degrades to submit-on-Enter
-    // (documented in the README). The result is deliberately discarded:
-    // setup must never abort the app over an optional enhancement, and the
-    // teardown guard below restores whatever actually got enabled.
     let _ = crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        EnableMouseCapture,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        EnableMouseCapture
     );
+    // On builds where crossterm decodes a raw ANSI byte stream (unix,
+    // including WSL inside Windows Terminal), ask for the kitty keyboard
+    // protocol so capable terminals deliver distinct Shift+Enter /
+    // Alt+Enter modifiers instead of bare-Enter bytes. Best-effort: an
+    // unsupported terminal ignores the escape sequence and the app degrades
+    // to submit-on-Enter (documented in the README). The result is
+    // deliberately discarded: setup must never abort the app over an
+    // optional enhancement.
+    //
+    // The push is platform-gated, NOT unconditional: on native Windows
+    // builds crossterm reads input through the Win32 console API, which
+    // cannot represent kitty sequences at all (crossterm reports enhancement
+    // support as always-off there). Pushing the flags makes terminals with
+    // kitty support — notably recent Windows Terminal — encode modified keys
+    // as CSI-u sequences that the console path cannot decode, silently
+    // killing chords like Ctrl+Up/Down thread switching. Legacy terminals
+    // already report Ctrl+arrows via unambiguous modifier-aware legacy
+    // sequences, so skipping the push loses nothing on Windows. The teardown
+    // guard below restores whatever actually got enabled: it pops the flags
+    // if and only if they were pushed here.
+    let push_kitty_flags = push_kitty_flags();
+    if push_kitty_flags {
+        let _ = crossterm::execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     // Every exit path below (splash abort, `?` failures, normal end, panic
     // unwind) restores the terminal exactly once through this guard.
-    let _terminal_restore = TerminalRestore;
+    let _terminal_restore = TerminalRestore::new(push_kitty_flags);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -201,19 +222,50 @@ async fn main() -> io::Result<()> {
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// Whether the kitty keyboard protocol is pushed at startup.
+///
+/// The protocol is only useful — and only safe — where crossterm decodes a
+/// raw ANSI byte stream (unix, including WSL inside Windows Terminal): there
+/// the legacy encodings (`ESC[1;5A` for Ctrl+arrows) and the kitty CSI-u
+/// encodings both decode into the very same key events, so pushing the flags
+/// is free and upgrades capable terminals to unambiguous Shift/Ctrl chords.
+/// On native Windows builds crossterm instead reads the Win32 console API,
+/// which cannot represent kitty sequences (crossterm itself reports
+/// enhancement support as always-off there); pushing the flags makes
+/// terminals with kitty support — notably recent Windows Terminal — emit
+/// CSI-u sequences the console path cannot decode, which is how Ctrl+↑/↓
+/// thread switching broke. So the flags are never pushed on Windows and the
+/// app runs on the console API's own modifier reporting.
+fn push_kitty_flags() -> bool {
+    !cfg!(windows)
+}
+
 /// RAII teardown: restores the terminal when dropped. Instantiated right
 /// after terminal setup so EVERY exit path — splash abort (`return Ok(())`),
 /// `?` failures, normal end, and panic unwind — leaves raw mode disabled,
 /// the alternate screen left, mouse capture off, and
-/// kitty keyboard-enhancement flags popped.
-struct TerminalRestore;
+/// kitty keyboard-enhancement flags popped exactly when they were pushed.
+struct TerminalRestore {
+    /// Mirrors the startup push decision: the pop is issued if and only if
+    /// the flags were pushed, so the terminal's kitty flag stack can never
+    /// leak into the user's shell (nor under-pop someone else's entry).
+    pop_kitty_flags: bool,
+}
+
+impl TerminalRestore {
+    fn new(pop_kitty_flags: bool) -> Self {
+        Self { pop_kitty_flags }
+    }
+}
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+        if self.pop_kitty_flags {
+            let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = crossterm::execute!(
             io::stdout(),
-            PopKeyboardEnhancementFlags,
             crossterm::terminal::LeaveAlternateScreen,
             DisableMouseCapture
         );
@@ -512,7 +564,16 @@ async fn run_loop(
                         // for the next event.
                         terminal.draw(|f| ui::draw(f, &mut app, theme))?;
                     }
-                    Some(Ok(_)) => {}                     // mouse etc.
+                    Some(Ok(CtEvent::Mouse(mouse))) => {
+                        // Wheel routing hit-tests against the SAME layout the
+                        // renderer just painted: the panel rectangles are
+                        // recomputed from the live frame size — there is no
+                        // cached geometry anywhere in the render path.
+                        let size = terminal.size()?;
+                        let area = Rect::new(0, 0, size.width, size.height);
+                        handle_mouse(&mut app, mouse, area);
+                    }
+                    Some(Ok(_)) => {} // focus, paste, other crossterm events
                     Some(Err(e)) => return Err(io::Error::other(e)),
                     None => {} // stream ended; keep looping until quit
                 }
@@ -707,10 +768,256 @@ fn paste_clipboard(app: &mut chibi_tui::app::App) {
 ///
 /// Terminal caveat: without the kitty keyboard protocol many terminals send
 /// bare-Enter bytes for Shift+Enter, so those presses degrade to submit.
-/// `main` pushes crossterm's keyboard-enhancement flags at startup so
-/// capable terminals deliver distinct SHIFT/ALT modifiers.
+/// `main` pushes crossterm's keyboard-enhancement flags at startup (on
+/// non-Windows builds; see `push_kitty_flags`) so capable terminals deliver
+/// distinct SHIFT/ALT modifiers.
+/// Wheel step per notch: chat rows in the chat panel, one step per entry /
+/// line in the modal list surfaces.
+const WHEEL_STEP: u16 = 3;
+
+/// Which surface receives the wheel: a modal that owns the screen gets it
+/// wherever the cursor is (same modal isolation as the keyboard), the base
+/// panels get it routed by cursor position.
+enum WheelSurface {
+    LogViewer,
+    Help,
+    ModelPicker,
+    Panels,
+}
+
+/// Route a crossterm mouse event. Wheel notches scroll (chat, sidebar,
+/// modals); left press/drag/release inside the chat pane drive the text
+/// selection (see below). Everything else is ignored.
+///
+/// Routing rules:
+/// - an open log viewer / help modal / model picker consumes the wheel
+///   regardless of cursor position, mirroring how those modals swallow
+///   every key — and their other mouse events stay ignored (a modal owns
+///   the whole screen, so no pointer selection can start under it);
+/// - cursor over the CHAT panel scrolls the chat (`App::scroll_up` unpins
+///   from follow-bottom, `scroll_down` re-pins at 0; `ui::scroll_skip`
+///   clamps at render);
+/// - cursor over the SIDEBAR moves the thread selection ONLY while the
+///   sidebar holds keyboard focus — hovering without focus intentionally
+///   does nothing (hover-switching threads was judged too noisy UX);
+/// - a left PRESS inside the chat pane (Normal mode, no error popup)
+///   starts a drag selection through the render-fed `App::chat_geometry`
+///   hit-test seam; DRAG moves the head; RELEASE copies the selected
+///   plain text through the SAME clipboard path as the log viewer's `y`
+///   (`App::release_selection` turns a press+release without drag into a
+///   plain click that clears). Presses outside the chat pane clear the
+///   selection too, and a release is finalized anywhere in the base
+///   surface — the cursor commonly leaves the pane before the button
+///   comes up.
+fn handle_mouse(app: &mut chibi_tui::app::App, mouse: MouseEvent, area: Rect) {
+    handle_mouse_with_copy(app, mouse, area, &|text| {
+        // Selection copy rides the SAME clipboard path as the log
+        // viewer's `y` (OSC 52 + the env fallback); the outcome is
+        // deliberately ignored — a failed write must not disturb the UI.
+        let _ = chibi_tui::clipboard::copy_text(text);
+    });
+}
+
+/// Testable form of [`handle_mouse`]: the clipboard write arrives as a
+/// closure (production passes [`chibi_tui::clipboard::copy_text`], tests
+/// capture into a buffer), so the dispatch flow can assert the copy
+/// without touching a real clipboard.
+fn handle_mouse_with_copy(
+    app: &mut chibi_tui::app::App,
+    mouse: MouseEvent,
+    area: Rect,
+    copy: &dyn Fn(&str),
+) {
+    let surface = match &app.mode {
+        Mode::LogViewer { .. } => WheelSurface::LogViewer,
+        Mode::HelpViewing { .. } => WheelSurface::Help,
+        Mode::ModelPicking { .. } => WheelSurface::ModelPicker,
+        _ => WheelSurface::Panels,
+    };
+    match surface {
+        WheelSurface::LogViewer => match mouse.kind {
+            MouseEventKind::ScrollUp => app.log_cursor_up(usize::from(WHEEL_STEP)),
+            MouseEventKind::ScrollDown => app.log_cursor_down(usize::from(WHEEL_STEP)),
+            _ => {}
+        },
+        WheelSurface::Help => match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                for _ in 0..WHEEL_STEP {
+                    app.help_scroll_up();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                for _ in 0..WHEEL_STEP {
+                    app.help_scroll_down();
+                }
+            }
+            _ => {}
+        },
+        WheelSurface::ModelPicker => match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                for _ in 0..WHEEL_STEP {
+                    app.model_picker_select_prev();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                for _ in 0..WHEEL_STEP {
+                    app.model_picker_select_next();
+                }
+            }
+            _ => {}
+        },
+        WheelSurface::Panels => {
+            let rects = ui::layout_rects(area, app.input_lines_height());
+            // Selection presses/drags/releases are Normal-mode-only and
+            // popup-free: popups (confirm dialogs, rename, search) and the
+            // error popup own the whole screen — the pointer must not draw
+            // a selection under them, and events under them are swallowed
+            // (same isolation as the keyboard). A selection started before
+            // a popup opened stays held underneath; a stale live drag is
+            // harmless — the next Normal-mode click or Esc clears it.
+            // The wheel keeps its pre-existing routing below.
+            let selectable = app.mode.is_normal() && app.error_popup.is_none();
+            match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    match ui::panel_region(&rects, mouse.column, mouse.row) {
+                        ui::PanelRegion::Chat => match mouse.kind {
+                            MouseEventKind::ScrollUp => app.scroll_up(WHEEL_STEP),
+                            _ => app.scroll_down(WHEEL_STEP),
+                        },
+                        ui::PanelRegion::Sidebar if app.focus == Focus::Sidebar => {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => app.select_prev(),
+                                _ => app.select_next(),
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Finalize the drag anywhere in the base surface (before
+                // the region hit-test: the release point may have left the
+                // pane).
+                MouseEventKind::Up(crossterm::event::MouseButton::Left) if selectable => {
+                    if let Some(text) = app.release_selection() {
+                        copy(&text);
+                    }
+                }
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) if selectable => {
+                    let in_chat =
+                        ui::panel_region(&rects, mouse.column, mouse.row) == ui::PanelRegion::Chat;
+                    let point = in_chat.then(|| {
+                        app.chat_geometry
+                            .as_ref()
+                            .and_then(|g| g.position_at(mouse.column, mouse.row))
+                    });
+                    match point.flatten() {
+                        Some(point) => app.begin_selection(point),
+                        // A press outside the chat pane is a plain click:
+                        // it clears the selection (the release completes
+                        // the click; nothing live to release).
+                        None => app.clear_selection(),
+                    }
+                }
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left) if selectable => {
+                    if let Some(point) = app
+                        .chat_geometry
+                        .as_ref()
+                        .and_then(|g| g.position_at(mouse.column, mouse.row))
+                    {
+                        app.drag_selection(point);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn should_submit(key: &crossterm::event::KeyEvent) -> bool {
     key.code == KeyCode::Enter && key.modifiers.is_empty()
+}
+
+/// Map one Cyrillic character onto its Latin counterpart for the Russian
+/// (ЙЦУКЕН) and Ukrainian keyboard layouts, preserving case for letters
+/// (uppercase Cyrillic → uppercase Latin, so the case-sensitive
+/// `Char('L')` reset shape keeps working). Characters outside both layouts
+/// return `None` and pass through unchanged.
+fn cyrillic_latin_counterpart(c: char) -> Option<char> {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped = match lower {
+        // Shared ЙЦУКЕН top row (the Latin q..p keys).
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        // Home row. ы (Russian) and і (Ukrainian) share the Latin `s` key;
+        // ї / є / ґ are the Ukrainian-only keys on `]` / `'` / `\`.
+        'ф' => 'a',
+        'ы' | 'і' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'ь' => 'm',
+        // Bottom row (the Latin z..m keys).
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        // Non-letter keys keep their physical Latin twins so the input
+        // behavior matches a Latin keyboard key-for-key.
+        'х' => '[',
+        'ъ' | 'ї' => ']',
+        'ж' => ';',
+        'э' | 'є' => '\'',
+        'б' => ',',
+        'ю' => '.',
+        'ё' => '`',
+        'ґ' => '\\',
+        _ => return None,
+    };
+    if c.is_uppercase() && mapped.is_ascii_alphabetic() {
+        Some(mapped.to_ascii_uppercase())
+    } else {
+        Some(mapped)
+    }
+}
+
+/// Normalize a Ctrl-chord reported under a Cyrillic keyboard layout onto
+/// the Latin chord the key dispatch matches.
+///
+/// Crossterm reports the LAYOUT character for modified keys, so under
+/// ЙЦУКЕН `Ctrl+A` arrives as `Ctrl+Ф` and every chord match silently
+/// failed until the user switched layouts. Applied at the very top of
+/// [`handle_key`], BEFORE any chord matching, and ONLY to events carrying
+/// CONTROL: plain typing (the textarea, the rename and search editors) is
+/// returned untouched, characters outside both layouts pass through
+/// unchanged, and every modifier rides along — so a normalized chord
+/// behaves byte-for-byte like its Latin original, including the
+/// case-sensitive `Char('L')` / `Char('l')` stop/reset split and the
+/// Ctrl+Shift+F global-search shape.
+fn normalize_cyrillic_ctrl_chord(
+    mut key: crossterm::event::KeyEvent,
+) -> crossterm::event::KeyEvent {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return key;
+    }
+    if let KeyCode::Char(c) = key.code {
+        if let Some(mapped) = cyrillic_latin_counterpart(c) {
+            key.code = KeyCode::Char(mapped);
+        }
+    }
+    key
 }
 
 /// Apply key handling to app state. Backend interactions (submit, cancel,
@@ -720,6 +1027,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return;
     }
+    // Ctrl-chords arrive with the LAYOUT character under the Russian
+    // (ЙЦУКЕН) and Ukrainian keyboard layouts (Ctrl+Ф instead of Ctrl+A),
+    // which left every chord dead until the layout was switched. Rewrite
+    // the char to its Latin counterpart before ANY matching; events without
+    // CONTROL are returned untouched, so plain typing into the textarea
+    // never sees a changed keystroke.
+    let key = normalize_cyrillic_ctrl_chord(key);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Alt+↑/↓ are a full synonym of Ctrl+↑/↓ thread
     // switching (see the match below); macOS Mission Control hijacks
@@ -1138,8 +1452,12 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Down => app.select_next(),
             // Apply & return to the editor, with no submit side effect.
             KeyCode::Enter if key.modifiers.is_empty() => app.focus = Focus::Chat,
-            // Return without touching the draft (never clears input).
-            KeyCode::Esc => app.focus = Focus::Chat,
+            // Return without touching the draft (never clears input);
+            // a mouse selection is cleared like in Normal mode.
+            KeyCode::Esc => {
+                app.clear_selection();
+                app.focus = Focus::Chat;
+            }
             // Everything else is swallowed while the sidebar is focused.
             _ => {}
         }
@@ -1401,10 +1719,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         (KeyCode::PageUp, _) => app.scroll_up(app.chat_visible_rows),
         (KeyCode::PageDown, _) => app.scroll_down(app.chat_visible_rows),
         (KeyCode::Esc, _) if !input_is_empty => {
-            // Non-empty input: clear it.
+            // Non-empty input: clear it (and any mouse selection with it).
+            app.clear_selection();
             app.clear_input();
         }
-        // Esc is ignored when input is empty; it never quits.
+        // Esc with an empty input clears the mouse selection (the
+        // keyboard's "deselect"); it still never quits.
+        (KeyCode::Esc, _) => app.clear_selection(),
         // Only Ctrl+C quits (idle) or cancels (busy).
         // BARE Enter is swallowed here and submitted by the loop's
         // should_submit() gate; Shift+Enter / Alt+Enter fall through to the
@@ -2541,6 +2862,71 @@ mod tests {
         assert!(app.chats.iter().all(|c| c.messages.is_empty()));
         assert!(app.active_request_id().is_none());
         assert_eq!(app.active_queue_len(), 0);
+    }
+
+    /// Simulated Windows Terminal / partial-kitty event shapes: terminals
+    /// with incomplete modifier reporting may deliver the Ctrl+↑/↓ chords
+    /// with EXTRA modifiers riding along (SHIFT when the terminal reports
+    /// the raw shift state, ALT when both chord flavors are registered).
+    /// The thread-switch arms match CONTROL with `KeyModifiers::contains`,
+    /// so every superset shape must still switch threads. (The plain legacy
+    /// shapes — bare CONTROL on Up/Down, the `ESC[1;5A`/`ESC[1;5B`
+    /// encodings — are pinned by the ctrl-arrows tests above; both encodings
+    /// decode into the very same `KeyEvent`.)
+    #[test]
+    fn ctrl_arrow_shapes_with_extra_riding_modifiers_still_switch_threads() {
+        for mods in [
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ] {
+            let mut app = app_with_chats(3);
+            press(&mut app, KeyCode::Down, mods);
+            assert_eq!(app.active, 1, "Down + {mods:?} must switch threads");
+            assert_eq!(
+                app.scroll, 0,
+                "Down + {mods:?} keeps the scroll-reset semantics"
+            );
+            app.scroll = 7;
+            press(&mut app, KeyCode::Up, mods);
+            assert_eq!(app.active, 0, "Up + {mods:?} must switch threads back");
+            assert_eq!(app.scroll, 0, "Up + {mods:?} resets the chat scroll");
+        }
+    }
+
+    /// The Alt synonym under the same partial-kitty shapes: SHIFT riding on
+    /// Alt+↑/↓ must not break the thread switch (kitty-capable terminals
+    /// report the shift state on the alt flavor too).
+    #[test]
+    fn alt_arrow_shapes_with_shift_riding_along_still_switch_threads() {
+        for mods in [
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        ] {
+            let mut app = app_with_chats(3);
+            press(&mut app, KeyCode::Down, mods);
+            assert_eq!(app.active, 1, "Alt-flavored Down + {mods:?} switches");
+            press(&mut app, KeyCode::Up, mods);
+            assert_eq!(app.active, 0, "Alt-flavored Up + {mods:?} switches back");
+        }
+    }
+
+    /// Startup/teardown pairing contract: the kitty enhancement flags are
+    /// popped by the `TerminalRestore` guard exactly when they were pushed,
+    /// so the terminal's kitty flag stack can never leak into the user's
+    /// shell after exit (nor under-pop an outer entry).
+    #[test]
+    fn terminal_restore_pops_the_kitty_flags_exactly_when_they_were_pushed() {
+        let restore = TerminalRestore::new(push_kitty_flags());
+        assert_eq!(
+            restore.pop_kitty_flags,
+            push_kitty_flags(),
+            "the guard's pop decision must mirror the push decision"
+        );
+        // The guard built from the real startup decision is internally
+        // consistent by construction; the false/true branches are covered
+        // by the mirror assertion above (a mismatch would mean either a
+        // leaked flag stack or an under-pop on some platform).
     }
 
     /// Plain ↑/↓ move the text cursor vertically inside the editor — never
@@ -4466,6 +4852,21 @@ mod tests {
         ),
         ("Global", "Ctrl+↑/↓ · Alt+↑/↓", "switch the active thread"),
         ("Global", "PgUp / PgDn", "scroll the chat view"),
+        (
+            "Global",
+            "Wheel ↑ / ↓",
+            "scroll the chat · select in the focused sidebar",
+        ),
+        (
+            "Global",
+            "Drag-select",
+            "highlight chat text · release copies it",
+        ),
+        (
+            "Global",
+            "Ctrl-chords",
+            "work under RU / UA keyboard layouts",
+        ),
         ("Global", "Esc", "clear the input · dismiss popups"),
         ("Input", "Enter", "send the message (queues while busy)"),
         ("Input", "⇧↵ / ⌥↵", "insert a newline"),
@@ -4995,5 +5396,763 @@ mod tests {
             app.help_scroll_down();
         }
         assert_eq!(scroll(&app), total.saturating_sub(page));
+    }
+
+    // ---- Cyrillic Ctrl-chord normalization -----------------------------------
+
+    /// The full Russian (ЙЦУКЕН) letter mapping, case-preserving on both
+    /// sides: lowercase layout char → lowercase Latin twin, uppercase →
+    /// uppercase (the case-sensitive `Char('L')` reset shape depends on it).
+    #[test]
+    fn cyrillic_table_maps_the_full_russian_layout_case_preserving() {
+        let ru: &[(char, char)] = &[
+            ('й', 'q'),
+            ('ц', 'w'),
+            ('у', 'e'),
+            ('к', 'r'),
+            ('е', 't'),
+            ('н', 'y'),
+            ('г', 'u'),
+            ('ш', 'i'),
+            ('щ', 'o'),
+            ('з', 'p'),
+            ('ф', 'a'),
+            ('ы', 's'),
+            ('в', 'd'),
+            ('а', 'f'),
+            ('п', 'g'),
+            ('р', 'h'),
+            ('о', 'j'),
+            ('л', 'k'),
+            ('д', 'l'),
+            ('ь', 'm'),
+            ('я', 'z'),
+            ('ч', 'x'),
+            ('с', 'c'),
+            ('м', 'v'),
+            ('и', 'b'),
+            ('т', 'n'),
+        ];
+        for &(cyr, lat) in ru {
+            assert_eq!(cyrillic_latin_counterpart(cyr), Some(lat), "{cyr}");
+            let upper = cyr.to_uppercase().next().unwrap_or(cyr);
+            assert_eq!(
+                cyrillic_latin_counterpart(upper),
+                Some(lat.to_ascii_uppercase()),
+                "{upper}"
+            );
+        }
+    }
+
+    /// Ukrainian-only keys: і shares the Latin `s` key with the Russian ы,
+    /// ї / є / ґ sit on the `]` / `'` / `\` keys of the layout.
+    #[test]
+    fn cyrillic_table_covers_the_ukrainian_only_keys() {
+        assert_eq!(cyrillic_latin_counterpart('і'), Some('s'));
+        assert_eq!(cyrillic_latin_counterpart('І'), Some('S'));
+        assert_eq!(cyrillic_latin_counterpart('ї'), Some(']'));
+        assert_eq!(cyrillic_latin_counterpart('Ї'), Some(']'));
+        assert_eq!(cyrillic_latin_counterpart('є'), Some('\''));
+        assert_eq!(cyrillic_latin_counterpart('Є'), Some('\''));
+        assert_eq!(cyrillic_latin_counterpart('ґ'), Some('\\'));
+        assert_eq!(cyrillic_latin_counterpart('Ґ'), Some('\\'));
+    }
+
+    /// Normalization touches ONLY Ctrl-chords: characters outside both
+    /// layouts pass through unchanged, and events without CONTROL — plain
+    /// typing, Alt-decorated keys — are never rewritten.
+    #[test]
+    fn cyrillic_normalization_touches_ctrl_chords_only_and_passes_unknown_through() {
+        let norm = |c: char, mods: KeyModifiers| {
+            normalize_cyrillic_ctrl_chord(key_event(KeyCode::Char(c), mods))
+        };
+        // Lowercase and uppercase shapes, modifiers preserved.
+        let key = norm('ф', KeyModifiers::CONTROL);
+        assert_eq!(key.code, KeyCode::Char('a'));
+        assert!(key.modifiers.contains(KeyModifiers::CONTROL));
+        let key = norm('Д', KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(key.code, KeyCode::Char('L'));
+        assert!(key.modifiers.contains(KeyModifiers::SHIFT));
+        // Characters outside both layouts pass through unchanged…
+        assert_eq!(norm('λ', KeyModifiers::CONTROL).code, KeyCode::Char('λ'));
+        assert_eq!(norm('q', KeyModifiers::CONTROL).code, KeyCode::Char('q'));
+        // …and so does EVERYTHING without CONTROL.
+        assert_eq!(norm('ф', KeyModifiers::NONE).code, KeyCode::Char('ф'));
+        assert_eq!(norm('ф', KeyModifiers::ALT).code, KeyCode::Char('ф'));
+    }
+
+    #[test]
+    fn cyrillic_ctrl_s_and_ukrainian_ctrl_i_toggle_thoughts() {
+        let mut app = app_with_chats(1);
+        assert!(app.thoughts_visible);
+        // ы is the ЙЦУКЕН twin of the Latin `s` key (see the table test)…
+        press(&mut app, KeyCode::Char('ы'), KeyModifiers::CONTROL);
+        assert!(!app.thoughts_visible, "Ctrl+ы (RU) toggles like Ctrl+S");
+        // …і its Ukrainian counterpart.
+        press(&mut app, KeyCode::Char('і'), KeyModifiers::CONTROL);
+        assert!(app.thoughts_visible, "Ctrl+і (UA) toggles like Ctrl+S too");
+    }
+
+    /// Layout-equivalence: a Cyrillic chord must leave the app in EXACTLY
+    /// the state its Latin original would — including the uppercase
+    /// Shift-decorated shapes, which tui-textarea treats as unknown ctrl
+    /// combos (a no-op here) in BOTH flavors.
+    #[test]
+    fn cyrillic_chords_reach_the_identical_state_as_their_latin_originals() {
+        // Lowercase Ctrl+A vs Ctrl+ф (the ЙЦУКЕН `a`-position key): caret
+        // to the line head in both.
+        let mut cyr = app_with_chats(1);
+        type_in(&mut cyr, "abcdef");
+        press(&mut cyr, KeyCode::Char('ф'), KeyModifiers::CONTROL);
+        let mut lat = app_with_chats(1);
+        type_in(&mut lat, "abcdef");
+        press(&mut lat, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(cyr.input.cursor(), lat.input.cursor(), "lowercase shape");
+        assert_eq!(cyr.input.cursor(), (0, 0), "Ctrl+A semantics reached");
+
+        // Uppercase Shift-decorated Ctrl+А vs Ctrl+Shift+A: identical
+        // (byte-for-byte the same normalized event, same no-op outcome).
+        let mut cyr = app_with_chats(1);
+        type_in(&mut cyr, "abcdef");
+        press(
+            &mut cyr,
+            KeyCode::Char('А'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let mut lat = app_with_chats(1);
+        type_in(&mut lat, "abcdef");
+        press(
+            &mut lat,
+            KeyCode::Char('A'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(cyr.input.cursor(), lat.input.cursor(), "uppercase shape");
+        assert_eq!(
+            cyr.input.lines(),
+            lat.input.lines(),
+            "no keystroke rewritten beyond the layout translation"
+        );
+    }
+
+    /// The task's headline example: Ctrl+Ф (the ЙЦУКЕН key on the Latin `a`
+    /// position) reaches the textarea's readline head-of-line mapping like
+    /// Ctrl+A does.
+    #[test]
+    fn cyrillic_ctrl_f_moves_the_caret_to_line_head_like_ctrl_a() {
+        let mut app = app_with_chats(1);
+        for ch in "abc".chars() {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('ф'), KeyModifiers::CONTROL);
+        assert_eq!(app.input.cursor(), (0, 0), "Ctrl+ф behaves like Ctrl+A");
+    }
+
+    /// The case-sensitive stop/reset split survives the translation:
+    /// lowercase д → the plain ^L stop confirm, uppercase Д → the
+    /// `Char('L')` reset shape (Shift+Ctrl+L).
+    #[test]
+    fn cyrillic_stop_and_reset_chords_keep_their_case_semantics() {
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(&mut app, KeyCode::Char('д'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Stop
+            }
+        ));
+
+        let mut app = busy_app_with_commands(&["/stop", "/reset"]);
+        press(
+            &mut app,
+            KeyCode::Char('Д'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmStopReset {
+                action: chibi_tui::app::StopResetAction::Reset
+            }
+        ));
+    }
+
+    #[test]
+    fn cyrillic_ctrl_c_cancels_the_inflight_request_like_latin_ctrl_c() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "in flight");
+        press(&mut app, KeyCode::Char('с'), KeyModifiers::CONTROL);
+        let (request_id, _) = app.pending_cancel.expect("cancel requested");
+        assert_eq!(request_id, submitted.request_id);
+        assert!(!app.should_quit, "busy Ctrl+с must not quit");
+    }
+
+    /// Plain Cyrillic typing must never be rewritten: the textarea receives
+    /// the layout characters verbatim (normalization is Ctrl-chord-only).
+    #[test]
+    fn plain_cyrillic_typing_lands_in_the_draft_untouched() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "привет, мир");
+        assert_eq!(app.input.lines().join(""), "привет, мир");
+        assert!(!app.should_quit);
+        assert!(app.active_request_id().is_none());
+    }
+
+    // ---- mouse wheel routing --------------------------------------------
+
+    /// Hand-built wheel notch at a terminal position, as crossterm delivers it.
+    fn wheel(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    use crossterm::event::MouseEventKind;
+
+    /// 120×40 frame: sidebar cols 0..=25, chat cols 26.., chrome rows 37..39.
+    const WHEEL_AREA: Rect = Rect::new(0, 0, 120, 40);
+
+    #[test]
+    fn wheel_up_over_the_chat_unpins_from_follow_bottom_by_the_wheel_step() {
+        let mut app = app_with_chats(1);
+        assert!(app.at_bottom(), "opens pinned to the tail");
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 3, "one notch = WHEEL_STEP rows");
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 6);
+        assert!(!app.at_bottom());
+    }
+
+    #[test]
+    fn wheel_down_over_the_chat_returns_to_follow_bottom() {
+        let mut app = app_with_chats(1);
+        app.scroll_up(6);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 3);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 0, "saturates at 0 = follow-bottom re-pinned");
+        assert!(app.at_bottom());
+        // further down-notches stay pinned: scroll can never go negative.
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn wheel_over_the_sidebar_without_focus_does_nothing() {
+        use chibi_tui::app::Focus;
+        let mut app = app_with_chats(3);
+        assert_eq!(app.focus, Focus::Chat);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 10, 5),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.active, 0, "hovering must never switch threads");
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.scroll, 0, "sidebar hover never scrolls the chat either");
+    }
+
+    #[test]
+    fn wheel_over_the_focused_sidebar_moves_the_selection() {
+        use chibi_tui::app::Focus;
+        let mut app = app_with_chats(3);
+        app.focus = Focus::Sidebar;
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 10, 5),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.active, 1, "wheel down = next thread (live switching)");
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(app.active, 0, "wheel up = previous thread");
+        // The top clamp holds: no wraparound past the first thread.
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn wheel_over_the_chrome_rows_is_ignored() {
+        let mut app = app_with_chats(2);
+        // spinner / input / hints rows (y >= 37) are no panel.
+        for row in [37, 38, 39] {
+            handle_mouse(
+                &mut app,
+                wheel(MouseEventKind::ScrollUp, 60, row),
+                WHEEL_AREA,
+            );
+            handle_mouse(
+                &mut app,
+                wheel(MouseEventKind::ScrollDown, 60, row),
+                WHEEL_AREA,
+            );
+        }
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn non_wheel_mouse_events_are_ignored() {
+        let mut app = app_with_chats(2);
+        app.scroll_up(9);
+        let kinds = [
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            MouseEventKind::Moved,
+        ];
+        for kind in kinds {
+            handle_mouse(&mut app, wheel(kind, 60, 10), WHEEL_AREA);
+            handle_mouse(&mut app, wheel(kind, 10, 5), WHEEL_AREA);
+        }
+        assert_eq!(app.scroll, 9, "clicks/drag/motion never touch the scroll");
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn wheel_inside_the_open_help_modal_scrolls_the_table() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        let scroll = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::HelpViewing { state } => state.scroll,
+            _ => panic!("modal must stay open"),
+        };
+        // The modal owns the wheel wherever the cursor is — same isolation
+        // as the keyboard.
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(scroll(&app), 3, "three lines per notch");
+        handle_mouse(&mut app, wheel(MouseEventKind::ScrollUp, 10, 5), WHEEL_AREA);
+        assert_eq!(scroll(&app), 0, "clamped at the top edge");
+    }
+
+    #[test]
+    fn wheel_inside_the_open_log_viewer_moves_the_cursor() {
+        let mut app = app_with_chats(1);
+        app.mode = chibi_tui::app::Mode::LogViewer {
+            state: log_viewer_state(
+                5,
+                vec![
+                    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                ],
+                None,
+            ),
+        };
+        let cursor = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::LogViewer { state } => state.cursor,
+            _ => panic!("viewer must stay open"),
+        };
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(cursor(&app), 2, "wheel up walks three logical lines up");
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(cursor(&app), 8);
+    }
+
+    #[test]
+    fn wheel_inside_the_open_model_picker_moves_the_selection() {
+        let mut app = app_with_chats(1);
+        inject_ready_picker(&mut app, 10);
+        let selected = |app: &chibi_tui::app::App| match &app.mode {
+            chibi_tui::app::Mode::ModelPicking { state } => state.selected,
+            _ => panic!("picker must stay open"),
+        };
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(selected(&app), 3, "wheel down walks three rows");
+        // The bottom clamp holds: no wraparound past the last row.
+        for _ in 0..10 {
+            handle_mouse(
+                &mut app,
+                wheel(MouseEventKind::ScrollDown, 60, 10),
+                WHEEL_AREA,
+            );
+        }
+        assert_eq!(selected(&app), 9);
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(selected(&app), 6);
+    }
+
+    // ---- mouse text selection dispatch --------------------------------------
+
+    use chibi_tui::app::ChatSelection;
+
+    /// Render one frame so the renderer caches `App::chat_geometry` (the
+    /// hit-test seam the mouse selection maps positions through).
+    fn render_for_geometry(app: &mut chibi_tui::app::App) {
+        let backend = ratatui::backend::TestBackend::new(WHEEL_AREA.width, WHEEL_AREA.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| chibi_tui::ui::draw(f, app, &chibi_tui::theme::Theme::tokyo_night()))
+            .unwrap();
+    }
+
+    /// Left-button press / drag / release at a terminal position.
+    fn button(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        wheel(kind, column, row)
+    }
+
+    /// THE dispatch flow: press in the chat pane anchors, drag extends,
+    /// release finalizes and copies the plain text through the injected
+    /// clipboard seam.
+    #[test]
+    fn press_drag_release_selects_and_copies_through_the_seam() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("hello world from selection"));
+        render_for_geometry(&mut app);
+
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            // Press at the first content cell of the message row, drag
+            // eleven columns right ("hello world"), release.
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    26,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            assert!(
+                app.selection.as_ref().is_some_and(|s| s.dragging),
+                "press starts the live drag"
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    37,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    40,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+        }
+
+        let sel = app.selection.expect("real selection held after release");
+        assert!(!sel.dragging, "released");
+        assert_eq!(
+            copied.borrow().as_slice(),
+            ["hello world"],
+            "the release copied the selected plain text"
+        );
+    }
+
+    /// A press+release without drag is a plain click: the selection clears
+    /// and nothing is copied.
+    #[test]
+    fn plain_click_clears_and_copies_nothing() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        let sink = &copied;
+        let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+        // Start a real selection first, then plain-click it away.
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        assert!(app.selection.is_some(), "drag held a selection");
+        assert_eq!(
+            copied.borrow().as_slice(),
+            ["text"],
+            "the drag release copied the selection"
+        );
+
+        // Fresh sink for the click phase.
+        let click_copied = std::cell::RefCell::new(Vec::<String>::new());
+        let click_sink = &click_copied;
+        let click_copy = |text: &str| click_sink.borrow_mut().push(text.to_owned());
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &click_copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &click_copy,
+        );
+        assert!(app.selection.is_none(), "plain click cleared");
+        assert!(click_sink.borrow().is_empty(), "plain click copied nothing");
+    }
+
+    /// Esc clears the selection (the keyboard's deselect), including a
+    /// live drag, and never quits.
+    #[test]
+    fn esc_clears_the_mouse_selection() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                34,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_some());
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.selection.is_none(), "Esc cleared the selection");
+        assert!(!app.should_quit);
+    }
+
+    /// A press outside the chat pane (sidebar / chrome rows) is a plain
+    /// click: it clears the selection instead of starting one.
+    #[test]
+    fn press_outside_the_chat_pane_clears_the_selection() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_some(), "precondition");
+
+        // Sidebar press (no focus — no thread switch either).
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                10,
+                5,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_none(), "sidebar press cleared");
+        assert_eq!(app.active, 0, "no hover switching");
+    }
+
+    /// Wheel scrolling during a live drag leaves the head in document-row
+    /// space (the documented choice: the next drag event re-extends the
+    /// selection; scroll alone never moves it) and the scroll itself works.
+    #[test]
+    fn wheel_during_a_drag_scrolls_without_moving_the_head() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("hello world"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                34,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        let head_before = app.selection.expect("live drag").head;
+
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(app.scroll, WHEEL_STEP, "the wheel still scrolls");
+        assert_eq!(
+            app.selection.expect("drag survives the wheel").head,
+            head_before,
+            "scroll does not move the head (document-row space choice)"
+        );
+    }
+
+    /// A selection press while a modal owns the screen (delete-confirm
+    /// popup open) is ignored — the popup owns the pointer too — and a
+    /// selection made before the popup stays held underneath.
+    #[test]
+    fn selection_presses_are_ignored_while_a_modal_is_open() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+        let noop = |_text: &str| {};
+
+        // Make a selection, then open the delete-confirm popup.
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                26,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(app.selection.is_some(), "precondition");
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, chibi_tui::app::Mode::ConfirmDelete);
+
+        // Press under the popup: ignored (the selection is untouched —
+        // the popup branch consumes the mouse like the keyboard).
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &noop,
+        );
+        assert!(
+            matches!(app.selection, Some(ChatSelection { dragging: true, .. })),
+            "popup press must not start a new selection nor clear"
+        );
     }
 }

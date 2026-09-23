@@ -118,7 +118,9 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 | `Shift+Enter` / `Alt+Enter` | Insert a newline into the input (multi-line prompts) |
 | `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
 | `PgUp` / `PgDn` | Scroll the chat view up/down one page (on macOS laptops without Page keys, `fn`+`↑` / `fn`+`↓` are equivalent) |
-| `Esc` | Clear the input or dismiss a popup; while the Sidebar holds focus, it just returns focus to Chat without touching the draft |
+| Mouse wheel ↑ / ↓ | Scroll the chat view three lines per notch while the cursor is over it (scrolling back down to the end re-pins follow-bottom); with the Sidebar focused, the wheel over it moves the thread selection (no switching on hover without focus). In the log viewer / help modal / model picker, the wheel works wherever the cursor is |
+| Mouse drag-select | Press and drag inside the chat view to highlight text; on release the selected plain text is copied to the clipboard (OSC 52 + `CHIBI_TUI_COPY_CMD` fallback; a failed write degrades silently). Newlines appear at real line breaks, never at wrap points. `Esc`, a plain click (press + release without dragging) or switching threads clears the selection; the selection is session-only and never saved to history |
+| `Esc` | Clear the input or dismiss a popup (also clears a mouse text selection); while the Sidebar holds focus, it just returns focus to Chat without touching the draft |
 | `Ctrl+V` | Paste from the clipboard (macOS: Cmd+V) |
 | `Ctrl+A` / `Ctrl+E` | Move the cursor to the start / end of the line |
 | `Ctrl+U` | Delete from the cursor to the start of the line |
@@ -126,17 +128,42 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 | `Shift+Ctrl+L` | Reset the current thread behind a confirmation popup (same confirm/cancel keys): the thread's history is dropped and the local dialog cleared, both while running and when idle (on legacy terminals this degrades to `Ctrl+L` — type `/reset` at the prompt instead) |
 | `F1` | Toggle the keybindings help modal — a centered, scrollable popup listing every active chord |
 
-> **Terminal support:** `Shift+Enter` / `Alt+Enter`, `Ctrl+↑` / `Ctrl+↓`,
-> `Alt+↑` / `Alt+↓`, `Ctrl+Shift+F`, `Shift+Ctrl+L` and `Ctrl+M` require a
-> terminal that implements the
+> **Keyboard layouts:** all `Ctrl`-chords work under the Russian (ЙЦУКЕН)
+> and Ukrainian keyboard layouts — the app normalizes the layout character
+> crossterm reports (`Ctrl+Ф` → `Ctrl+A`, `Ctrl+С` → `Ctrl+C`,
+> `Ctrl+І` → `Ctrl+S`, …), including the shifted uppercase shapes
+> (`Shift+Ctrl+Д` is the `Shift+Ctrl+L` reset). Plain-letter hotkeys
+> (`R` reconnect, `y`/`n` confirmations, `k`/`j`/`g`/`w` in the log viewer)
+> still require a Latin layout; typing text into the draft, the rename
+> editor and the search popups works with any layout.
+
+> **Terminal support:** `Shift+Enter` / `Alt+Enter`, `Ctrl+Shift+F`,
+> `Shift+Ctrl+L` and `Ctrl+M` require a terminal that implements the
 > [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 > (kitty, WezTerm, foot, recent Ghostty, iTerm2, …); chibi-tui requests the
-> protocol at startup, and on terminals without support the request is
-> silently ignored: `Shift+Enter` / `Alt+Enter` degrade to plain `Enter`
-> (sending the message), the thread-switching chords may arrive as plain
-> arrows or an Esc + arrow pair and then just move the cursor,
-> `Ctrl+Shift+F` degrades to `Ctrl+F`, `Shift+Ctrl+L` to `Ctrl+L`, and
-> `Ctrl+M` arrives as bare `Enter`.
+> protocol at startup (on non-Windows builds — see the Windows note below),
+> and on terminals without support the request is silently ignored:
+> `Shift+Enter` / `Alt+Enter` degrade to plain `Enter` (sending the
+> message), `Ctrl+Shift+F` degrades to `Ctrl+F`, `Shift+Ctrl+L` to
+> `Ctrl+L`, and `Ctrl+M` arrives as bare `Enter`.
+> `Ctrl+↑` / `Ctrl+↓` and their `Alt+↑` / `Alt+↓` synonyms do **not** need
+> the protocol: terminals emit modifier-aware legacy sequences for them.
+> They fail only where something outside the app intercepts the chord —
+> macOS Mission Control binds `Ctrl+↑` / `Ctrl+↓` system-wide (use the
+> `Alt` variants there; see the macOS note below), and multiplexers or SSH
+> remotes may swallow the modifier, in which case the chord degrades to a
+> plain arrow (caret move).
+>
+> **Windows:** the kitty keyboard protocol is never requested on Windows
+> builds. Crossterm reads Windows console input through the Win32 console
+> API, which cannot represent kitty sequences, so requesting the protocol
+> would only make kitty-capable terminals (recent Windows Terminal among
+> them) encode keys the console path cannot decode — Ctrl+↑ / Ctrl+↓ thread
+> switching broke exactly this way before the gate. On Windows builds the
+> protocol-dependent chords above (`Shift+Enter`, `Ctrl+Shift+F`,
+> `Shift+Ctrl+L`, `Ctrl+M`) therefore degrade even in kitty-capable
+> terminals, while `Ctrl+↑` / `Ctrl+↓` work through the console API's own
+> modifier reporting.
 
 > **macOS:** the system binds `Ctrl+↑` / `Ctrl+↓` to Mission Control's
 > *Move between spaces*, so prefer the `Alt+↑` / `Alt+↓` variant there (in

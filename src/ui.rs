@@ -1,7 +1,7 @@
 //! Ratatui layout: sidebar (chat list) + chat view + spinner line + input +
 //! hotkey status line.
 
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::block::Title;
@@ -36,22 +36,57 @@ pub fn scroll_skip(scroll: u16, at_bottom: bool, total: usize, visible: u16) -> 
     max_scroll - scrolled
 }
 
-/// Draw one full frame.
-pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
+/// Panel rectangles of one frame, exactly as [`draw`] lays them out.
+///
+/// The mouse-event router in `main.rs` reuses this geometry to hit-test
+/// which panel the cursor is over, so rendering and hit-testing can never
+/// disagree. Layout is recomputed per frame / per event — there is no
+/// cached geometry anywhere in the render path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutRects {
+    /// Sidebar pane (chat list), left column of the main area.
+    pub sidebar: Rect,
+    /// Chat view pane, right of the sidebar divider.
+    pub chat: Rect,
+    /// Root rows: `[0]` main area, `[1]` spinner line, `[2]` input block,
+    /// `[3]` hotkey-hints line.
+    pub root: [Rect; 4],
+}
+
+impl LayoutRects {
+    /// Chat text column: starts at the chat pane's left edge and excludes
+    /// the 1-column right margin, so the prompt, tint and hints stay
+    /// inside e.g. cols 26..=118 @120 and never spill onto the divider
+    /// (col 25) or the margins.
+    pub fn chat_column(&self) -> Rect {
+        Rect {
+            x: self.chat.x,
+            width: self.chat.width.saturating_sub(1),
+            ..self.root[2]
+        }
+    }
+}
+
+/// Split `area` exactly like [`draw`] does: the root vertical stack (main
+/// area / spinner line / growing input block / hotkey-hints line) plus the
+/// sidebar+chat horizontal split of the main area. `input_height` is the
+/// RAW editor-block height (see `App::input_lines_height`); the tiny-frame
+/// clamp is applied here, shared by the renderer and the mouse router.
+pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
     // the editor block grows per frame from 1 row up to
     // MAX_INPUT_LINES rows with the multiline draft (chat pane shrinks
     // correspondingly: Min(0) absorbs the rest). On tiny terminals the
     // block is additionally clamped so spinner + hints + a sliver of chat
     // always survive; saturating math everywhere keeps ≤4-row frames safe.
-    let max_block_height = f.area().height.saturating_sub(4).max(1);
-    let input_height = app.input_lines_height().min(max_block_height);
+    let max_block_height = area.height.saturating_sub(4).max(1);
+    let input_height = input_height.min(max_block_height);
     let root = Layout::vertical([
         Constraint::Min(0),               // main area
         Constraint::Length(1),            // spinner / status line (above input)
         Constraint::Length(input_height), // growing editor block
         Constraint::Length(1),            // status line with hotkey hints
     ])
-    .split(f.area());
+    .split(area);
 
     let main = Layout::horizontal([
         Constraint::Length(26), // sidebar
@@ -59,19 +94,47 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     ])
     .split(root[0]);
 
-    // The chat column starts at the chat pane's left edge (past the sidebar
-    // divider) and excludes the 1-column right margin, so the prompt, tint
-    // and hints stay inside cols 26..=118 @120 and never spill onto the
-    // divider (col 25) or the margins.
-    let chat_column = Rect {
-        x: main[1].x,
-        width: main[1].width.saturating_sub(1),
-        ..root[2]
-    };
+    LayoutRects {
+        sidebar: main[0],
+        chat: main[1],
+        root: [root[0], root[1], root[2], root[3]],
+    }
+}
 
-    render_sidebar(f, app, theme, main[0]);
-    render_chat(f, app, theme, main[1], root[1]);
-    render_spinner_line(f, app, theme, root[1]);
+/// Which on-screen panel a point falls into — the shared hit-test seam for
+/// mouse routing (wheel scrolling now, text selection later). Modal popups
+/// are NOT regions: they own the whole screen when open, and the router
+/// dispatches on the app `Mode` before consulting geometry at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelRegion {
+    /// The sidebar (chat list) column.
+    Sidebar,
+    /// The chat view column (right of the sidebar divider).
+    Chat,
+    /// Anywhere else (spinner / input / hints rows, margins).
+    Other,
+}
+
+/// Hit-test a terminal point against the frame layout. The two panels do
+/// not overlap (horizontal split), so the check order is irrelevant.
+pub fn panel_region(rects: &LayoutRects, column: u16, row: u16) -> PanelRegion {
+    if rects.sidebar.contains(Position { x: column, y: row }) {
+        PanelRegion::Sidebar
+    } else if rects.chat.contains(Position { x: column, y: row }) {
+        PanelRegion::Chat
+    } else {
+        PanelRegion::Other
+    }
+}
+
+/// Draw one full frame.
+pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
+    let rects = layout_rects(f.area(), app.input_lines_height());
+    let chat_column = rects.chat_column();
+
+    render_sidebar(f, app, theme, rects.sidebar);
+    render_chat(f, app, theme, rects.chat, rects.root[1]);
+    render_spinner_line(f, app, theme, rects.root[1]);
     match &app.mode {
         Mode::Renaming { .. } => render_rename_line(f, app, theme, chat_column),
         // While the confirm, a search or the log viewer popup is open the
@@ -86,7 +149,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         | Mode::ModelPicking { .. }
         | Mode::HelpViewing { .. } => render_input(f, app, theme, chat_column),
     }
-    render_status(f, app, theme, root[3]);
+    render_status(f, app, theme, rects.root[3]);
 
     // Modal error popup overlays everything (rendered last).
     if app.error_popup.is_some() {
@@ -430,6 +493,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     let Some(chat) = app.chats.get(app.active) else {
         return;
     };
+    let chat_id = chat.id.clone();
 
     // Render every message into lines. `msg_ranges` records each message's
     // `[start, end)` span of LOGICAL lines (role header + content + trailing
@@ -491,7 +555,7 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     // here instead, count them, and render WITHOUT an internal wrap: the
     // scrolled view and the row total are the same thing by construction.
     let width = inner.width.max(1) as usize;
-    let (wrapped, first_row_of) = wrap_message_rows_indexed(&lines, width);
+    let (mut wrapped, first_row_of, row_meta) = wrap_message_rows_full(&lines, width);
     let total = wrapped.len();
     let visible = inner.height;
 
@@ -543,6 +607,26 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
 
     let skip = scroll_skip(app.scroll, app.at_bottom(), total, visible);
     let overflowed = total > visible.max(1) as usize;
+
+    // Mouse selection highlight: the selected chars of the affected rows
+    // take a REVERSED overlay BEFORE the Paragraph render — markdown /
+    // syntect styling of the unselected text is untouched (rows without
+    // selected chars stay byte-identical).
+    if let Some(sel) = &app.selection {
+        apply_selection_highlight(&mut wrapped, sel);
+    }
+
+    // Render-fed geometry seam for the mouse router (same pattern as
+    // chat_visible_rows): the wrapped-row model of THIS frame, so a
+    // cursor position maps onto the exact document position the user
+    // sees. Guarded by the thread id against the one-iteration
+    // staleness window after a thread switch.
+    app.chat_geometry = Some(crate::app::ChatGeometry {
+        chat_id,
+        inner,
+        skip,
+        rows: row_meta,
+    });
 
     let text = Text::from(wrapped);
     let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
@@ -1581,6 +1665,21 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
     },
     HotkeyRow {
         group: "Global",
+        chord: "Wheel ↑ / ↓",
+        action: "scroll the chat · select in the focused sidebar",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Drag-select",
+        action: "highlight chat text · release copies it",
+    },
+    HotkeyRow {
+        group: "Global",
+        chord: "Ctrl-chords",
+        action: "work under RU / UA keyboard layouts",
+    },
+    HotkeyRow {
+        group: "Global",
         chord: "Esc",
         action: "clear the input · dismiss popups",
     },
@@ -2522,13 +2621,109 @@ pub fn wrap_message_rows_indexed(
     lines: &[markdown::MdLine],
     max_width: usize,
 ) -> (Vec<markdown::MdLine>, Vec<usize>) {
-    let mut rows = Vec::new();
-    let mut first_row_of = Vec::with_capacity(lines.len());
-    for line in lines {
-        first_row_of.push(rows.len());
-        rows.extend(wrap_line_rows(line, max_width));
-    }
+    let (rows, first_row_of, _) = wrap_message_rows_full(lines, max_width);
     (rows, first_row_of)
+}
+
+/// The full wrap of the transcript, PLUS per-display-row hit-test
+/// metadata ([`crate::app::ChatRowMeta`]): the owning logical line, the
+/// row's char range within it and the row's plain text. The mouse
+/// selection consumes the meta for hit-testing, highlighting and
+/// plain-text extraction — built from the renderer's OWN wrap, so
+/// hit-testing and painting can never disagree.
+pub fn wrap_message_rows_full(
+    lines: &[markdown::MdLine],
+    max_width: usize,
+) -> (
+    Vec<markdown::MdLine>,
+    Vec<usize>,
+    Vec<crate::app::ChatRowMeta>,
+) {
+    let mut rows: Vec<markdown::MdLine> = Vec::new();
+    let mut first_row_of = Vec::with_capacity(lines.len());
+    let mut meta: Vec<crate::app::ChatRowMeta> = Vec::new();
+    for (logical, line) in lines.iter().enumerate() {
+        first_row_of.push(rows.len());
+        let (line_rows, ranges) = wrap_line_rows_indexed(line, max_width);
+        for (row, &(start, end)) in line_rows.iter().zip(ranges.iter()) {
+            let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            meta.push(crate::app::ChatRowMeta {
+                logical,
+                start,
+                end,
+                text,
+            });
+        }
+        rows.extend(line_rows);
+    }
+    (rows, first_row_of, meta)
+}
+
+/// Overlay the mouse selection on the wrapped display rows: chars inside
+/// the ordered (anchor → head) range take a REVERSED modifier ON TOP of
+/// their own span style, so the markdown/syntect coloring of the
+/// unselected text is preserved exactly. Rows without selected chars stay
+/// byte-identical. Selection rows beyond the current content (messages
+/// changed mid-selection) are clamped; a selection char range past a
+/// row's length clamps at the row end.
+fn apply_selection_highlight(rows: &mut [markdown::MdLine], sel: &crate::app::ChatSelection) {
+    let (lo, hi) = sel.ordered();
+    if rows.is_empty() {
+        return;
+    }
+    let last = rows.len() - 1;
+    let (lo_row, hi_row) = (lo.row.min(last), hi.row.min(last));
+    for (r, row) in rows
+        .iter_mut()
+        .enumerate()
+        .skip(lo_row)
+        .take(hi_row - lo_row + 1)
+    {
+        // Effective per-char style, same precedence the wrap applies
+        // (line style patched under span style).
+        let line_style = row.style;
+        let chars: Vec<(char, Style)> = row
+            .spans
+            .iter()
+            .flat_map(|span| {
+                let style = line_style.patch(span.style);
+                span.content.chars().map(move |ch| (ch, style))
+            })
+            .collect();
+        let len = chars.len();
+        let start = if r == lo_row { lo.col.min(len) } else { 0 };
+        let end = if r == hi_row { hi.col.min(len) } else { len };
+        if end <= start {
+            continue;
+        }
+        // Rebuild the row as styled runs; selected runs add REVERSED.
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(row.spans.len() + 1);
+        let mut run = String::new();
+        let mut run_style: Option<Style> = None;
+        for (i, (ch, style)) in chars.iter().enumerate() {
+            let style = if i >= start && i < end {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                *style
+            };
+            match run_style {
+                Some(prev) if prev == style => run.push(*ch),
+                Some(prev) => {
+                    spans.push(Span::styled(std::mem::take(&mut run), prev));
+                    run.push(*ch);
+                    run_style = Some(style);
+                }
+                None => {
+                    run.push(*ch);
+                    run_style = Some(style);
+                }
+            }
+        }
+        if let Some(style) = run_style {
+            spans.push(Span::styled(run, style));
+        }
+        *row = Line::from(spans).style(line_style);
+    }
 }
 
 /// Map a search hit `(message_index, line_index, col)` — as produced by
@@ -2580,7 +2775,8 @@ fn scroll_for_search_jump(target_row: usize, total: usize, visible: u16) -> u16 
 }
 
 /// Expand ONE logical markdown line into the DISPLAY ROWS ratatui paints at
-/// `max_width` columns.
+/// `max_width` columns (the row-only view of [`wrap_line_rows_indexed`],
+/// kept for the wrap-behavior tests).
 ///
 /// Greedy word-wrap over a flattened `(char, style)` stream so styling
 /// survives a mid-span break; unicode-width keeps wide glyphs (CJK, emoji,
@@ -2589,16 +2785,17 @@ fn scroll_for_search_jump(target_row: usize, total: usize, visible: u16) -> u16 
 /// verbatim; a break trims only the spaces that caused it (the visible part
 /// of ratatui's former `Wrap { trim: false }` behavior). Empty input yields
 /// exactly one blank row, matching an empty `Paragraph`.
+#[cfg(test)]
 fn wrap_line_rows(line: &markdown::MdLine, max_width: usize) -> Vec<markdown::MdLine> {
     wrap_line_rows_indexed(line, max_width).0
 }
 
-/// Like [`wrap_line_rows`], but ALSO returns, per output row, the half-open
+/// Like the test-only `wrap_line_rows`, but ALSO returns, per output row, the half-open
 /// `(start, end)` CHAR range of the original line it covers
 /// (mapping a search hit's char offset onto the exact wrapped row the
 /// renderer paints it on). Dropped break-triggering spaces
 /// are covered by no row, so ranges may have gaps — matching the wrap
-/// exactly. Existing callers of [`wrap_line_rows`] keep identical behavior.
+/// exactly. Existing callers of [`wrap_message_rows`] keep identical behavior.
 fn wrap_line_rows_indexed(
     line: &markdown::MdLine,
     max_width: usize,
@@ -6773,6 +6970,227 @@ mod tests {
                 );
                 prev = row.group;
             }
+        }
+    }
+
+    // ---- layout rects / panel region (mouse hit-testing) ----
+
+    #[test]
+    fn layout_rects_matches_the_draw_layout() {
+        let rects = layout_rects(Rect::new(0, 0, 120, 40), 1);
+        // Sidebar is the 26-col left column of the main area; the chat
+        // pane takes the rest of the width.
+        assert_eq!(rects.sidebar.width, 26);
+        assert_eq!(rects.chat.x, 26);
+        assert_eq!(rects.chat.width, 120 - 26);
+        // Root stack: main area of 37 rows, then spinner / input / hints
+        // rows of one row each at the bottom.
+        assert_eq!(rects.root[0].height, 37);
+        assert_eq!(rects.root[1].height, 1);
+        assert_eq!(rects.root[2].height, 1);
+        assert_eq!(rects.root[3].height, 1);
+        assert_eq!(rects.root[3].y, 39);
+    }
+
+    #[test]
+    fn layout_rects_clamps_the_input_block_on_tiny_frames() {
+        // 6-row frame with a 10-row draft: the clamp keeps spinner + hints
+        // + a sliver of chat, so the block collapses to 2 rows and the
+        // chat pane absorbs what remains.
+        let rects = layout_rects(Rect::new(0, 0, 120, 6), 10);
+        assert_eq!(rects.root[2].height, 2);
+        assert_eq!(rects.root[0].height, 2);
+        // A 1-row frame never underflows.
+        let rects = layout_rects(Rect::new(0, 0, 40, 1), 1);
+        assert_eq!(rects.root[2].height, 1);
+    }
+
+    #[test]
+    fn chat_column_excludes_the_right_margin_and_matches_the_input_row() {
+        let rects = layout_rects(Rect::new(0, 0, 120, 40), 1);
+        let column = rects.chat_column();
+        // Starts past the sidebar divider, skips the 1-col right margin,
+        // and is vertically aligned with the input block (root[2]).
+        assert_eq!(column.x, 26);
+        assert_eq!(column.width, 120 - 26 - 1);
+        assert_eq!(column.y, rects.root[2].y);
+        assert_eq!(column.height, rects.root[2].height);
+    }
+
+    #[test]
+    fn panel_region_hit_tests_the_panels_and_the_chrome() {
+        let rects = layout_rects(Rect::new(0, 0, 120, 40), 1);
+        // Inside the sidebar column.
+        assert_eq!(panel_region(&rects, 10, 5), PanelRegion::Sidebar);
+        assert_eq!(panel_region(&rects, 0, 0), PanelRegion::Sidebar);
+        // Inside the chat pane (right of the divider).
+        assert_eq!(panel_region(&rects, 26, 0), PanelRegion::Chat);
+        assert_eq!(panel_region(&rects, 60, 10), PanelRegion::Chat);
+        // Chrome rows (spinner / input / hints) are never panels.
+        assert_eq!(panel_region(&rects, 60, 37), PanelRegion::Other);
+        assert_eq!(panel_region(&rects, 60, 38), PanelRegion::Other);
+        assert_eq!(panel_region(&rects, 60, 39), PanelRegion::Other);
+        // Out of bounds is Other too.
+        assert_eq!(panel_region(&rects, 120, 10), PanelRegion::Other);
+        assert_eq!(panel_region(&rects, 60, 40), PanelRegion::Other);
+    }
+
+    // ---- mouse text selection: wrap meta + highlight -----------------------
+
+    /// The full wrap exposes per-row hit-test metadata: the owning logical
+    /// line, the char range within it (break spaces dropped by the wrap
+    /// leave gaps) and the plain text — and the row/first-row outputs stay
+    /// identical to the indexed wrapper's.
+    #[test]
+    fn wrap_message_rows_full_records_logical_and_char_ranges() {
+        let lines = vec![plain_line("alpha beta gamma delta"), plain_line("second")];
+        let (rows, first_row_of, meta) = wrap_message_rows_full(&lines, 10);
+        assert_eq!(rows.len(), meta.len(), "one meta entry per display row");
+        assert_eq!(first_row_of, vec![0, 3], "first-row map unchanged");
+
+        // "alpha beta" | "gamma" | "delta": the wrap drops the break
+        // spaces, so the char ranges gap (0..10, 11..16, 17..22).
+        assert_eq!(meta[0].logical, 0);
+        assert_eq!((meta[0].start, meta[0].end), (0, 10));
+        assert_eq!(meta[0].text, "alpha beta");
+        assert_eq!(meta[1].logical, 0);
+        assert_eq!((meta[1].start, meta[1].end), (11, 16));
+        assert_eq!(meta[1].text, "gamma");
+        assert_eq!(meta[2].text, "delta");
+        // The next LOGICAL line starts a fresh range.
+        assert_eq!(meta[3].logical, 1);
+        assert_eq!((meta[3].start, meta[3].end), (0, 6));
+        assert_eq!(meta[3].text, "second");
+    }
+
+    /// THE render acceptance criterion: exactly the selected chars take a
+    /// REVERSED overlay on top of their own style — unselected text keeps
+    /// its style untouched, and rows outside the selection are
+    /// byte-identical. Rendered through the full `TestBackend` path with
+    /// the selection anchored in display-row space.
+    #[test]
+    fn selection_highlights_selected_chars_only_in_render() {
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(vec![Chat::new("sel")]);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("hello world"));
+        // First render populates the geometry seam (the same one the
+        // mouse router hit-tests through).
+        let _ = render_grid_with_buffer(&mut app);
+        let geom = app.chat_geometry.clone().expect("geometry cached");
+        let r = geom
+            .rows
+            .iter()
+            .position(|m| m.text.contains("hello world"))
+            .expect("message row in the geometry");
+        // The row's y on the grid: inner top + (row - skip).
+        let y = geom.inner.y + (r - geom.skip) as u16;
+
+        app.selection = Some(crate::app::ChatSelection {
+            anchor: crate::app::SelectionPoint { row: r, col: 0 },
+            head: crate::app::SelectionPoint { row: r, col: 5 },
+            dragging: false,
+        });
+        let (rows, buf) = render_grid_with_buffer(&mut app);
+        let row_text = &rows[y as usize];
+        let x0 = col_of_sub(row_text, "hello").expect("message rendered");
+
+        // "hello" (5 chars) reversed; the space and "world" not.
+        for dx in 0..5usize {
+            let cell = &buf[(x0 as u16 + dx as u16, y)];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "selected char {dx} must be reversed"
+            );
+        }
+        for dx in 5..11usize {
+            let cell = &buf[(x0 as u16 + dx as u16, y)];
+            assert!(
+                !cell.modifier.contains(Modifier::REVERSED),
+                "unselected char {dx} must not be reversed"
+            );
+        }
+        // Styling preserved: reversed is an overlay, the fg slot of a
+        // selected char equals its unselected neighbor's slot family
+        // (plain markdown text renders in the theme fg either way).
+        assert_eq!(
+            buf[(x0 as u16, y)].fg,
+            buf[(x0 as u16 + 6, y)].fg,
+            "selected and unselected text share the markdown fg slot"
+        );
+        assert_eq!(buf[(x0 as u16, y)].fg, theme.fg);
+
+        // Clearing the selection restores the plain render.
+        app.clear_selection();
+        let (rows_plain, buf_plain) = render_grid_with_buffer(&mut app);
+        assert_eq!(rows_plain[y as usize], *row_text, "text identical");
+        assert!(
+            !buf_plain[(x0 as u16, y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "no highlight after the clear"
+        );
+    }
+
+    /// A selection spanning several wrapped rows highlights its slice on
+    /// every affected row: full rows entirely, edge rows partially.
+    #[test]
+    fn selection_highlight_spans_wrapped_rows() {
+        let mut app = App::new(vec![Chat::new("wrap")]);
+        // Narrow pane: force the paragraph onto multiple display rows.
+        app.chats[0]
+            .messages
+            .push(Message::assistant("alpha beta gamma delta epsilon"));
+        let _ = render_grid_at_with_buffer(&mut app, 50, 24);
+        let geom = app.chat_geometry.clone().expect("geometry cached");
+        let content: Vec<usize> = geom
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.text.contains("alpha") || m.text.contains("epsilon"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            content.len() >= 2,
+            "precondition: the message wraps over several rows"
+        );
+        let first = content[0];
+        let second = content[1];
+
+        app.selection = Some(crate::app::ChatSelection {
+            anchor: crate::app::SelectionPoint { row: first, col: 6 },
+            head: crate::app::SelectionPoint {
+                row: second,
+                col: 5,
+            },
+            dragging: false,
+        });
+        let (_, buf) = render_grid_at_with_buffer(&mut app, 50, 24);
+        let y_first = geom.inner.y + (first - geom.skip) as u16;
+        let y_second = geom.inner.y + (second - geom.skip) as u16;
+
+        // First row: from char 6 to the row end is reversed.
+        let reversed_first: Vec<bool> = (0..geom.rows[first].text.chars().count())
+            .map(|dx| {
+                buf[((geom.inner.x as usize + dx) as u16, y_first)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect();
+        assert!(!reversed_first[5], "chars before the anchor stay plain");
+        assert!(
+            reversed_first[6..].iter().all(|&rev| rev),
+            "the anchor-to-end slice is reversed: {reversed_first:?}"
+        );
+        // Second row: chars 0..5 reversed (its slice of the selection).
+        for dx in 0..5usize {
+            assert!(
+                buf[((geom.inner.x as usize + dx) as u16, y_second)]
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "second-row slice char {dx} reversed"
+            );
         }
     }
 }
