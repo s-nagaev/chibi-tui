@@ -1,16 +1,27 @@
 //! Clipboard plumbing for the TUI.
 //!
 //! Reading (paste into the input field) goes through `arboard`. Writing
-//! (the `y` key in the ^G log viewer) is dependency-free on purpose: the
-//! primary transport is an OSC 52 escape sequence, which most modern
-//! terminals understand, with an optional external command as fallback.
+//! (the `y` key in the ^G log viewer, the chat selection copy) fans out
+//! over three transports, attempted in order:
+//!
+//! 1. an OSC 52 escape sequence on stdout, which many modern terminals
+//!    understand — and some SSH workflows rely on;
+//! 2. the `arboard` system clipboard, which makes the copy land for real
+//!    on macOS/Windows/Linux desktop sessions regardless of terminal
+//!    settings (this is the transport that actually delivers when the
+//!    terminal ignores OSC 52 — e.g. iTerm2 with its default settings,
+//!    Terminal.app);
+//! 3. an optional external command (`CHIBI_TUI_COPY_CMD`).
+//!
+//! All available transports are attempted and success is any one of them:
+//! a terminal that silently drops OSC 52 cannot be detected in-band, so
+//! the escape stays fire-and-forget, and writing the same payload through
+//! both OSC 52 and the system clipboard is harmless (identical content).
+//! Each transport failing degrades silently — the header just shows
+//! `copy: unavailable`.
 //!
 //! OSC 52 format used here: `ESC ] 52 ; c ; <base64 of utf-8 payload> BEL`
 //! (`\x1b]52;c;<b64>\x07`). The `c` selection is the clipBOARD equivalent.
-//! Note that a terminal can silently ignore the sequence (for example iTerm2
-//! before the "Applications in terminal may access clipboard" pref is
-//! enabled), and the app has no way to detect that, so the escape is
-//! fire-and-forget by design.
 
 use std::io::Write;
 
@@ -85,15 +96,26 @@ fn pipe_to_cmd(cmd: &str, text: &str) -> std::io::Result<()> {
 /// Copy `text` to the system clipboard, testable form.
 ///
 /// `out` receives the OSC 52 bytes (production passes stdout, tests pass a
-/// buffer). `cmd` is the `CHIBI_TUI_COPY_CMD` fallback, if set: the payload
-/// is piped to its stdin as well. Both transports are attempted when
-/// available; the copy counts as done when at least one succeeded, since a
-/// terminal that silently ignores OSC 52 cannot be detected in-band.
-pub fn copy_text_with(text: &str, out: &mut dyn Write, cmd: Option<&str>) -> CopyOutcome {
+/// buffer). `try_system_clipboard` is the `arboard` transport, injected so
+/// unit tests never touch the real clipboard (production passes
+/// the private `set_system_clipboard` helper). `cmd` is the `CHIBI_TUI_COPY_CMD` fallback,
+/// if set: the payload is piped to its stdin as well. All available
+/// transports are attempted; the copy counts as done when at least one
+/// succeeded, since a terminal that silently ignores OSC 52 cannot be
+/// detected in-band.
+pub fn copy_text_with(
+    text: &str,
+    out: &mut dyn Write,
+    cmd: Option<&str>,
+    try_system_clipboard: &dyn Fn(&str) -> bool,
+) -> CopyOutcome {
     let mut ok = out
         .write_all(osc52_sequence(text).as_bytes())
         .and_then(|_| out.flush())
         .is_ok();
+    if try_system_clipboard(text) {
+        ok = true;
+    }
     if let Some(cmd) = cmd.map(str::trim).filter(|c| !c.is_empty()) {
         if pipe_to_cmd(cmd, text).is_ok() {
             ok = true;
@@ -106,14 +128,25 @@ pub fn copy_text_with(text: &str, out: &mut dyn Write, cmd: Option<&str>) -> Cop
     }
 }
 
-/// Production entry point: OSC 52 to stdout, plus the `CHIBI_TUI_COPY_CMD`
-/// fallback when the env var is set to a non-empty value.
+/// The real system-clipboard transport: write `text` via `arboard`.
+/// Returns `false` when the clipboard is unavailable (headless session,
+/// Wayland without the data-control protocol, …) — degrades silently, as
+/// with every other transport.
+fn set_system_clipboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(text))
+        .is_ok()
+}
+
+/// Production entry point: OSC 52 to stdout, the `arboard` system clipboard,
+/// plus the `CHIBI_TUI_COPY_CMD` fallback when the env var is set to a
+/// non-empty value.
 pub fn copy_text(text: &str) -> CopyOutcome {
     let cmd = std::env::var_os("CHIBI_TUI_COPY_CMD")
         .map(|v| v.to_string_lossy().into_owned())
         .filter(|v| !v.trim().is_empty());
     let mut out = std::io::stdout().lock();
-    copy_text_with(text, &mut out, cmd.as_deref())
+    copy_text_with(text, &mut out, cmd.as_deref(), &set_system_clipboard)
 }
 
 /// Read text from the system clipboard. Returns `None` when the clipboard is
@@ -142,19 +175,38 @@ mod tests {
         assert_eq!(osc52_sequence("h\u{e9}llo"), "\u{1b}]52;c;aMOpbGxv\u{7}");
     }
 
-    /// Primary transport: the OSC 52 bytes land in the given writer and the
-    /// copy counts as done.
+    /// A writer that always fails (no tty in tests).
+    struct Dead;
+    impl Write for Dead {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no tty in tests"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// OSC 52 transport: the bytes land in the given writer and the copy
+    /// counts as done even when the system clipboard is unavailable.
     #[test]
     fn copy_via_osc52_writes_sequence() {
         let mut sink = Vec::new();
-        let outcome = copy_text_with("log line one", &mut sink, None);
+        let outcome = copy_text_with("log line one", &mut sink, None, &|_| false);
         assert_eq!(outcome, CopyOutcome::Copied);
         assert_eq!(sink, osc52_sequence("log line one").into_bytes());
     }
 
+    /// System-clipboard transport: the copy counts as done even when the
+    /// OSC 52 writer is dead and no command fallback is set.
+    #[test]
+    fn copy_via_system_clipboard_alone_succeeds() {
+        let outcome = copy_text_with("payload", &mut Dead, None, &|_| true);
+        assert_eq!(outcome, CopyOutcome::Copied);
+    }
+
     /// Fallback transport: with CHIBI_TUI_COPY_CMD semantics, the payload is
     /// piped to the command's stdin verbatim (tee writes it to a file we can
-    /// assert on).
+    /// assert on) even when both other transports fail.
     #[test]
     fn copy_via_fallback_cmd_pipes_stdin() {
         let path = std::env::temp_dir().join(format!(
@@ -165,31 +217,38 @@ mod tests {
                 .as_nanos()
         ));
         let cmd = format!("tee {}", path.display());
-        let mut sink = Vec::new();
-        let outcome = copy_text_with("piped payload", &mut sink, Some(&cmd));
+        let outcome = copy_text_with("piped payload", &mut Dead, Some(&cmd), &|_| false);
         assert_eq!(outcome, CopyOutcome::Copied);
         let written = std::fs::read_to_string(&path).expect("tee wrote the file");
         assert_eq!(written, "piped payload");
         std::fs::remove_file(&path).ok();
     }
 
-    /// Unavailable path: a dead writer AND a nonexistent command leave no
-    /// working transport, so the header would show `copy: unavailable`.
+    /// Any single working transport is enough: with all three available the
+    /// payload is delivered through every one of them (writing the same
+    /// content twice via OSC 52 + system clipboard is harmless).
+    #[test]
+    fn copy_succeeds_when_every_transport_works() {
+        let mut sink = Vec::new();
+        let outcome = copy_text_with("everywhere", &mut sink, Some("cat > /dev/null"), &|_| true);
+        assert_eq!(outcome, CopyOutcome::Copied);
+        assert_eq!(sink, osc52_sequence("everywhere").into_bytes());
+    }
+
+    /// Unavailable path: a dead writer, a failing system-clipboard attempt
+    /// AND a nonexistent command leave no working transport, so the header
+    /// would show `copy: unavailable`.
     #[test]
     fn copy_unavailable_when_every_transport_fails() {
-        struct Dead;
-        impl Write for Dead {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("no tty in tests"))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let outcome = copy_text_with("x", &mut Dead, Some("chibi_tui_no_such_binary_xyz"));
+        let outcome = copy_text_with(
+            "x",
+            &mut Dead,
+            Some("chibi_tui_no_such_binary_xyz"),
+            &|_| false,
+        );
         assert_eq!(outcome, CopyOutcome::Unavailable);
         // Dead writer alone is just as unavailable.
-        let outcome = copy_text_with("x", &mut Dead, None);
+        let outcome = copy_text_with("x", &mut Dead, None, &|_| false);
         assert_eq!(outcome, CopyOutcome::Unavailable);
     }
 }

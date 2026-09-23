@@ -1984,9 +1984,10 @@ impl App {
     /// y: copy the full text of the cursor LOGICAL line to the clipboard.
     ///
     /// In wrap mode that is the whole message, not the truncated row. The
-    /// transports are [`crate::clipboard::copy_text`]: OSC 52 first, plus
-    /// the `CHIBI_TUI_COPY_CMD` fallback when set. The header gets a brief
-    /// feedback note either way (`copied` / `copy: unavailable`).
+    /// transports are [`crate::clipboard::copy_text`]: OSC 52 first, then
+    /// the `arboard` system clipboard, then the `CHIBI_TUI_COPY_CMD`
+    /// fallback when set. The header gets a brief feedback note either way
+    /// (`copied` / `copy: unavailable`).
     pub fn log_copy_selected(&mut self) {
         let note = match &self.mode {
             Mode::LogViewer { state } => {
