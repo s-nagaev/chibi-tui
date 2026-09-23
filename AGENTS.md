@@ -38,16 +38,22 @@ cargo build --release                          # binary at target/release/chibi-
 
 ## Architecture
 
-The library (`lib.rs`) holds the testable core; `main.rs` is the
-runtime/controller layer — tokio event loop, keyboard/mode dispatch,
-submit/queue handling, persistence calls, last-thread tracking, many tests.
-UI code never talks to processes or sockets — it consumes `BackendEvent`
+The library (`lib.rs`) holds the testable core; `main.rs` is a thin
+bin-level controller — tokio event loop, submit/queue handling, persistence
+calls, last-thread tracking. Keyboard dispatch and mouse handling are
+extracted from `main.rs` into the bin-level `keymap.rs` and `mouse.rs`
+modules. UI code never talks to processes or sockets — it consumes `BackendEvent`
 streams from `crate::backend`, so the backend source (mock ↔ live) is
 swappable without UI changes.
 
 ```text
 src/
-├── main.rs             runtime/controller: tokio event loop, keyboard & mode dispatch, submit/queue, persistence + last-thread tracking, CLI
+├── main.rs             bin-level controller: tokio event loop, submit/queue, persistence + last-thread tracking, CLI
+├── keymap.rs           keyboard dispatch (bin): key events → app actions, Cyrillic Ctrl-chord normalization
+├── keymap/tests.rs     keyboard-dispatch tests (topic submodules incl. Cyrillic chords)
+├── mouse.rs            mouse handling (bin): wheel scrolling across surfaces, chat-pane text selection
+├── mouse/tests.rs      mouse-handling tests
+├── tests.rs + tests/   main.rs's bin-level tests: bootstrap, send_submitted, terminal_restore (+ support helpers)
 ├── lib.rs              library root; module tree + public re-exports
 ├── protocol.rs         serde types of IDE protocol v1 (internally tagged; ProtocolVersion parses only the literal 1)
 ├── backend_client.rs   child-process lifecycle: spawn, handshake, JSONL framing, stderr → diag log
@@ -55,7 +61,7 @@ src/
 ├── live.rs             LiveBackend: real backend source; frames → BackendEvent; wire ids: thread = i64 UUID hash, request = u64 stand-in
 ├── backend.rs          Backend trait + MockBackend + BackendEvent — the seam the UI consumes
 ├── history.rs          persistence: one JSON per thread + last-thread.json pointer
-├── app.rs              App state: chats, selection, input, connection, per-thread mirrors, sticky display state, per-chat subagent counters
+├── app.rs              App state: chats, selection, input, connection, per-thread mirrors, sticky display state, per-chat subagent counters (+ tests in app/tests/)
 ├── markdown.rs         pulldown-cmark → styled ratatui lines (+ syntect highlighting)
 ├── mock.rs             static mock conversations and replies for --mock
 ├── model.rs            Message / Role / ChatStatus / ChatLifecycle types
@@ -66,14 +72,13 @@ src/
 ├── clipboard.rs        arboard-backed clipboard paste into the input (Ctrl+V / Cmd+V)
 ├── diag.rs             diagnostics ring buffer (512 lines) + optional CHIBI_TUI_LOG file sink; parses ` | LEVEL | `
 ├── theme.rs            Tokyo Night palette + syntect global syntax state
-└── ui.rs               layout & rendering: sidebar, chat view, input, status strip, log viewer, popups
+└── ui.rs               layout & rendering: sidebar, chat view, input, status strip, log viewer, popups (+ tests in ui/tests/)
 ```
 
-`README.md` is partially stale — do not learn behavior from it: its
-Architecture list is missing `model_picker.rs` / `setup_screen.rs` /
-`clipboard.rs` / `diag.rs`, and its "Model label" / status-strip sections
-predate persistence (labels are persisted per thread as `last_model`, not
-session-scoped). Fix the README when touching those areas.
+`README.md` is user-facing and intentionally brief; it keeps only a short
+Architecture summary. Do not learn behavior from it — this file and the code
+are the source of truth. Fix the README when touching those areas if the
+summary drifts.
 
 ## Behavioral contracts — do not break
 
@@ -140,10 +145,19 @@ session-scoped). Fix the README when touching those areas.
   as the modal error popup (`R` retry, `Esc` dismiss, `q`/Ctrl+C quit) —
   never a panic, never a silent swallow.
 - **Terminal capability degradation.** The kitty keyboard protocol is
-  pushed at startup (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`)
-  and popped on exit. Chords that degrade on legacy terminals (Shift+Enter,
-  Ctrl+M, Ctrl+Shift+F, Ctrl+arrows) are documented in the README keybinding
-  table — keep it honest when touching keybindings.
+  pushed at startup ONLY on non-Windows builds
+  (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`; see
+  `push_kitty_flags()` in `main.rs` — the Win32 console input path cannot
+  represent kitty sequences, and pushing there makes kitty-capable
+  terminals emit keys the console path mis-decodes, which is how
+  Ctrl+↑/↓ thread switching broke). The `TerminalRestore` guard pops the
+  flags if and only if they were pushed — the push/pop decisions always
+  mirror each other. On unix, legacy encodings (`ESC[1;5A`) and kitty
+  CSI-u encodings decode into the same `KeyEvent`, so both flavors work
+  everywhere the byte stream is parsed. Chords that degrade on legacy
+  terminals (Shift+Enter, Ctrl+M, Ctrl+Shift+F, Shift+Ctrl+L) are
+  documented in the README keybinding table — keep it honest when touching
+  keybindings.
 
 ## Wire frames (protocol v1)
 
@@ -159,7 +173,9 @@ wire `thread_id` is a deterministic i64 hash of the chat's stable UUID.
 ## Tests
 
 - Unit tests live inline (`#[cfg(test)] mod tests` at the bottom of each
-  module); integration tests live in `tests/`.
+  module) OR in a sibling `mod tests;` file (e.g. `keymap.rs` +
+  `keymap/tests.rs`); large flat test blobs must not accumulate in a single
+  file. Integration tests live in `tests/`.
 - `tests/protocol_fixtures.rs` runs against `tests/fixtures/ide_protocol/` —
   canonical copies of the backend repo's fixtures. Never edit them here: fix
   upstream and re-copy.

@@ -266,6 +266,18 @@ pub fn render(md: &str, theme: &Theme) -> Vec<MdLine> {
             }
 
             // ---------- text flow ----------
+            // Paragraph boundaries: `End(Paragraph)` / `Start(Paragraph)`
+            // carry no flush of their own, so a blank-line-separated
+            // prompt (`тест1\n\nтест2` → two paragraphs) used to
+            // accumulate BOTH paragraphs' text in the same span buffer and
+            // render glued on one row. Flush at each paragraph start and
+            // keep the blank line the source had between the two blocks.
+            Event::Start(Tag::Paragraph) => {
+                if !spans.is_empty() {
+                    flush_line!();
+                    out.push(Line::from(""));
+                }
+            }
             Event::Text(t) => {
                 push_text!(&t, inline_style.fg(base_fg));
             }
@@ -555,6 +567,49 @@ mod tests {
         assert!(plain.contains("let x = 42;"));
     }
 
+    /// Multi-line user prompt, single `\n` (the Shift+Enter draft shape):
+    /// pulldown-cmark emits Text / SoftBreak / Text inside ONE paragraph —
+    /// the SoftBreak flush must split the draft into two rendered lines.
+    #[test]
+    fn single_newline_renders_two_separate_lines() {
+        let theme = Theme::tokyo_night();
+        let plain = to_plain(&render("тест5\nтест6", &theme));
+        assert_eq!(
+            plain.lines().collect::<Vec<_>>(),
+            vec!["тест5", "тест6"],
+            "single \\n must split into two lines, got {plain:?}"
+        );
+    }
+
+    /// THE glue regression: a prompt with a BLANK line (`тест1\n\nтест2`)
+    /// parses as TWO paragraphs. `End(Paragraph)` / `Start(Paragraph)` used
+    /// to be unhandled, so the second paragraph's text accumulated in the
+    /// same span buffer as the first and the bubble rendered `тест1тест2`
+    /// on one row. Each paragraph must land on its own line with the blank
+    /// separation preserved.
+    #[test]
+    fn blank_line_between_paragraphs_renders_separate_lines() {
+        let theme = Theme::tokyo_night();
+        let plain = to_plain(&render("тест1\n\nтест2", &theme));
+        assert_eq!(
+            plain.lines().collect::<Vec<_>>(),
+            vec!["тест1", "", "тест2"],
+            "blank-line paragraphs must not glue, got {plain:?}"
+        );
+    }
+
+    /// Assistant answers with blank-line-separated paragraphs must not glue
+    /// either (same parser path, both roles share `markdown::render`).
+    #[test]
+    fn assistant_blank_line_paragraphs_render_separate_lines() {
+        let theme = Theme::tokyo_night();
+        let plain = to_plain(&render("alpha para\n\nbeta para", &theme));
+        assert_eq!(
+            plain.lines().collect::<Vec<_>>(),
+            vec!["alpha para", "", "beta para"],
+            "assistant paragraphs must not glue, got {plain:?}"
+        );
+    }
     #[test]
     fn empty_input_yields_single_empty_line() {
         let theme = Theme::tokyo_night();

@@ -1,6 +1,8 @@
 # Unified Chibi image: chibi-tui terminal client + chibi backend (agent mode).
 # The TUI spawns `chibi stdio --tui`, so the backend console script is installed
-# in the same image; skills are served from /app/skills.
+# in the same image; built-in skills ship inside the backend Python package
+# (chibi/skills) — SKILLS_DIR is not set (it is a user-facing knob for custom
+# skill directories only).
 #
 # This image is self-sufficient: a bare clone of chibi-tui builds it with no
 # external build context. The backend source is git-cloned inside the build
@@ -45,7 +47,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=backend-src /repo/requirements.txt /repo/pyproject.toml /repo/README.md ./
 COPY --from=backend-src /repo/chibi ./chibi
-COPY --from=backend-src /repo/skills ./skills
 # data/.keep is excluded from the build context by the backend's .dockerignore;
 # recreate it so the poetry includes resolve during wheel build.
 RUN mkdir -p data && touch data/.keep
@@ -86,12 +87,12 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=tui-builder /tui/target/release/chibi-tui /usr/local/bin/chibi-tui
 
 WORKDIR /app
-COPY --from=backend-src /repo/skills ./skills
 RUN mkdir -p /app/data
 
 # Default environment variables (agent mode)
 ENV FILESYSTEM_ACCESS=true
 ENV ENABLE_MCP_STDIO=true
-ENV SKILLS_DIR=/app/skills
+# NOTE: SKILLS_DIR is intentionally NOT set — built-in skills are served from
+# the installed package (chibi/skills); set SKILLS_DIR only for custom skills.
 
 CMD ["chibi-tui"]
