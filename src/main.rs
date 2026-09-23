@@ -1083,6 +1083,22 @@ fn normalize_cyrillic_ctrl_chord(
 /// reconnect) happen in the event loop by observing state changes, keeping
 /// this function synchronous and testable.
 fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
+    handle_key_with_copy(app, key, &|text| {
+        // Same clipboard transport as the selection release copy below
+        // (OSC 52 + the env fallback); the outcome is deliberately
+        // ignored — a failed write must not disturb the UI.
+        let _ = chibi_tui::clipboard::copy_text(text);
+    });
+}
+
+/// Testable form of [`handle_key`]: the clipboard write arrives as a
+/// closure (production passes [`chibi_tui::clipboard::copy_text`], tests
+/// capture into a buffer), the same seam [`handle_mouse_with_copy`] uses.
+fn handle_key_with_copy(
+    app: &mut chibi_tui::app::App,
+    key: crossterm::event::KeyEvent,
+    copy: &dyn Fn(&str),
+) {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return;
     }
@@ -1781,6 +1797,22 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         }
         (KeyCode::PageUp, _) => app.scroll_up(app.chat_visible_rows),
         (KeyCode::PageDown, _) => app.scroll_down(app.chat_visible_rows),
+        // y with a held chat selection copies its plain text through the
+        // SAME clipboard path as the drag-release copy (and the log
+        // viewer's `y`); the outcome is ignored — a failed write degrades
+        // silently. The selection STAYS active after copying (the user
+        // still sees what they copied; a click / Esc / thread switch
+        // clears it as before). Without a selection the arm does not
+        // claim the key: plain `y` keeps its pre-existing behavior
+        // (typing into the draft) and no binding is shadowed.
+        // Latin-only by convention: under RU/UA layouts the plain letter
+        // is never rewritten (only Ctrl-chords are normalized), so `y`
+        // stays a Latin keypress by design.
+        (KeyCode::Char('y'), false) if !alt && app.selection.is_some() => {
+            if let Some(text) = app.selection_text() {
+                copy(&text);
+            }
+        }
         (KeyCode::Esc, _) if !input_is_empty => {
             // Non-empty input: clear it (and any mouse selection with it).
             app.clear_selection();
@@ -4988,6 +5020,7 @@ mod tests {
             "Drag-select",
             "highlight chat text · release copies it",
         ),
+        ("Global", "y", "copy the active chat selection"),
         (
             "Global",
             "Ctrl-chords",
@@ -6100,7 +6133,117 @@ mod tests {
         assert!(click_sink.borrow().is_empty(), "plain click copied nothing");
     }
 
-    /// Esc clears the selection (the keyboard's deselect), including a
+    /// `y` with a held chat selection copies its plain text through the
+    /// SAME injected clipboard seam as the release copy, and the selection
+    /// STAYS active afterwards (the user still sees what they copied).
+    #[test]
+    fn y_copies_the_held_selection_and_keeps_it_active() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("hello world from selection"));
+        render_for_geometry(&mut app);
+
+        // Build a real selection through the mouse dispatch ("hello").
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    26,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    31,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    31,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            assert_eq!(
+                copied.borrow().as_slice(),
+                ["hello"],
+                "the release copied the dragged range"
+            );
+            copied.borrow_mut().clear();
+        }
+        assert!(app.selection.is_some(), "release held the selection");
+
+        // `y` copies through the keyboard seam — WITHOUT clearing.
+        let y_copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &y_copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            handle_key_with_copy(
+                &mut app,
+                key_event(KeyCode::Char('y'), KeyModifiers::NONE),
+                &copy,
+            );
+        }
+        assert_eq!(
+            y_copied.borrow().as_slice(),
+            ["hello"],
+            "y copied the selected plain text"
+        );
+        assert!(
+            app.selection.is_some(),
+            "the selection stays active after the copy"
+        );
+
+        // A later Esc clears it as before (the deselect path is untouched).
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.selection.is_none(), "Esc still deselects after a copy");
+    }
+
+    /// Without a selection `y` is NOT claimed by the copy binding: nothing
+    /// is copied and the pre-existing behavior (plain typing into the
+    /// draft) is preserved — no binding is shadowed.
+    #[test]
+    fn y_without_a_selection_copies_nothing_and_types_into_the_draft() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "draf");
+
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            handle_key_with_copy(
+                &mut app,
+                key_event(KeyCode::Char('y'), KeyModifiers::NONE),
+                &copy,
+            );
+        }
+        assert!(
+            copied.borrow().is_empty(),
+            "nothing selected, nothing copied"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "drafy",
+            "plain y keeps its typing behavior without a selection"
+        );
+    }
+
+    /// Esc clears the selection    /// Esc clears the selection (the keyboard's deselect), including a
     /// live drag, and never quits.
     #[test]
     fn esc_clears_the_mouse_selection() {

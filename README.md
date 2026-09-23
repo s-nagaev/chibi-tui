@@ -120,6 +120,7 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 | `PgUp` / `PgDn` | Scroll the chat view up/down one page (on macOS laptops without Page keys, `fn`+`↑` / `fn`+`↓` are equivalent) |
 | Mouse wheel ↑ / ↓ | Scroll the chat view three lines per notch while the cursor is over it (scrolling back down to the end re-pins follow-bottom); with the Sidebar focused, the wheel over it moves the thread selection (no switching on hover without focus). In the log viewer / help modal / model picker, the wheel works wherever the cursor is |
 | Mouse drag-select | Press and drag inside the chat view to highlight text; on release the selected plain text is copied to the clipboard (OSC 52 + `CHIBI_TUI_COPY_CMD` fallback; a failed write degrades silently). Newlines appear at real line breaks, never at wrap points. `Esc`, a plain click (press + release without dragging) or switching threads clears the selection; the selection is session-only and never saved to history |
+| `y` | Copy the current chat text selection to the clipboard again (same transport as the drag-release copy); the selection stays highlighted afterwards. Without an active selection `y` is not bound and types into the input as usual (plain-letter hotkeys are Latin-only) |
 | `Esc` | Clear the input or dismiss a popup (also clears a mouse text selection); while the Sidebar holds focus, it just returns focus to Chat without touching the draft |
 | `Ctrl+V` | Paste from the clipboard (macOS: Cmd+V) |
 | `Ctrl+A` / `Ctrl+E` | Move the cursor to the start / end of the line |

@@ -1672,6 +1672,11 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
     },
     HotkeyRow {
         group: "Global",
+        chord: "y",
+        action: "copy the active chat selection",
+    },
+    HotkeyRow {
+        group: "Global",
         chord: "Ctrl-chords",
         action: "work under RU / UA keyboard layouts",
     },

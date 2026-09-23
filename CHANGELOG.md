@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `y` copies the current chat text selection to the clipboard (the same OSC 52 + `CHIBI_TUI_COPY_CMD` path as the drag-release copy); the selection stays highlighted after copying. Without an active selection `y` keeps typing into the input as before.
+
 ### Changed
 
 - Upgraded `ratatui` to 0.30 and `crossterm` to 0.29, closing the transitive `lru` vulnerability advisory (`lru` is now 0.18.5; Dependabot had flagged 0.12.5 as unfixable while `ratatui` 0.29 pinned it).
