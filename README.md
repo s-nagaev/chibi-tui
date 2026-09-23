@@ -116,7 +116,8 @@ The app starts in fullscreen alternate-screen mode; the terminal is restored on 
 | `Ctrl+M` | Open the model picker popup (`↑`/`↓` navigate, `Enter` switch, `Esc` close; requires the kitty keyboard protocol) |
 | `Enter` | Send the message (or queue it while this chat is busy) |
 | `Shift+Enter` / `Alt+Enter` | Insert a newline into the input (multi-line prompts) |
-| `Ctrl+C` | Cancel the in-flight request of the current chat; quit when idle |
+| `Ctrl+C` | Cancel the in-flight request of the current chat; when idle, open the quit confirmation (`y`/`Enter` quits, `n`/`Esc`/`q` stays — the second `Ctrl+C` is itself a confirmation) |
+| Quit confirmation | Every manual exit asks first: idle `Ctrl+C`, `q`/`Ctrl+C` from the error popup, and the same exit keys on the startup splash and the backend setup screen all open a centered "Quit chibi-tui?" popup (`y`/`Enter` quit, `n`/`Esc`/`q` stay). Dismissing restores the exact prior state — draft, focus, open popups and a streaming request are never touched by the popup itself |
 | `PgUp` / `PgDn` | Scroll the chat view up/down one page (on macOS laptops without Page keys, `fn`+`↑` / `fn`+`↓` are equivalent) |
 | Mouse wheel ↑ / ↓ | Scroll the chat view three lines per notch while the cursor is over it (scrolling back down to the end re-pins follow-bottom); with the Sidebar focused, the wheel over it moves the thread selection (no switching on hover without focus). In the log viewer / help modal / model picker, the wheel works wherever the cursor is |
 | Mouse drag-select | Press and drag inside the chat view to highlight text; on release the selected plain text is copied to the clipboard (OSC 52 + `CHIBI_TUI_COPY_CMD` fallback; a failed write degrades silently). Newlines appear at real line breaks, never at wrap points. `Esc`, a plain click (press + release without dragging) or switching threads clears the selection; the selection is session-only and never saved to history |

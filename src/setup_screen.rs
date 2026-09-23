@@ -59,7 +59,8 @@ pub fn applies(err: &BackendError, backend_bin_env: Option<&OsStr>) -> bool {
 pub enum Flow {
     /// `r`: re-attempt the backend spawn.
     Retry,
-    /// `q`/Esc/Ctrl+C: leave the app.
+    /// `q`/Esc/Ctrl+C, confirmed via the shared quit confirmation: leave
+    /// the app.
     Quit,
 }
 
@@ -145,7 +146,10 @@ pub fn content_lines(os: TargetOs, theme: &Theme) -> Vec<Line<'static>> {
 
 /// Draw one setup frame: theme background everywhere plus a centered
 /// bordered block sized to the content (same shape as the modal popups).
-pub fn draw(f: &mut Frame, theme: &Theme) {
+/// `quit_confirm` overlays the shared "Quit chibi-tui?" popup (the same
+/// renderer the in-app confirm uses, the same shared grammar — see
+/// [`crate::app::quit_decision`]).
+pub fn draw(f: &mut Frame, theme: &Theme, quit_confirm: bool) {
     use unicode_width::UnicodeWidthStr;
 
     let area = f.area();
@@ -194,28 +198,46 @@ pub fn draw(f: &mut Frame, theme: &Theme) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     f.render_widget(Paragraph::new(lines), inner);
+
+    if quit_confirm {
+        crate::ui::render_quit_confirm(f, theme);
+    }
 }
 
 /// Run the setup screen loop.
 ///
 /// Returns [`Flow::Retry`] for `r` (the caller re-attempts the spawn) and
-/// [`Flow::Quit`] for `q`/Esc/Ctrl+C (the caller exits the app). Other keys
-/// and mouse/resize events only trigger a redraw.
+/// [`Flow::Quit`] for a CONFIRMED `q`/Esc/Ctrl+C: the exit keys open the
+/// shared quit-confirmation popup first (`y`/Enter quits, `n`/Esc/`q`
+/// returns to the screen; the same grammar as the in-app confirm and the
+/// splash). Other keys and mouse/resize events only trigger a redraw.
 pub async fn run(terminal: &mut Tui, reader: &mut EventStream, theme: &Theme) -> io::Result<Flow> {
+    let mut quit_confirm = false;
     loop {
-        terminal.draw(|f| draw(f, theme))?;
+        terminal.draw(|f| draw(f, theme, quit_confirm))?;
         let maybe_event = reader.next().await;
         match maybe_event {
             Some(Ok(CtEvent::Key(key))) if key.kind == KeyEventKind::Press => {
+                if quit_confirm {
+                    match crate::app::quit_decision(key) {
+                        crate::app::QuitDecision::Confirm => return Ok(Flow::Quit),
+                        crate::app::QuitDecision::Dismiss => quit_confirm = false,
+                        crate::app::QuitDecision::Swallow => {}
+                    }
+                    continue;
+                }
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if ctrl_c {
-                    return Ok(Flow::Quit);
-                }
-                match key.code {
-                    KeyCode::Char('r') | KeyCode::Char('R') => return Ok(Flow::Retry),
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(Flow::Quit),
-                    _ => {}
+                    quit_confirm = true; // ask before quitting
+                } else {
+                    match key.code {
+                        KeyCode::Char('r') | KeyCode::Char('R') => return Ok(Flow::Retry),
+                        // The exit keys ask before quitting (same flow as
+                        // the in-app quit confirmation).
+                        KeyCode::Char('q') | KeyCode::Esc => quit_confirm = true,
+                        _ => {}
+                    }
                 }
             }
             Some(Ok(_)) => {}
@@ -295,5 +317,26 @@ mod tests {
         // A binary that exists but fails right after exec is a different
         // story: the popup must keep the real error text.
         assert!(!applies(&exec_failed, None));
+    }
+
+    /// The quit-confirm overlay renders over the setup screen without
+    /// panicking and carries the shared popup text (same renderer and
+    /// grammar as the in-app confirm).
+    #[test]
+    fn quit_confirm_overlay_renders_over_the_setup_screen() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let theme = Theme::tokyo_night();
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|f| draw(f, &theme, true)).unwrap();
+        let buf = terminal.backend().buffer();
+        let flat: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            flat.contains("Quit chibi-tui?"),
+            "the confirm popup must overlay the setup screen"
+        );
+        assert!(
+            flat.contains("not found on PATH"),
+            "setup content stays underneath"
+        );
     }
 }

@@ -182,6 +182,12 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     if matches!(app.mode, Mode::HelpViewing { .. }) {
         render_help_modal(f, app, theme);
     }
+    // quit-confirmation popup (rendered last — TOPMOST: it may be opened
+    // from any state, including above another popup, without disturbing
+    // the state below; dismissing restores it exactly).
+    if app.quit_confirm {
+        render_quit_confirm(f, theme);
+    }
 }
 
 use crate::app::Mode;
@@ -1583,7 +1589,7 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
     HotkeyRow {
         group: "Global",
         chord: "Ctrl+C",
-        action: "cancel the active request · quit when idle",
+        action: "cancel the active request · quit when idle (confirmation)",
     },
     HotkeyRow {
         group: "Global",
@@ -1903,12 +1909,22 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
     HotkeyRow {
         group: "Error popup",
         chord: "q",
-        action: "quit",
+        action: "quit (confirmation)",
     },
     HotkeyRow {
         group: "Error popup",
         chord: "Esc · any key",
         action: "dismiss",
+    },
+    HotkeyRow {
+        group: "Quit confirm",
+        chord: "y · Enter",
+        action: "quit",
+    },
+    HotkeyRow {
+        group: "Quit confirm",
+        chord: "Esc · n · q",
+        action: "stay",
     },
     HotkeyRow {
         group: "Help (F1)",
@@ -2056,6 +2072,60 @@ fn render_help_modal(f: &mut Frame, app: &mut App, theme: &Theme) {
         ))),
         footer,
     );
+}
+
+/// Centered modal quit-confirmation popup over the full frame. Rendered
+/// LAST (topmost) so it can sit above any other open popup — opening it
+/// never disturbs the state below. Same visual language as the
+/// confirmation family: red border + red title, yellow decision hint.
+/// Purely visual — all key handling lives in `main.rs` (in-app popup) and
+/// in the splash / setup loops (the same renderer over their own frames).
+pub fn render_quit_confirm(f: &mut Frame, theme: &Theme) {
+    use ratatui::widgets::{Clear, Padding};
+
+    let message = "Quit chibi-tui?";
+    let hint = "y/Enter quit \u{00b7} Esc/n stay";
+
+    // Same centered geometry as the delete confirm (content-driven width,
+    // ~50% frame floor, hard floor of 20 for tiny terminals).
+    let max_w = f.area().width.saturating_sub(4).max(20);
+    let width = (message.width() as u16 + hint.width() as u16 + 6)
+        .max(f.area().width / 2)
+        .clamp(20, max_w);
+    let height = 5.min(f.area().height.saturating_sub(2)).max(3);
+    let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
+    let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme.red))
+        .style(Style::new().bg(theme.bg))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            " Quit ",
+            Style::new().fg(theme.red).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height > 0 {
+        let lines = wrap_text(message, inner.width.max(1) as usize);
+        let hint_line = Line::from(Span::styled(hint, Style::new().fg(theme.yellow)));
+        let mut all: Vec<Line<'static>> = lines;
+        all.push(hint_line); // rendered last; clipped when out of room
+        let text = Text::from(all);
+        let visible = inner.height as usize;
+        let skip = text.height().saturating_sub(visible);
+        let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
+        f.render_widget(paragraph, inner);
+    }
 }
 
 /// Centered modal error popup over a dimmed backdrop. Purely visual — all
