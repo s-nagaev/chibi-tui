@@ -3391,7 +3391,78 @@ mod tests {
         assert_eq!(app.input.lines(), ["keep me"]);
     }
 
-    /// Plain ↑/↓ move the text cursor vertically inside the editor — never
+    /// A Shift+Enter-typed two-line draft submits the prompt with the
+    /// newline intact. Pins the submit chain end to end: whatever the
+    /// editor shows (`["alpha", "beta"]`) is what `take_input` extracts —
+    /// the backend receives `alpha\nbeta`, never the word-glued
+    /// `alphabeta`.
+    #[test]
+    fn shift_enter_multiline_draft_submits_prompt_with_newlines() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_in(&mut app, "beta");
+        assert_eq!(app.input.lines(), ["alpha", "beta"], "precondition");
+
+        let submitted = app.take_input().expect("prompt taken");
+        assert_eq!(
+            submitted.prompt, "alpha\nbeta",
+            "the submitted prompt carries the Shift+Enter newline verbatim"
+        );
+    }
+
+    /// A pasted multi-line draft submits the prompt with the newlines
+    /// intact. Regression pin for the reported word-gluing: the OLD
+    /// Ctrl+V path on main filtered `\n`/`\r` out of the clipboard text
+    /// outright, so `line one\nline two` reached the backend as the glued
+    /// single word-merged string `line oneline two`. The paste now inserts
+    /// hard newlines and the extraction joins with `\n`.
+    #[test]
+    fn pasted_multiline_draft_submits_prompt_with_newlines() {
+        let mut app = app_with_chats(1);
+        handle_paste(&mut app, "line one\nline two");
+        assert_eq!(app.input.lines(), ["line one", "line two"], "precondition");
+
+        let submitted = app.take_input().expect("prompt taken");
+        assert_eq!(
+            submitted.prompt, "line one\nline two",
+            "paste newlines must reach the wire prompt, not be stripped away"
+        );
+        assert!(
+            !submitted.prompt.contains("oneline"),
+            "words from consecutive lines must never glue together"
+        );
+    }
+
+    /// A multi-line prompt submitted while a request is in flight enqueues
+    /// with its newline intact and drains verbatim — the queued path
+    /// preserves newlines exactly like the immediate-send path.
+    #[test]
+    fn queued_multiline_prompt_preserves_newlines_through_the_fifo() {
+        let mut app = app_with_chats(1);
+        let first = submit_text(&mut app, "in flight");
+
+        // Busy chat: the multi-line draft goes to the FIFO, not the wire.
+        type_in(&mut app, "queued one");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_in(&mut app, "queued two");
+        assert!(
+            app.take_input().is_none(),
+            "busy chat enqueues, no immediate send"
+        );
+
+        let thread = app.chats[0].id.clone();
+        let drained = app
+            .dequeue_next_for(&thread)
+            .expect("queued prompt drained");
+        assert_eq!(
+            drained.prompt, "queued one\nqueued two",
+            "the queued prompt keeps its newline through enqueue and drain"
+        );
+        assert_ne!(drained.request_id, first.request_id);
+    }
+
+    /// Plain ↑/↓ move the text cursor vertically inside the editor — never    /// Plain ↑/↓ move the text cursor vertically inside the editor — never
     /// switching threads. Column preserved across rows (readline-native
     /// mapping), clamped at the first/last row. This exercises the grown
     /// (MAX_INPUT_LINES-capped) block's caret navigation path.
