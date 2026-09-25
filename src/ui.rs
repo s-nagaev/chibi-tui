@@ -4,7 +4,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -273,6 +273,11 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// palette: border and ` Chats ` title switch from their resting colors to
 /// a brighter accent pair, and the idle unselected dot column brightens
 /// (dim → fg). Busy dots keep their semantic colors either way.
+///
+/// The sidebar is a FULL rounded rectangle: all four borders (`╭╮╰╯`
+/// corners) rendered inside the existing sidebar rect — the former divider
+/// column is the right border, the frame edge column hosts the left one —
+/// so the outer frame dimensions and the hit-test rects are unchanged.
 fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let sidebar_focused = app.focus == Focus::Sidebar;
     let items: Vec<ListItem> = app
@@ -333,9 +338,10 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let list = List::new(items)
         .block(
             Block::default()
-                .borders(Borders::RIGHT)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(if sidebar_focused {
-                    // Emphasis: focused sidebar's divider lifts to blue.
+                    // Emphasis: the focused sidebar's outline lifts to blue.
                     theme.blue
                 } else {
                     theme.selection
@@ -359,10 +365,10 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let mut state = ListState::default().with_selected(Some(app.active));
     f.render_stateful_widget(list, area, &mut state);
 
-    // Extend the sidebar's vertical border down through EVERY bottom row:
-    // spinner + the grown editor block (1..=20 rows) +
-    // hotkey hints, so the divider runs unbroken from the top edge to the
-    // status line at any editor height.
+    // Extend the sidebar's right rounded border down through EVERY bottom
+    // row: spinner + the grown editor block (1..=20 rows) + hotkey hints,
+    // so the divider runs unbroken from the pane's ╯ corner to the status
+    // line at any editor height.
     let below = Rect {
         x: area.right().saturating_sub(1),
         y: area.bottom(),
@@ -475,7 +481,11 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
             left_title.clone(),
             Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
         ))
-        .borders(Borders::TOP)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        // The border color stays the resting selection tone in BOTH focuses
+        // (the reference design keeps panel borders constant; the sidebar
+        // carries the focus emphasis alone).
         .border_style(Style::new().fg(theme.selection));
 
     // when the strip is visible its `cwd: <path tail> ·
@@ -711,7 +721,8 @@ fn context_usage_segment(usage: &Usage) -> String {
 
 /// the strip as a right-aligned top-border title [`Line`] for
 /// the chat pane, dim-styled. Squeezed into the columns LEFT of the
-/// left-aligned header title (1-column gutter): too-narrow panes yield
+/// left-aligned header title inside the title row (1-column gutter, the two
+/// rounded border columns excluded): too-narrow panes yield
 /// `None` and the strip simply does not render this frame.
 fn status_strip_title<'a>(
     app: &'a App,
@@ -720,7 +731,10 @@ fn status_strip_title<'a>(
     left_title: &str,
 ) -> Option<Line<'a>> {
     let gutter = 1u16;
-    let available = area_width.saturating_sub(left_title.width() as u16 + gutter) as usize;
+    // The two rounded border columns are no longer hostable by the title
+    // row: the strip must fit between the corners (and clear of the left
+    // title), so they come out of the budget too.
+    let available = area_width.saturating_sub(left_title.width() as u16 + gutter + 2) as usize;
     if available == 0 {
         return None;
     }
@@ -3670,15 +3684,28 @@ mod tests {
 
     /// End-to-end smoke test: at 120x34 every code panel must be a closed
     /// rectangle — right border present on EVERY body row, aligned with the
-    /// corners, never wrapped or clipped by the layout.
+    /// corners, never wrapped or clipped by the layout. The scan runs inside
+    /// the chat pane's INNER area: the pane itself is a rounded rectangle
+    /// now, so its own border glyphs (corners on rows 0/30, │ on cols
+    /// 26/119) must not confuse the code-panel search.
     #[test]
     fn full_ui_code_panels_are_closed_rectangles() {
         // Chat 1 has python panels, chat 2 the widest rust panel.
+        let rects = layout_rects(Rect::new(0, 0, 120, 34), 1);
+        let inner_x = (rects.chat.x + 1) as usize;
+        let inner_w = rects.chat.width.saturating_sub(2) as usize;
         for active in [0usize, 1] {
             let mut app = App::new(mock::initial_chats());
             app.active = active;
             let rows = render_grid(&mut app);
-            let tops: Vec<usize> = rows
+            // Slice every row to the pane's inner columns and keep only the
+            // pane's inner rows (each cell is one symbol char, so char
+            // indices are cell indices).
+            let inner_rows: Vec<String> = rows[1..(rects.chat.bottom() as usize - 1)]
+                .iter()
+                .map(|r| r.chars().skip(inner_x).take(inner_w).collect())
+                .collect();
+            let tops: Vec<usize> = inner_rows
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| r.contains('\u{256d}'))
@@ -3686,20 +3713,20 @@ mod tests {
                 .collect();
             assert!(!tops.is_empty(), "chat {active}: no code panel rendered");
             for t in tops {
-                let b = (t + 1..rows.len())
-                    .find(|&y| rows[y].contains('\u{2570}'))
+                let b = (t + 1..inner_rows.len())
+                    .find(|&y| inner_rows[y].contains('\u{2570}'))
                     .unwrap_or_else(|| {
                         panic!("chat {active}: bottom border missing under top at y{t}")
                     });
-                let rc_top = col_of(&rows[t], '\u{256e}')
+                let rc_top = col_of(&inner_rows[t], '\u{256e}')
                     .unwrap_or_else(|| panic!("chat {active}: ╮ missing on top row y{t}"));
-                let rc_bot = col_of(&rows[b], '\u{256f}')
+                let rc_bot = col_of(&inner_rows[b], '\u{256f}')
                     .unwrap_or_else(|| panic!("chat {active}: ╯ missing on bottom row y{b}"));
                 assert_eq!(
                     rc_top, rc_bot,
                     "chat {active} panel y{t}..{b}: right border column drifts"
                 );
-                for (dy, row) in rows[t + 1..b].iter().enumerate() {
+                for (dy, row) in inner_rows[t + 1..b].iter().enumerate() {
                     let y = t + 1 + dy;
                     let n = row.matches('\u{2502}').count();
                     assert!(
@@ -3715,6 +3742,82 @@ mod tests {
             }
         }
     }
+
+    // ---- panel outlines (rounded borders on both panes) --------------------
+
+    /// The sidebar and the chat pane render FULL rounded outlines: ╭╮╰╯
+    /// corners on all four corners of each pane, │ sides, ─ tops/bottoms —
+    /// with the titles still embedded in the top border rows and the outer
+    /// frame dimensions unchanged (the borders live inside the existing
+    /// rects; the sidebar's divider column became its right border and the
+    /// chat header's top-border row became the pane's top border).
+    #[test]
+    fn panel_outlines_render_rounded_borders_on_both_panels() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        let (rows, _) = render_grid_with_buffer(&mut app);
+
+        // Sidebar: cols 0..=25, rows 0..=30 at 120×34.
+        assert_eq!(rows[0].chars().next(), Some('╭'), "sidebar top-left");
+        assert_eq!(rows[0].chars().nth(25), Some('╮'), "sidebar top-right");
+        assert_eq!(rows[30].chars().next(), Some('╰'), "sidebar bottom-left");
+        assert_eq!(rows[30].chars().nth(25), Some('╯'), "sidebar bottom-right");
+        // Chat pane: cols 26..=119, rows 0..=30.
+        assert_eq!(rows[0].chars().nth(26), Some('╭'), "chat top-left");
+        assert_eq!(rows[0].chars().nth(119), Some('╮'), "chat top-right");
+        assert_eq!(rows[30].chars().nth(26), Some('╰'), "chat bottom-left");
+        assert_eq!(rows[30].chars().nth(119), Some('╯'), "chat bottom-right");
+        // Vertical sides on every inner row of both panes.
+        for (y, row) in rows.iter().enumerate().take(30).skip(1) {
+            let col = |x: usize| row.chars().nth(x);
+            assert_eq!(col(0), Some('│'), "sidebar left y{y}");
+            assert_eq!(col(25), Some('│'), "sidebar right y{y}");
+            assert_eq!(col(26), Some('│'), "chat left y{y}");
+            assert_eq!(col(119), Some('│'), "chat right y{y}");
+        }
+        // Titles still embedded in the top border rows, unchanged.
+        assert!(rows[0].contains(" Chats "), "sidebar title missing");
+        assert!(rows[0].contains("#1/1"), "chat header title missing");
+    }
+
+    /// The hit-test seam agrees with the rendered outlines: the seam rects
+    /// are unchanged by the outlines, every rendered border cell sits inside
+    /// the panel the router routes its column to, and a wheel event over the
+    /// sidebar column still routes to the sidebar with the new rects
+    /// (layout_rects/panel_region never moved).
+    #[test]
+    fn panel_outlines_keep_the_hit_test_seam_consistent() {
+        let mut app = App::new(vec![Chat::new("chat")]);
+        let (_, buf) = render_grid_with_buffer(&mut app);
+        let rects = layout_rects(Rect::new(0, 0, 120, 34), 1);
+
+        // The seam rects are byte-identical to the pre-outline geometry.
+        assert_eq!(rects.sidebar, Rect::new(0, 0, 26, 31));
+        assert_eq!(rects.chat, Rect::new(26, 0, 94, 31));
+
+        // Every rendered border cell belongs to the panel its column
+        // hit-tests to: sidebar borders (cols 0/25) → Sidebar, chat borders
+        // (cols 26/119) → Chat — rendering and routing can never disagree.
+        for y in 1..30u16 {
+            for x in [0u16, 25] {
+                assert_eq!(buf[(x, y)].symbol(), "│", "sidebar border at ({x},{y})");
+                assert_eq!(
+                    panel_region(&rects, x, y),
+                    PanelRegion::Sidebar,
+                    "column {x} must route to the sidebar"
+                );
+            }
+            for x in [26u16, 119] {
+                assert_eq!(buf[(x, y)].symbol(), "│", "chat border at ({x},{y})");
+                assert_eq!(
+                    panel_region(&rects, x, y),
+                    PanelRegion::Chat,
+                    "column {x} must route to the chat pane"
+                );
+            }
+        }
+    }
+
+    //------------------------------------------------------------------------
 
     //------------------------------------------------------------------------
 
@@ -3985,7 +4088,8 @@ mod tests {
         let names = ["idle", "queued", "running"];
         for (i, (glyph, color)) in expected.iter().enumerate() {
             // Sidebar block renders its " Chats " title on grid row 0; the
-            // per-chat list rows start one row below.
+            // per-chat list rows start one row below, and the lifecycle dot
+            // occupies column 1 (right of the outline's left border).
             let y = i + 1;
             assert!(
                 rows[y].contains(names[i]),
@@ -3993,7 +4097,7 @@ mod tests {
                 names[i],
                 rows[y]
             );
-            let cell = &buf[(0, y as u16)];
+            let cell = &buf[(1, y as u16)];
             assert_eq!(
                 cell.symbol(),
                 *glyph,
@@ -4949,9 +5053,11 @@ mod tests {
         // Narrow chat pane forces heavy wrapping of the long paragraph.
         const FRAME_W: u16 = 60;
         const FRAME_H: u16 = 24;
-        // Chat pane inner width = frame - sidebar(26); chat inner height =
-        // frame - top border(1) - spinner(1) - input(1) - status(1).
-        let pane_width = FRAME_W - 26;
+        // Chat pane inner width = frame - sidebar(26) - the pane's two
+        // rounded border columns; chat inner height =
+        // frame - top border(1) - bottom border(1) - spinner(1) - input(1)
+        // - status(1).
+        let pane_width = FRAME_W - 26 - 2;
 
         let mut app = App::new(vec![Chat::new("wrap")]);
         {
@@ -5232,8 +5338,9 @@ mod tests {
         // Narrow chat pane forces heavy wrapping of the long paragraph.
         const FRAME_W: u16 = 60;
         const FRAME_H: u16 = 24;
-        // Chat pane inner width = frame - sidebar(26).
-        let pane_width = FRAME_W - 26;
+        // Chat pane inner width = frame - sidebar(26) - the pane's two
+        // rounded border columns.
+        let pane_width = FRAME_W - 26 - 2;
 
         let mut app = App::new(vec![Chat::new("target"), Chat::new("decoy")]);
         // The ACTIVE chat at search time: chat 0. Lots of filler so
@@ -5465,15 +5572,16 @@ mod tests {
         let mut app = App::new(vec![Chat::new("first"), Chat::new("second")]);
 
         let (_, chat_buf) = render_grid_with_buffer(&mut app);
-        // Row 2 = second chat's unselected idle dot.
-        assert_eq!(chat_buf[(0, 2)].fg, theme.dim);
+        // Row 2 = second chat's unselected idle dot (column 1, right of the
+        // outline's left border).
+        assert_eq!(chat_buf[(1, 2)].fg, theme.dim);
 
         app.focus = Focus::Sidebar;
         let (_, side_buf) = render_grid_with_buffer(&mut app);
-        assert_eq!(side_buf[(0, 2)].fg, theme.fg, "unselected dot brightens");
+        assert_eq!(side_buf[(1, 2)].fg, theme.fg, "unselected dot brightens");
         // Selected (row 1) keeps green in both focuses.
-        assert_eq!(chat_buf[(0, 1)].fg, theme.green);
-        assert_eq!(side_buf[(0, 1)].fg, theme.green);
+        assert_eq!(chat_buf[(1, 1)].fg, theme.green);
+        assert_eq!(side_buf[(1, 1)].fg, theme.green);
     }
 
     /// The prompt's `❯` marker dims cyan → theme.dim while the sidebar
@@ -5607,8 +5715,9 @@ mod tests {
     fn long_model_name_wrap_is_absorbed_by_row_math() {
         const FRAME_W: u16 = 60;
         const FRAME_H: u16 = 24;
-        // Chat pane inner width = frame - sidebar(26).
-        let pane_width = (FRAME_W - 26) as usize;
+        // Chat pane inner width = frame - sidebar(26) - the pane's two
+        // rounded border columns.
+        let pane_width = (FRAME_W - 26 - 2) as usize;
 
         let model_name = "super-long-model-name-ultra-extended-edition-v42";
         let tail_word = "tail42";
@@ -6536,9 +6645,10 @@ mod tests {
         let text = "cwd: \u{2014} \u{00b7} \u{2014}";
         assert!(header.contains(text), "strip text missing: {header:?}");
         // Right-aligned: the readout's last column is the chat pane's last
-        // column (119 @120), i.e. it starts at 120 - 10 = 110.
+        // INNER column (118 @120, right of it the rounded border), i.e. it
+        // starts at 118 - 10 + 1 = 109.
         let start = col_of_sub(header, text).expect("strip column");
-        assert_eq!(start, 110, "strip not right-aligned: {header:?}");
+        assert_eq!(start, 109, "strip not right-aligned: {header:?}");
         // Dim styling: every cell of the readout uses theme.dim (not the
         // bold header blue, not the border selection color).
         for (i, _) in text.chars().enumerate() {
@@ -6777,12 +6887,28 @@ mod tests {
 
     /// Turning usage on/off changes the strip ONLY by the segment: same
     /// `cwd` + `model` text, segment appended at its tail (the border-dash
-    /// fill shrinks to make room — the strip is right-aligned).
+    /// fill shrinks to make room — the strip is right-aligned). The rows
+    /// compared are title rows on the pane's top border, so the rounded
+    /// right-corner glyph rides at the tail of either readout; border
+    /// drawing chars are stripped first — the assertion is about the
+    /// payload, not where the corner lands.
     #[test]
     fn strip_with_usage_differs_from_without_only_by_the_segment() {
+        let payload = |row: &str| {
+            row[row.find("cwd:").unwrap()..]
+                .chars()
+                .filter(|c| {
+                    !matches!(
+                        c,
+                        '\u{2500}' | '\u{2502}' | '\u{256d}' | '\u{256e}' | '\u{2570}' | '\u{256f}'
+                    )
+                })
+                .collect::<String>()
+        };
+
         let mut app = App::new(mock::initial_chats());
         let (rows, _) = render_grid_with_buffer(&mut app);
-        let without = &rows[0][rows[0].find("cwd:").unwrap()..];
+        let without = payload(&rows[0]);
 
         app.last_turn_usage = Some(Usage {
             input_tokens: 18432,
@@ -6790,7 +6916,7 @@ mod tests {
             context_window: Some(131_072),
         });
         let (rows, _) = render_grid_with_buffer(&mut app);
-        let with = &rows[0][rows[0].find("cwd:").unwrap()..];
+        let with = payload(&rows[0]);
         assert_eq!(
             with,
             format!("{without} \u{00b7} ctx 14% (18.4k/131.0k)"),
@@ -7035,32 +7161,34 @@ mod tests {
         app.chats[0].unread = true;
 
         let (rows, buf) = render_grid_with_buffer(&mut app);
-        // Sidebar rows: " Chats " title on row 0, chat rows start at 1.
+        // Sidebar rows: " Chats " title on row 0, chat rows start at 1; the
+        // lifecycle dot sits at column 1, the name at column 3 (right of the
+        // outline's left border).
         assert!(rows[1].contains("fresh") && rows[2].contains("marked"));
 
         // Unread inactive dot: hollow glyph in the unread-activity yellow.
-        assert_eq!(buf[(0, 1)].symbol(), "\u{25cb}");
-        assert_eq!(buf[(0, 1)].fg, theme.unread_activity);
+        assert_eq!(buf[(1, 1)].symbol(), "\u{25cb}");
+        assert_eq!(buf[(1, 1)].fg, theme.unread_activity);
         // Bold dim name, resting background: no highlight.
-        assert_eq!(buf[(2, 1)].fg, theme.dim);
-        assert!(buf[(2, 1)].modifier.contains(Modifier::BOLD));
-        assert_ne!(buf[(2, 1)].bg, theme.selection, "no selection highlight");
-        assert_eq!(buf[(2, 1)].bg, theme.panel);
+        assert_eq!(buf[(3, 1)].fg, theme.dim);
+        assert!(buf[(3, 1)].modifier.contains(Modifier::BOLD));
+        assert_ne!(buf[(3, 1)].bg, theme.selection, "no selection highlight");
+        assert_eq!(buf[(3, 1)].bg, theme.panel);
 
         // Selected chat: active-marker dot, highlight on its row.
-        assert_eq!(buf[(0, 2)].fg, theme.active_marker);
-        assert_eq!(buf[(2, 2)].bg, theme.selection, "selected row highlighted");
+        assert_eq!(buf[(1, 2)].fg, theme.active_marker);
+        assert_eq!(buf[(3, 2)].bg, theme.selection, "selected row highlighted");
 
         // Read inactive neighbour: default dot, plain dim name.
-        assert_eq!(buf[(0, 3)].fg, theme.dot_default);
-        assert!(!buf[(2, 3)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(1, 3)].fg, theme.dot_default);
+        assert!(!buf[(3, 3)].modifier.contains(Modifier::BOLD));
 
         // Fresh frame + scrolling: the marker is sticky until selection.
         let (_, buf2) = render_grid_with_buffer(&mut app);
-        assert_eq!(buf2[(0, 1)].fg, theme.unread_activity, "survives re-render");
+        assert_eq!(buf2[(1, 1)].fg, theme.unread_activity, "survives re-render");
         app.scroll_up(5);
         let (_, buf3) = render_grid_with_buffer(&mut app);
-        assert_eq!(buf3[(0, 1)].fg, theme.unread_activity, "survives scrolling");
+        assert_eq!(buf3[(1, 1)].fg, theme.unread_activity, "survives scrolling");
     }
 
     //------------------------------------------------------------------------
@@ -7410,17 +7538,21 @@ mod tests {
         let (rows, buf) = render_grid_at_with_buffer(&mut app, 80, 24);
 
         // Geometry: width 30 (max content line 25 + padding/borders, above
-        // the 30-column floor), height 4, centered at 80×24.
+        // the 30-column floor), height 4, centered at 80×24. The chat pane
+        // is a rounded rectangle too, so the banner rows are identified by
+        // the banner's own " Quit " title, not by the ╭ glyph alone.
         let banner: Vec<&String> = rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.contains('╭') || r.contains("Quit chibi-tui?"))
+            .filter(|(_, r)| {
+                (r.contains('╭') && r.contains(" Quit ")) || r.contains("Quit chibi-tui?")
+            })
             .map(|(_, r)| r)
             .collect();
         assert_eq!(banner.len(), 2, "banner spans top border + question rows");
         let top_y = rows
             .iter()
-            .position(|r| r.contains('╭'))
+            .position(|r| r.contains('╭') && r.contains(" Quit "))
             .expect("rounded top border");
         assert_eq!(top_y, 10, "vertically centered");
         // The banner is centered, so the row carries 25 columns of the UI

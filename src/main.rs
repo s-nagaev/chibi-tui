@@ -6425,7 +6425,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    26,
+                    27,
                     2,
                 ),
                 WHEEL_AREA,
@@ -6439,7 +6439,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                    37,
+                    38,
                     2,
                 ),
                 WHEEL_AREA,
@@ -6482,7 +6482,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6492,7 +6492,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6502,7 +6502,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6523,7 +6523,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6533,7 +6533,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6563,7 +6563,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    26,
+                    27,
                     2,
                 ),
                 WHEEL_AREA,
@@ -6573,7 +6573,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                    31,
+                    32,
                     2,
                 ),
                 WHEEL_AREA,
@@ -6666,7 +6666,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6676,7 +6676,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                34,
+                35,
                 2,
             ),
             WHEEL_AREA,
@@ -6702,7 +6702,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6712,7 +6712,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6751,7 +6751,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6761,7 +6761,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                34,
+                35,
                 2,
             ),
             WHEEL_AREA,
@@ -6797,7 +6797,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6807,7 +6807,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6858,7 +6858,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    26,
+                    27,
                     2,
                 ),
                 WHEEL_AREA,
@@ -6868,7 +6868,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                    30,
+                    31,
                     2,
                 ),
                 WHEEL_AREA,
