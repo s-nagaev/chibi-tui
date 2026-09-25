@@ -2074,25 +2074,27 @@ fn render_help_modal(f: &mut Frame, app: &mut App, theme: &Theme) {
     );
 }
 
-/// Centered modal quit-confirmation popup over the full frame. Rendered
+/// Centered modal quit-confirmation banner over the full frame. Rendered
 /// LAST (topmost) so it can sit above any other open popup — opening it
-/// never disturbs the state below. Same visual language as the
-/// confirmation family: red border + red title, yellow decision hint.
-/// Purely visual — all key handling lives in `main.rs` (in-app popup) and
-/// in the splash / setup loops (the same renderer over their own frames).
+/// never disturbs the state below. Compact rounded banner: the title sits
+/// in the top border, the question and the decision hint each take one
+/// inner row — 4 rows total when the terminal allows. Purely visual — all
+/// key handling lives in `main.rs` (in-app popup) and in the splash /
+/// setup loops (the same renderer over their own frames).
 pub fn render_quit_confirm(f: &mut Frame, theme: &Theme) {
-    use ratatui::widgets::{Clear, Padding};
+    use ratatui::widgets::{BorderType, Clear, Padding};
 
     let message = "Quit chibi-tui?";
     let hint = "y/Enter quit \u{00b7} Esc/n stay";
 
-    // Same centered geometry as the delete confirm (content-driven width,
-    // ~50% frame floor, hard floor of 20 for tiny terminals).
+    // Content-hugging banner geometry: width follows the wider of the two
+    // inner rows (1-cell padding per side, 2 border cells) with a modest
+    // 30-column floor, height is exactly the two text rows plus borders.
     let max_w = f.area().width.saturating_sub(4).max(20);
-    let width = (message.width() as u16 + hint.width() as u16 + 6)
-        .max(f.area().width / 2)
+    let width = (message.width().max(hint.width()) as u16 + 4)
+        .max(30)
         .clamp(20, max_w);
-    let height = 5.min(f.area().height.saturating_sub(2)).max(3);
+    let height = 4.min(f.area().height.saturating_sub(2)).max(3);
     let x = f.area().x + (f.area().width.saturating_sub(width)) / 2;
     let y = f.area().y + (f.area().height.saturating_sub(height)) / 2;
     let area = Rect {
@@ -2105,6 +2107,7 @@ pub fn render_quit_confirm(f: &mut Frame, theme: &Theme) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.red))
         .style(Style::new().bg(theme.bg))
         .padding(Padding::horizontal(1))
@@ -2116,11 +2119,20 @@ pub fn render_quit_confirm(f: &mut Frame, theme: &Theme) {
     f.render_widget(block, area);
 
     if inner.height > 0 {
-        let lines = wrap_text(message, inner.width.max(1) as usize);
+        let mut lines: Vec<Line<'static>> = wrap_text(message, inner.width.max(1) as usize)
+            .into_iter()
+            .map(|line| {
+                Line::from(
+                    line.spans
+                        .into_iter()
+                        .map(|span| Span::styled(span.content, Style::new().fg(theme.fg)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
         let hint_line = Line::from(Span::styled(hint, Style::new().fg(theme.yellow)));
-        let mut all: Vec<Line<'static>> = lines;
-        all.push(hint_line); // rendered last; clipped when out of room
-        let text = Text::from(all);
+        lines.push(hint_line); // rendered last; clipped when out of room
+        let text = Text::from(lines);
         let visible = inner.height as usize;
         let skip = text.height().saturating_sub(visible);
         let paragraph = Paragraph::new(text).scroll((skip as u16, 0));
@@ -7385,5 +7397,71 @@ mod tests {
                 "second-row slice char {dx} reversed"
             );
         }
+    }
+
+    /// The quit-confirmation banner: compact rounded box, title embedded in
+    /// the top border, question + amber hints inside, exactly 4 rows at
+    /// demo resolution, width hugging its content (no 50%-frame stretch).
+    #[test]
+    fn quit_confirm_renders_as_compact_rounded_banner() {
+        let theme = Theme::tokyo_night();
+        let mut app = App::new(vec![Chat::new("quit")]);
+        app.quit_confirm = true;
+        let (rows, buf) = render_grid_at_with_buffer(&mut app, 80, 24);
+
+        // Geometry: width 30 (max content line 25 + padding/borders, above
+        // the 30-column floor), height 4, centered at 80×24.
+        let banner: Vec<&String> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains('╭') || r.contains("Quit chibi-tui?"))
+            .map(|(_, r)| r)
+            .collect();
+        assert_eq!(banner.len(), 2, "banner spans top border + question rows");
+        let top_y = rows
+            .iter()
+            .position(|r| r.contains('╭'))
+            .expect("rounded top border");
+        assert_eq!(top_y, 10, "vertically centered");
+        // The banner is centered, so the row carries 25 columns of the UI
+        // beneath it before the border — slice the banner off the row by
+        // chars (the rounded corners are multi-byte).
+        let chars: Vec<char> = rows[top_y].chars().collect();
+        let bx = chars.iter().position(|&c| c == '╭').unwrap();
+        let top: String = chars[bx..bx + 30].iter().collect();
+        assert_eq!(top.chars().count(), 30, "banner hugs its content width");
+        assert!(
+            top.starts_with('╭') && top.ends_with('╮'),
+            "rounded corners"
+        );
+        assert!(top.contains(" Quit "), "title embedded in the top border");
+        let bottom: String = rows[top_y + 3].chars().skip(bx).take(30).collect();
+        assert_eq!(bottom.chars().count(), 30);
+        assert!(
+            bottom.starts_with('╰') && bottom.ends_with('╯'),
+            "rounded bottom corners"
+        );
+        assert!(
+            rows[top_y + 1].contains("│ Quit chibi-tui?"),
+            "question row with 1-space padding"
+        );
+        assert!(
+            rows[top_y + 2].contains("y/Enter quit · Esc/n stay"),
+            "hints row unchanged"
+        );
+
+        // Title + borders red (bold title), question off-white, hints amber.
+        let title_x = rows[top_y].find(" Quit ").unwrap() as u16 + 1;
+        let title_cell = buf[(title_x, top_y as u16)].clone();
+        assert_eq!(title_cell.fg, theme.red, "title in theme.red");
+        assert!(title_cell.modifier.contains(Modifier::BOLD), "bold title");
+        let border_cell = buf[(bx as u16, top_y as u16)].clone();
+        assert_eq!(border_cell.fg, theme.red, "border in theme.red");
+        let question_x = rows[top_y + 1].find("Quit chibi-tui?").unwrap() as u16;
+        let question_cell = buf[(question_x, (top_y + 1) as u16)].clone();
+        assert_eq!(question_cell.fg, theme.fg, "question in theme.fg");
+        let hint_x = rows[top_y + 2].find("y/Enter quit").unwrap() as u16;
+        let hint_cell = buf[(hint_x, (top_y + 2) as u16)].clone();
+        assert_eq!(hint_cell.fg, theme.yellow, "hints in theme.yellow");
     }
 }

@@ -12,6 +12,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The quit-confirmation popup is restyled as a compact rounded banner: 4 rows total (rounded corners, bold ` Quit ` title in the top border, question row + amber hints row), width hugging its content instead of stretching to half the frame. Keys, state, and isolation behavior are unchanged.
 - Quitting now asks for confirmation: every manual exit path — idle `Ctrl+C`, `q`/`Ctrl+C` from the error popup, and the exit keys on the startup splash and the backend setup screen — opens a centered "Quit chibi-tui?" popup (`y`/`Enter` quit, `n`/`Esc`/`q` stay). `Ctrl+C` with an in-flight request still cancels the request instantly and never opens the popup; dismissing the confirmation restores the exact prior state (draft, focus, open popups, streaming request).
 - Upgraded `ratatui` to 0.30 and `crossterm` to 0.29, closing the transitive `lru` vulnerability advisory (`lru` is now 0.18.5; Dependabot had flagged 0.12.5 as unfixable while `ratatui` 0.29 pinned it).
 - Replaced the `tui-textarea` dependency with a minimal in-house readline input editor (`input.rs`): upstream has no ratatui-0.30-compatible release, and its pinned `ratatui 0.29` would have kept the vulnerable `lru` in the tree. The editor surface (readline keybindings, multi-line buffer, caret-following scroll, kill ring) matches the old behavior; `Ctrl+U` keeps readline kill-to-head semantics, as before.
