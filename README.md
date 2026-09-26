@@ -97,6 +97,19 @@ Options:
 
 The app starts in fullscreen alternate-screen mode; the terminal is restored on exit.
 
+## Architecture
+
+The library crate (`src/lib.rs`) holds the testable core — protocol types,
+backend abstraction, request pipeline, persistence, app state, and markdown
+rendering. The binary (`src/main.rs`) is a thin controller: the tokio event
+loop, submit/queue handling, and CLI. Keyboard dispatch and mouse handling
+are extracted into dedicated bin-level modules (`src/keymap.rs`,
+`src/mouse.rs`).
+
+Unit tests live inline at the bottom of each module or in sibling `tests`
+modules (`keymap/tests.rs`, `mouse/tests.rs`, `app/tests/`, `ui/tests/`, and
+`tests.rs` + `tests/` for the binary); integration tests live in `tests/`.
+
 ## Keybindings
 
 | Key | Action |
