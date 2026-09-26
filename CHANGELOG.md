@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Refactored test organization: the flat inline test blobs in `main.rs`, `app.rs`, and `ui.rs` are split into per-topic sibling test modules (`keymap/tests.rs`, `mouse/tests.rs`, `app/tests/`, `ui/tests/`, `tests.rs` + `tests/`), and the keyboard dispatch and mouse handling were extracted from `main.rs` into dedicated `keymap` and `mouse` modules. No behavior changes.
+
 ## [0.3.0] - 2026-09-26
 
 ### Added
