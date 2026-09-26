@@ -1,6 +1,6 @@
 [package]
 name = "chibi-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Terminal UI client for Chibi — an AI assistant (IDE protocol v1 over stdio)"
 license = "MIT"
