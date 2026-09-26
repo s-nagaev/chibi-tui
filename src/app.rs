@@ -2,17 +2,18 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Position, Rect};
 
 use crate::backend::BackendEvent;
 use crate::diag::LogEntry;
+use crate::input::InputArea;
 use crate::markdown;
 use crate::model::{ChatLifecycle, Message};
 use crate::model_picker::{parse_model_listing, parse_selection_confirmation, ModelEntry};
 use crate::popup::ErrorPopup;
 use crate::protocol::{AgentEventKind, Usage};
 use crate::theme::Theme;
-use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
 /// Liveness of the backend link as shown by the status-bar indicator.
@@ -400,6 +401,43 @@ impl Mode {
         matches!(self, Mode::Normal)
     }
 }
+
+/// What the quit-confirmation popup does with a key press.
+///
+/// The ONE grammar shared by every quit-confirmation surface: the in-app
+/// popup (dispatch branch in `main.rs`), the splash screen and the backend
+/// setup screen (both run their own pre-app event loops). Keeping the
+/// decision in one pure function pins the grammar against drift between
+/// the three loops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuitDecision {
+    /// Quit for real (`y`/`Enter`; `Ctrl+C` — the second press IS the
+    /// confirmation, the first one only opened the popup).
+    Confirm,
+    /// Stay in the app, restore the exact prior state (`Esc`/`n`; `q` as
+    /// dismiss is deliberate — it can never CONFIRM a quit, and treating
+    /// it as "stay" matches the modal family where `q` is unbound rather
+    /// than destructive).
+    Dismiss,
+    /// Swallowed: no leak into any editor, no global binding fires.
+    Swallow,
+}
+
+/// Classify a key press for the quit-confirmation popup. Plain chars only:
+/// ctrl-chords other than `Ctrl+C` are swallowed like any other combo, and
+/// modifier rides-along (`Shift+y`) confirms the same as plain `y`.
+pub fn quit_decision(key: KeyEvent) -> QuitDecision {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => QuitDecision::Confirm,
+        KeyCode::Char('c') if ctrl => QuitDecision::Confirm,
+        KeyCode::Char('y') | KeyCode::Char('Y') if !ctrl => QuitDecision::Confirm,
+        KeyCode::Esc => QuitDecision::Dismiss,
+        KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => QuitDecision::Dismiss,
+        KeyCode::Char('q') if !ctrl => QuitDecision::Dismiss,
+        _ => QuitDecision::Swallow,
+    }
+}
 /// which pane owns the keyboard. NOT a [`Mode`] —
 /// the rename/delete/search modals remain [`Mode`]s layered above focus:
 /// opening one never changes focus, and closing one always resets it to
@@ -686,12 +724,20 @@ pub struct App {
     /// PgUp/PgDn can scroll exactly one page of rows. Defaults to 20
     /// (a conservative page size) until the first render.
     pub chat_visible_rows: u16,
-    pub input: TextArea<'static>,
+    pub input: InputArea,
     pub spinner_frame: usize,
     pub should_quit: bool,
     /// Modal error popup (backend failures). When set, it captures input
     /// until dismissed.
     pub error_popup: Option<ErrorPopup>,
+    /// Quit-confirmation popup ("Quit chibi-tui?"). A standalone flag, NOT
+    /// a [`Mode`]: opening it from any state — Normal mode, another popup,
+    /// the sidebar — must not disturb that state, so dismissing restores it
+    /// exactly (focus, mode, draft, in-flight request all untouched). Set
+    /// by every manual exit path (`q` in the error popup, idle Ctrl+C) via
+    /// [`App::begin_quit_confirm`]; the dispatch branch in `main.rs` owns
+    /// the keyboard while it is open.
+    pub quit_confirm: bool,
     /// Transport liveness for the status-bar indicator.
     pub connection: Connection,
     /// Set by `R` in the error popup; the event loop performs the async
@@ -959,7 +1005,7 @@ pub fn is_transport_failure(message: &str) -> bool {
 
 impl App {
     pub fn new(chats: Vec<Chat>) -> Self {
-        let mut input = TextArea::default();
+        let mut input = InputArea::default();
         input.set_placeholder_text("Type a message…  (\u{23ce} send)");
         // Restore seam: threads carry their last known usage/model across
         // restarts, so the sticky display state is seeded from the snapshot
@@ -982,6 +1028,7 @@ impl App {
             spinner_frame: 0,
             should_quit: false,
             error_popup: None,
+            quit_confirm: false,
             connection: Connection::Connecting,
             reconnect_requested: None,
             pending_cancel: None,
@@ -1937,9 +1984,10 @@ impl App {
     /// y: copy the full text of the cursor LOGICAL line to the clipboard.
     ///
     /// In wrap mode that is the whole message, not the truncated row. The
-    /// transports are [`crate::clipboard::copy_text`]: OSC 52 first, plus
-    /// the `CHIBI_TUI_COPY_CMD` fallback when set. The header gets a brief
-    /// feedback note either way (`copied` / `copy: unavailable`).
+    /// transports are [`crate::clipboard::copy_text`]: OSC 52 first, then
+    /// the `arboard` system clipboard, then the `CHIBI_TUI_COPY_CMD`
+    /// fallback when set. The header gets a brief feedback note either way
+    /// (`copied` / `copy: unavailable`).
     pub fn log_copy_selected(&mut self) {
         let note = match &self.mode {
             Mode::LogViewer { state } => {
@@ -2333,8 +2381,8 @@ impl App {
         if text.is_empty() {
             return None;
         }
-        // Reset the TextArea in place, keeping its placeholder.
-        self.input = TextArea::default();
+        // Reset the editor in place, keeping its placeholder.
+        self.input = InputArea::default();
         self.input
             .set_placeholder_text("Type a message…  (\u{23ce} send)");
 
@@ -2462,14 +2510,45 @@ impl App {
         self.focus = Focus::Chat;
     }
 
+    // ---- quit confirmation -------------------------------
+
+    /// Open the quit-confirmation popup ("Quit chibi-tui?").
+    ///
+    /// Deliberately cancel-safe: it flips one flag and touches NOTHING else
+    /// — an in-flight request keeps streaming, the draft, focus and any
+    /// other open popup stay exactly as they were. The actual exit still
+    /// requires an explicit confirm ([`App::confirm_quit`]); dismissal
+    /// ([`App::cancel_quit_confirm`]) restores the prior state by doing
+    /// nothing at all.
+    pub fn begin_quit_confirm(&mut self) {
+        self.quit_confirm = true;
+    }
+
+    /// Dismiss the quit-confirmation popup. Returns `true` when it was
+    /// open (the dispatch uses this for symmetry with the other cancel
+    /// helpers; the state itself needs no restore — opening never changed
+    /// anything).
+    pub fn cancel_quit_confirm(&mut self) -> bool {
+        std::mem::take(&mut self.quit_confirm)
+    }
+
+    /// Confirm the quit: close the popup and arm the normal shutdown path
+    /// (`should_quit` — the event loop performs the graceful backend
+    /// shutdown and terminal restore, the same transition every existing
+    /// quit path used to trigger directly).
+    pub fn confirm_quit(&mut self) {
+        self.quit_confirm = false;
+        self.should_quit = true;
+    }
+
     /// Clear the whole input buffer and park the cursor at the start
     /// (`Ctrl+L`).
     ///
-    /// The TextArea is rebuilt in place so its placeholder survives; undo
+    /// The editor is rebuilt in place so its placeholder survives; kill-ring
     /// history is intentionally reset too — a "clear" that can be undone by
     /// a stray Ctrl+U surprises more than it helps.
     pub fn clear_input(&mut self) {
-        self.input = TextArea::default();
+        self.input = InputArea::default();
         self.input
             .set_placeholder_text("Type a message…  (\u{23ce} send)");
     }
@@ -3714,6 +3793,61 @@ mod tests {
     use super::*;
     use crate::model::Role;
 
+    // ---- quit confirmation -------------------------------
+
+    /// The shared quit-confirm grammar (in-app popup, splash, setup screen
+    /// all route through [`quit_decision`]): y/Enter/Ctrl+C confirm,
+    /// Esc/n/q dismiss, everything else is swallowed.
+    #[test]
+    fn quit_decision_grammar_pins_the_shared_keymap() {
+        use crossterm::event::KeyCode as K;
+        let e = |code, m| KeyEvent::new(code, m);
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+
+        for (code, mods, want) in [
+            (K::Char('y'), none, QuitDecision::Confirm),
+            (K::Char('Y'), none, QuitDecision::Confirm),
+            (K::Enter, none, QuitDecision::Confirm),
+            (K::Char('c'), ctrl, QuitDecision::Confirm),
+            (K::Esc, none, QuitDecision::Dismiss),
+            (K::Char('n'), none, QuitDecision::Dismiss),
+            (K::Char('N'), none, QuitDecision::Dismiss),
+            (K::Char('q'), none, QuitDecision::Dismiss),
+            (K::Char('x'), none, QuitDecision::Swallow),
+            (K::Char('y'), ctrl, QuitDecision::Swallow),
+            (K::Up, none, QuitDecision::Swallow),
+            (K::Backspace, none, QuitDecision::Swallow),
+        ] {
+            assert_eq!(quit_decision(e(code, mods)), want, "{code:?} {mods:?}");
+        }
+    }
+
+    /// begin/cancel/confirm lifecycle: opening is cancel-safe (touches
+    /// nothing else), confirm arms `should_quit` — the exact transition
+    /// the direct quit paths used to perform.
+    #[test]
+    fn quit_confirm_lifecycle_begin_cancel_confirm() {
+        let mut app = App::new(Vec::new());
+        app.input.insert_str("draft");
+        assert!(!app.quit_confirm);
+
+        app.begin_quit_confirm();
+        assert!(app.quit_confirm);
+        assert!(!app.should_quit, "opening must not quit");
+        assert_eq!(app.input.lines().join(""), "draft", "cancel-safe");
+
+        assert!(app.cancel_quit_confirm(), "dismiss reports it was open");
+        assert!(!app.quit_confirm);
+        assert!(!app.should_quit);
+        assert!(!app.cancel_quit_confirm(), "second dismiss is a no-op");
+
+        app.begin_quit_confirm();
+        app.confirm_quit();
+        assert!(app.should_quit, "confirm arms the shutdown path");
+        assert!(!app.quit_confirm, "popup closed by the confirm");
+    }
+
     /// Regression test for the review finding: PgUp must move one page up
     /// from the bottom, not to the top.
     #[test]
@@ -3758,8 +3892,8 @@ mod tests {
 
     fn type_in(app: &mut App, text: &str) {
         for ch in text.chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(crate::input::Input {
+                key: crate::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -4966,7 +5100,7 @@ mod tests {
     #[test]
     fn empty_input_is_never_submitted_and_state_stays_idle() {
         let mut app = app_with_chats(1);
-        app.input.input(tui_textarea::Input::default());
+        app.input.input(crate::input::Input::default());
         assert!(app.take_input().is_none(), "whitespace-only is rejected");
         assert!(!app.is_busy());
         assert!(app.active_request_id().is_none());
@@ -5948,7 +6082,7 @@ mod tests {
         );
         assert_eq!(
             app.input.placeholder_text(),
-            "Type a message…  (\u{23ce} send)"
+            Some("Type a message…  (\u{23ce} send)")
         );
     }
 

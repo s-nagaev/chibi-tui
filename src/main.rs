@@ -9,14 +9,17 @@
 //!   chats, no processes, no I/O: development / screenshot mode.
 //!
 //! UX layer:
-//! * `Ctrl+C` cancels the in-flight request when one exists; quits only when
-//!   idle. `Esc` clears non-empty input and dismisses the error popup.
+//! * `Ctrl+C` cancels the in-flight request when one exists; when idle it
+//!   opens the quit confirmation ("Quit chibi-tui?", `y`/Enter quits,
+//!   `n`/Esc stays). `Esc` clears non-empty input and dismisses the error
+//!   popup.
 //! * backend failures surface as a modal popup (`R` reconnect, `Esc`
 //!   dismisses, `q`/`Ctrl+C` quit) instead of crashing or being silently dropped;
 //! * connection state is shown in the status bar
 //!   (`● connected / connecting… / disconnected (press R)`);
-//! * readline-style input keys (`Ctrl+A/E/U/L`, word ops via tui-textarea)
-//!   plus clipboard paste (`Ctrl+V`, macOS Cmd+V).
+//! * readline-style input keys (`Ctrl+A/E/U/L`, word ops via the in-house
+//!   readline editor `input.rs`), plus clipboard paste (`Ctrl+V`, macOS
+//!   Cmd+V).
 //!
 //! All logic lives in the library crate (`lib.rs`); this binary only wires
 //! the terminal.
@@ -26,9 +29,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyModifiers,
-    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CtEvent, EventStream, KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use futures_util::StreamExt;
 use ratatui::layout::Rect;
@@ -88,6 +91,21 @@ async fn main() -> io::Result<()> {
         crossterm::terminal::EnterAlternateScreen,
         EnableMouseCapture
     );
+    // Bracketed paste: ask the terminal to wrap clipboard pastes in
+    // `\e[200~ ... \e[201~` so a multi-line paste arrives as ONE crossterm
+    // `Event::Paste` instead of a raw keystroke flood. Without the brackets a
+    // three-line paste is decoded as ordinary typing — every embedded newline
+    // becomes a bare Enter key event and fires a submit (the bug this guards
+    // against). Best-effort, same policy as the kitty flags: an unsupported
+    // terminal ignores the escape sequence and `handle_paste` degrades to the
+    // Ctrl+V clipboard path. Platform-gated like the kitty push: on native
+    // Windows crossterm reads input through the Win32 console API, which
+    // never synthesizes `Event::Paste`, so pushing the sequence there is a
+    // no-op at best.
+    let enable_bracketed_paste = !cfg!(windows);
+    if enable_bracketed_paste {
+        let _ = crossterm::execute!(stdout, EnableBracketedPaste);
+    }
     // On builds where crossterm decodes a raw ANSI byte stream (unix,
     // including WSL inside Windows Terminal), ask for the kitty keyboard
     // protocol so capable terminals deliver distinct Shift+Enter /
@@ -117,7 +135,7 @@ async fn main() -> io::Result<()> {
     }
     // Every exit path below (splash abort, `?` failures, normal end, panic
     // unwind) restores the terminal exactly once through this guard.
-    let _terminal_restore = TerminalRestore::new(push_kitty_flags);
+    let _terminal_restore = TerminalRestore::new(push_kitty_flags, enable_bracketed_paste);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -243,18 +261,27 @@ fn push_kitty_flags() -> bool {
 /// RAII teardown: restores the terminal when dropped. Instantiated right
 /// after terminal setup so EVERY exit path — splash abort (`return Ok(())`),
 /// `?` failures, normal end, and panic unwind — leaves raw mode disabled,
-/// the alternate screen left, mouse capture off, and
-/// kitty keyboard-enhancement flags popped exactly when they were pushed.
+/// the alternate screen left, mouse capture off,
+/// kitty keyboard-enhancement flags popped exactly when they were pushed,
+/// and bracketed paste mode disabled exactly when it was enabled.
 struct TerminalRestore {
     /// Mirrors the startup push decision: the pop is issued if and only if
     /// the flags were pushed, so the terminal's kitty flag stack can never
     /// leak into the user's shell (nor under-pop someone else's entry).
     pop_kitty_flags: bool,
+    /// Mirrors the startup enable decision: bracketed paste is a terminal
+    /// MODE (not a stack), so it is turned off if and only if it was turned
+    /// on here — never blind, to avoid un-bracketing someone else's paste
+    /// mode on exit.
+    disable_bracketed_paste: bool,
 }
 
 impl TerminalRestore {
-    fn new(pop_kitty_flags: bool) -> Self {
-        Self { pop_kitty_flags }
+    fn new(pop_kitty_flags: bool, disable_bracketed_paste: bool) -> Self {
+        Self {
+            pop_kitty_flags,
+            disable_bracketed_paste,
+        }
     }
 }
 
@@ -263,6 +290,9 @@ impl Drop for TerminalRestore {
         let _ = crossterm::terminal::disable_raw_mode();
         if self.pop_kitty_flags {
             let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        if self.disable_bracketed_paste {
+            let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
         }
         let _ = crossterm::execute!(
             io::stdout(),
@@ -388,6 +418,18 @@ async fn run_loop(
                             // popup, never to the message draft.
                             let was_confirming_stop_reset =
                                 matches!(app.mode, Mode::ConfirmStopReset { .. });
+                            // the quit-confirm popup's Enter belongs to the
+                            // popup too. The popup is a FLAG, not a Mode, and
+                            // it can sit ABOVE a non-empty draft: its
+                            // confirming Enter (and the second Ctrl+C, which
+                            // is not a submit key anyway) must never ALSO
+                            // submit the draft it is parked on top of. The
+                            // snapshot is taken before the key lands because
+                            // `confirm_quit` clears the flag inside
+                            // handle_key — the loop would otherwise see a
+                            // plain Enter over a full draft and send it right
+                            // before shutting down.
+                            let was_quit_confirm = app.quit_confirm;
 
                             handle_key(&mut app, key);
 
@@ -462,6 +504,12 @@ async fn run_loop(
                             // is swallowed with the rest of its keys.
                             let enter_consumed_by_help =
                                 was_help_viewing && key.code == KeyCode::Enter;
+                            // the quit-confirm popup's
+                            // confirming Enter is consumed the same way:
+                            // with the popup open, Enter means "quit", never
+                            // "send the draft underneath".
+                            let enter_consumed_by_quit_confirm =
+                                was_quit_confirm && key.code == KeyCode::Enter;
 
                             // A confirmed thread deletion removes the persisted
                             // history file (idempotent: a missing file is
@@ -542,6 +590,7 @@ async fn run_loop(
                                 && !enter_consumed_by_sidebar
                                 && !enter_consumed_by_picker
                                 && !enter_consumed_by_help
+                                && !enter_consumed_by_quit_confirm
                             {
                                 let submitted = app.take_input();
                                 if let Some(submitted) = submitted {
@@ -573,7 +622,14 @@ async fn run_loop(
                         let area = Rect::new(0, 0, size.width, size.height);
                         handle_mouse(&mut app, mouse, area);
                     }
-                    Some(Ok(_)) => {} // focus, paste, other crossterm events
+                    Some(Ok(CtEvent::Paste(text))) => {
+                        // A bracketed paste is NOT a key: it never reaches
+                        // `handle_key`, can never match bare Enter, and can
+                        // never submit. The whole payload — newlines
+                        // included — lands in the draft in one insert.
+                        handle_paste(&mut app, &text);
+                    }
+                    Some(Ok(_)) => {} // focus and other crossterm events
                     Some(Err(e)) => return Err(io::Error::other(e)),
                     None => {} // stream ended; keep looping until quit
                 }
@@ -746,14 +802,40 @@ fn note_active_thread(
     *tracked = current;
 }
 
+/// Paste text into the input draft at the cursor — the shared sink for BOTH
+/// paste entry points: the Ctrl+V / Cmd+V clipboard read and the terminal's
+/// bracketed-paste event (`Event::Paste`).
+///
+/// Never submits. Newlines are hard newlines in the draft (the editor's
+/// `insert_str` splits them into lines), matching tui-textarea 0.7's paste
+/// behavior; `should_submit` stays the ONLY submit path and it runs on bare
+/// Enter key events alone — a paste event carries no key at all.
+///
+/// CRLF (Windows) and bare CR (classic Mac) line endings are normalized to
+/// `\n` before insertion so a foreign clipboard never leaves stray `\r`
+/// characters in the draft.
+///
+/// Paste is editor-scoped: while a modal popup, rename, search viewer or the
+/// sidebar holds the keyboard, the paste is swallowed — a flood of pasted
+/// text must never mutate the message draft that a popup's Enter would
+/// otherwise submit. The quit-confirm popup is no exception: it is a flag
+/// (not a Mode), so it is checked explicitly — a paste behind it would sit in
+/// the draft the confirming Enter must never send.
+fn handle_paste(app: &mut chibi_tui::app::App, text: &str) {
+    if app.quit_confirm || !app.mode.is_normal() || app.focus != Focus::Chat {
+        return;
+    }
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.is_empty() {
+        app.input.insert_str(&normalized);
+    }
+}
+
 /// Paste text from the system clipboard into the input field at the cursor.
 /// Failures are silent — a locked clipboard must not disturb typing.
 fn paste_clipboard(app: &mut chibi_tui::app::App) {
     if let Some(text) = chibi_tui::clipboard::get_text() {
-        let cleaned: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
-        if !cleaned.is_empty() {
-            app.input.insert_str(cleaned);
-        }
+        handle_paste(app, &text);
     }
 }
 
@@ -875,8 +957,14 @@ fn handle_mouse_with_copy(
             // (same isolation as the keyboard). A selection started before
             // a popup opened stays held underneath; a stale live drag is
             // harmless — the next Normal-mode click or Esc clears it.
+            // The quit-confirm popup is checked explicitly: it is a flag,
+            // not a Mode, and the pointer must not select (nor copy on
+            // release) under it. WHEEL routing deliberately stays live
+            // under it, mirroring the error popup: scrolling the chat
+            // behind a popup is harmless and pre-existing behavior; only
+            // pointer-driven selection/interaction is swallowed.
             // The wheel keeps its pre-existing routing below.
-            let selectable = app.mode.is_normal() && app.error_popup.is_none();
+            let selectable = app.mode.is_normal() && app.error_popup.is_none() && !app.quit_confirm;
             match mouse.kind {
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                     match ui::panel_region(&rects, mouse.column, mouse.row) {
@@ -1024,6 +1112,22 @@ fn normalize_cyrillic_ctrl_chord(
 /// reconnect) happen in the event loop by observing state changes, keeping
 /// this function synchronous and testable.
 fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
+    handle_key_with_copy(app, key, &|text| {
+        // Same clipboard transport as the selection release copy below
+        // (OSC 52 + the env fallback); the outcome is deliberately
+        // ignored — a failed write must not disturb the UI.
+        let _ = chibi_tui::clipboard::copy_text(text);
+    });
+}
+
+/// Testable form of [`handle_key`]: the clipboard write arrives as a
+/// closure (production passes [`chibi_tui::clipboard::copy_text`], tests
+/// capture into a buffer), the same seam [`handle_mouse_with_copy`] uses.
+fn handle_key_with_copy(
+    app: &mut chibi_tui::app::App,
+    key: crossterm::event::KeyEvent,
+    copy: &dyn Fn(&str),
+) {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return;
     }
@@ -1040,6 +1144,37 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // Ctrl+arrows system-wide before they ever reach the terminal.
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // ---- modal quit-confirmation popup captures everything ----
+    //
+    // While the "Quit chibi-tui?" popup is open, ONLY the decision keys
+    // work (the shared grammar `app::quit_decision`, also used by the
+    // splash / setup loops): y/Enter quit, Esc/n stay, `q` stays (deliberate —
+    // `q` can never confirm a quit; the same unbound-ish treatment the
+    // destructive popups give it), a SECOND Ctrl+C confirms (the first one
+    // only opened the popup). Everything else is swallowed so no keystroke
+    // leaks into the textarea and no global binding fires. The isolation is
+    // complete across ALL input sinks: keys (this branch), bracketed pastes
+    // (`handle_paste` checks the flag), the loop-level submit gate
+    // (`enter_consumed_by_quit_confirm` — the confirming Enter must never
+    // also send the draft underneath) and pointer selection (the mouse
+    // `selectable` guard). The popup is a
+    // standalone flag, not a Mode: it may sit above any state (another
+    // popup, a rename session, the sidebar) and dismissing restores that
+    // state exactly, because opening it never changed anything. It is
+    // cancel-safe by construction: an in-flight request keeps streaming
+    // while the popup is open — cancellation still goes through its own
+    // Ctrl+C path (busy Ctrl+C), which never opens this popup.
+    if app.quit_confirm {
+        match chibi_tui::app::quit_decision(key) {
+            chibi_tui::app::QuitDecision::Confirm => app.confirm_quit(),
+            chibi_tui::app::QuitDecision::Dismiss => {
+                app.cancel_quit_confirm();
+            }
+            chibi_tui::app::QuitDecision::Swallow => {}
+        }
+        return;
+    }
+
     // ---- modal error popup captures everything ----
     // (Ctrl+R rename is intentionally unreachable while the popup is open:
     // the popup branch returns before any mode handling.)
@@ -1050,8 +1185,10 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                 app.reconnect_requested = Some(ReconnectRequest {});
             }
             KeyCode::Esc => app.dismiss_error(),
-            KeyCode::Char('q') => app.should_quit = true,
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            // q / Ctrl+C open the quit confirmation (same flow as the
+            // idle Ctrl+C; the exit itself still needs the confirm).
+            KeyCode::Char('q') => app.begin_quit_confirm(),
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             // Any other key just dismisses the popup (stay in the app).
             _ => app.dismiss_error(),
         }
@@ -1069,7 +1206,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // pattern, Enter commits, Esc cancels, everything else is swallowed.
     // While the cursor rests on the newest line the view keeps streaming
     // new arrivals in; one step up pins it to the cursor. Esc closes,
-    // Ctrl+C quits (same class as the other popups). Everything else
+    // Ctrl+C opens the quit confirmation (same class as the other
+    // popups). Everything else
     // (typing, global chords (^N/^R/^D/^T/^L/^F), thread switching) is
     // swallowed so no keystroke leaks into the textarea and no global
     // binding fires. There is no Enter action: the viewer is strictly
@@ -1087,7 +1225,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                 KeyCode::Backspace if !ctrl && !alt => app.log_search_pop(),
                 KeyCode::Enter => app.log_commit_search(),
                 KeyCode::Esc => app.log_cancel_search(),
-                KeyCode::Char('c') if ctrl => app.should_quit = true,
+                KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
                 _ => {}
             }
             return;
@@ -1113,7 +1251,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Esc => {
                 app.close_log_viewer();
             }
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             _ => {}
         }
         return;
@@ -1128,7 +1266,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // Enter confirms the highlighted
     // row (stages the hidden `/model <n>` request, a no-op until the
     // listing arrives), Esc closes without acting (a parked fetch is
-    // dropped; an already-confirmed selection stays queued), Ctrl+C quits
+    // dropped; an already-confirmed selection stays queued), Ctrl+C opens the
+    // quit confirmation
     // (same class as the other popups). Everything else (typing, global
     // chords (^N/^R/^D/^T/^L/^F/^G/^O), thread switching) is swallowed so
     // no keystroke leaks into the textarea and no global binding fires.
@@ -1146,7 +1285,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Esc => {
                 app.close_model_picker();
             }
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             _ => {}
         }
         return;
@@ -1155,7 +1294,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // modal confirm popup captures everything ----
     //
     // While the Ctrl+D confirmation is open, ONLY the destructive decision
-    // keys work: Enter/`y` confirm, Esc/`n` cancel, Ctrl+C quits (same
+    // keys work: Enter/`y` confirm, Esc/`n` cancel, Ctrl+C opens the quit
+    // confirmation (same
     // class as the error popup's Ctrl+C). Everything else (typing, arrows,
     // Ctrl+N/R/L/F) is swallowed so no keystroke leaks into the textarea
     // and no global binding fires. `q` is deliberately left UNBOUND here
@@ -1178,7 +1318,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
                 app.cancel_delete();
             }
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             _ => {}
         }
         return;
@@ -1190,7 +1330,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // While the ^L (stop) or ⇧^L (reset) confirmation is open, ONLY the
     // destructive decision keys work: Enter/`y` confirm, Esc/`n`/same-chord
     // cancel (the chord that opened the popup: ^L for stop, ⇧^L for reset),
-    // Ctrl+C quits — the exact grammar of the delete confirm. Everything
+    // Ctrl+C opens the quit confirmation — the exact grammar of the delete
+    // confirm. Everything
     // else (typing, arrows, global chords) is swallowed so no keystroke
     // leaks into the textarea and no global binding fires. `q` is
     // deliberately unbound here (same destructive-popup rule as the delete
@@ -1216,7 +1357,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                 // variants (reset) close the popup without staging anything.
                 app.cancel_stop_reset();
             }
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             _ => {}
         }
         return;
@@ -1227,7 +1368,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // While the Ctrl+F search popup is open, ONLY search keys work: plain
     // chars edit the query (live recompute), Backspace edits backwards,
     // ↑/↓ navigate matches, Enter jumps to the selected match and closes,
-    // Esc closes without jumping, Ctrl+C quits (same class as the other
+    // Esc closes without jumping, Ctrl+C opens the quit confirmation (same
+    // class as the other
     // popups). Everything else (PgUp/PgDn, arrows, Ctrl+N/R/L/D, q) is
     // swallowed so no keystroke leaks into the textarea and no global
     // binding fires. Chat scroll is driven ONLY by the jump, never by
@@ -1243,7 +1385,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                 app.cancel_search();
             }
             KeyCode::Backspace => app.search_backspace(),
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             KeyCode::Char(ch) if !ctrl => app.search_push(ch),
             _ => {}
         }
@@ -1270,7 +1412,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                 app.cancel_search_all();
             }
             KeyCode::Backspace => app.search_all_backspace(),
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             KeyCode::Char(ch) if !ctrl => app.search_all_push(ch),
             _ => {}
         }
@@ -1283,7 +1425,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     // static keybindings table one line and PgUp/PgDn one page (both clamped
     // at the table's edges over the render-fed viewport — the same seam the
     // picker and the log viewer page by). F1 toggles closed (same-chord
-    // semantics) and Esc closes; Ctrl+C quits (same class as the other
+    // semantics) and Esc closes; Ctrl+C opens the quit confirmation (same
+    // class as the other
     // popups). There is no Enter action: the table is strictly read-only,
     // so Enter is swallowed and the loop's submit gate carries the same
     // help-modal snapshot the other popups have. Everything else (typing,
@@ -1298,7 +1441,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             KeyCode::Esc | KeyCode::F(1) => {
                 app.close_help_modal();
             }
-            KeyCode::Char('c') if ctrl => app.should_quit = true,
+            KeyCode::Char('c') if ctrl => app.begin_quit_confirm(),
             _ => {}
         }
         return;
@@ -1306,9 +1449,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
 
     // ---- global quit / cancel semantics ----
     //
-    // Ctrl+C cancels the in-flight request when one exists, otherwise quits,
-    // in EVERY mode (an open rename session does not trap Ctrl+C; it cancels
-    // the draft implicitly via the normal quit/cancel path).
+    // Ctrl+C cancels the in-flight request when one exists, otherwise opens
+    // the quit confirmation ("Quit chibi-tui?"), in EVERY mode (an open
+    // rename session does not trap Ctrl+C; it cancels the draft implicitly
+    // via the normal quit/cancel path). The two meanings never mix: a busy
+    // Ctrl+C is a cancellation ONLY — it never opens the popup — so a
+    // second Ctrl+C after the cancellation (request gone) is what asks
+    // before quitting.
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
         if app.cancel_rename() {
             return; // Esc-equivalent: drop the draft first, stay consistent.
@@ -1316,7 +1463,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         if let Some((request_id, thread_id)) = app.cancel_active() {
             app.pending_cancel = Some((request_id, thread_id));
         } else {
-            app.should_quit = true;
+            app.begin_quit_confirm();
         }
         return;
     }
@@ -1371,7 +1518,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
                     // is ignored: the draft is a plain single-line string, so
                     // only typing + backspace exist. Ctrl combos never reach
                     // here except modifiers-only presses, which are no-ops.
-                    let _ = tui_textarea::Input::from(key);
+                    let _ = chibi_tui::input::Input::from(key);
                 }
             }
         }
@@ -1486,13 +1633,13 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // a plain char falls through to the textarea's `(_, _)` arm and
         // inserts into the draft, so binding it would make a literal
         // question mark untypable in prompts. Ctrl+H was REJECTED too:
-        // tui-textarea 0.7 maps Char('h') + CONTROL to delete_char()
-        // (textarea.rs, the same arm as Backspace), and several terminal
+        // the editor maps Char('h') + CONTROL to backspace (the same
+        // arm as Backspace, kept from tui-textarea 0.7), and several terminal
         // setups deliver the physical Backspace key as ASCII BS, i.e.
         // Char('h') + CONTROL — the chord IS the editor's backspace today.
         // F(1) is verified FREE: no binding anywhere in src/ (no
-        // KeyCode::F hit at all), no tui-textarea mapping (its input match
-        // has no function-key arms, so the fall-through is a no-op), and
+        // KeyCode::F hit at all), no editor mapping (unknown keys are
+        // inert in the readline fall-through), and
         // no degradation cliff — F1 has a dedicated escape sequence on
         // legacy terminals as well, so the chord works with or without the
         // kitty keyboard protocol. Mnemonic: the universal help key.
@@ -1507,9 +1654,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // no-op: nothing to stop, and the retired screen-wipe semantics
         // taught that a visible idle action invites accidental clears.
         // Chord verification (same audit class as ^F/^G/^O/^S/^M): ^L never
-        // reaches the textarea — tui-textarea 0.7 has no Char('l') +
-        // CONTROL mapping (its input match has no ctrl-letter arms beyond
-        // the ones the dispatch claims), so the chord is free.
+        // reaches the editor — the dispatch claims the chord before the
+        // readline fall-through ever sees it, so the chord is free.
         (KeyCode::Char('l'), true) if key.modifiers.contains(KeyModifiers::SHIFT) => {
             // Kitty-protocol variant that reports the unshifted char with
             // the SHIFT flag: reset, same as the ⇧^L arm below.
@@ -1531,8 +1677,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             return;
         }
         (KeyCode::Char('u'), true) => {
-            // Delete from cursor to start of line. tui-textarea maps Ctrl+U
-            // to undo, which surprises readline users. Override it here.
+            // Delete from cursor to start of line. The old tui-textarea
+            // engine mapped Ctrl+U to undo, which surprised readline
+            // users; the in-house editor keeps readline semantics.
             app.input.delete_line_by_head();
             return;
         }
@@ -1552,13 +1699,14 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         //
         // Chord verification (feat task discipline, see the executor report
         // for the full audit): the first-choice ^Y candidate was REJECTED:
-        // tui-textarea 0.7 maps Ctrl+Y to paste-from-internal-yank (src/
-        // textarea.rs:589), and the yank buffer IS populated in this app:
+        // the readline family binds ^Y to paste-from-kill-ring (kept
+        // from tui-textarea 0.7, src/textarea.rs:589), and the kill ring
+        // IS populated in this app:
         // our own ^U override calls delete_line_by_head() → delete_piece()
         // which stores the killed text (textarea.rs:1022), so ^U→^Y (kill
         // line, paste it back) is live behavior today. Taking ^Y would break
         // that readline kill/yank family (^U/^K/^W/^Y). ^G is verified FREE:
-        // no app binding anywhere in src/, no tui-textarea 0.7 mapping, no
+        // no app binding anywhere in src/, no editor mapping, no
         // macOS system hijack, no flow-control semantics, and its readline
         // meaning (abort) has no function in this TUI. Mnemonic: loG.
         (KeyCode::Char('g'), true) => {
@@ -1574,8 +1722,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // for the full audit): ^G was already taken by the log viewer, so
         // the other task candidate ^O was verified FREE: no app binding
         // anywhere in src/ (only `Char('o')` hits are plain typing), no
-        // tui-textarea 0.7 shortcut (its Ctrl table covers a/b/d/e/f/h/j/k/
-        // n/p/r/u/v/w/x/y/<>/[], no 'o'), not part of this app's readline
+        // editor shortcut (the readline table covers a/b/d/e/f/h/j/k/n/p/
+        // u/w/y/<>/[], no 'o'), not part of this app's readline
         // family (^A/^E/^U/^K/^W/^Y/^L; GNU readline's operate-and-get-
         // next is a shell-side binding that never fires inside the TUI), no
         // macOS system hijack (Mission Control only takes ^arrows), and the
@@ -1592,9 +1740,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         //
         // Chord verification (feat task discipline, same audit class as the
         // ^G/^O/^M/^P entries): no app binding anywhere in src/ (the only
-        // `Char('s')` hits are plain typing), no tui-textarea 0.7 shortcut
-        // (its Ctrl table covers a/b/d/e/f/h/j/k/n/p/r/u/v/w/x/y/<>/[],
-        // no 's'), not part of this app's readline family (^A/^E/^U/^K/^W/
+        // `Char('s')` hits are plain typing), no editor shortcut (the
+        // readline table covers a/b/d/e/f/h/j/k/n/p/u/w/y/<>/[], no 's'),
+        // not part of this app's readline family (^A/^E/^U/^K/^W/
         // ^Y/^L), no macOS system hijack (Mission Control only takes
         // ^arrows), and the legacy tty IXON flow-control meaning of ^S is
         // inert under raw mode (crossterm enables raw at startup).
@@ -1609,8 +1757,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // `/model <n>` the same hidden way.
         //
         // Chord verification (feat task discipline, see the executor report
-        // for the full audit): tui-textarea 0.7 maps Ctrl+M to
-        // insert_newline() (textarea.rs:274-286, the same arm as Enter),
+        // for the full audit): the readline editor maps Ctrl+M to
+        // insert_newline() (the same arm as Enter, kept from tui-textarea
+        // 0.7),
         // which this binding deliberately OVERRIDES exactly like the
         // existing ^U undo override: the global match claims the chord and
         // returns before the textarea ever sees it, and no app flow relies
@@ -1636,8 +1785,9 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         //
         // Chord verification (feat task discipline, same audit class as the
         // ^G/^O/^M entries): no app binding anywhere in src/ (the only `p`
-        // hits are the splash art color table), and tui-textarea 0.7 maps
-        // Ctrl+P to move-cursor-up, which this binding deliberately
+        // hits are the splash art color table), and the readline editor maps
+        // Ctrl+P to move-cursor-up (kept from tui-textarea 0.7), which this
+        // binding deliberately
         // OVERRIDES exactly like the ^U undo override: the global match
         // claims the chord and returns before the textarea ever sees it, and
         // no app flow relies on a ^P caret move (plain ↑ is the caret
@@ -1680,7 +1830,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
             app.toggle_focus();
             return;
         }
-        // Ctrl+A / Ctrl+E reach tui-textarea's built-in readline mappings
+        // Ctrl+A / Ctrl+E reach the editor's built-in readline mappings
         // (head/end of line); they fall through untouched below.
         _ => {}
     }
@@ -1695,7 +1845,8 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
     //   zero behavior divergence. Alt exists because macOS Mission Control
     //   hijacks Ctrl+arrows system-wide before they reach the terminal.
     // * Plain ↑ / ↓ move the TEXT CURSOR vertically inside the editor via
-    //   tui-textarea's native Up/Down mapping (CursorMove::Up/Down). They
+    //   the editor's native Up/Down mapping (caret up/down, column
+    //   preserved and clamped). They
     //   never submit and never switch threads; the caret auto-follows the
     //   grown editor viewport because ui::draw renders the widget over
     //   the full grown block every frame.
@@ -1713,11 +1864,27 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // textarea's readline-compatible handler: caret movement only.
         // Alt+↑/↓ never reach this arm (the synonym arms above take them).
         (KeyCode::Up | KeyCode::Down, _) => {
-            let converted: tui_textarea::Input = key.into();
+            let converted: chibi_tui::input::Input = key.into();
             app.input.input(converted);
         }
         (KeyCode::PageUp, _) => app.scroll_up(app.chat_visible_rows),
         (KeyCode::PageDown, _) => app.scroll_down(app.chat_visible_rows),
+        // y with a held chat selection copies its plain text through the
+        // SAME clipboard path as the drag-release copy (and the log
+        // viewer's `y`); the outcome is ignored — a failed write degrades
+        // silently. The selection STAYS active after copying (the user
+        // still sees what they copied; a click / Esc / thread switch
+        // clears it as before). Without a selection the arm does not
+        // claim the key: plain `y` keeps its pre-existing behavior
+        // (typing into the draft) and no binding is shadowed.
+        // Latin-only by convention: under RU/UA layouts the plain letter
+        // is never rewritten (only Ctrl-chords are normalized), so `y`
+        // stays a Latin keypress by design.
+        (KeyCode::Char('y'), false) if !alt && app.selection.is_some() => {
+            if let Some(text) = app.selection_text() {
+                copy(&text);
+            }
+        }
         (KeyCode::Esc, _) if !input_is_empty => {
             // Non-empty input: clear it (and any mouse selection with it).
             app.clear_selection();
@@ -1743,7 +1910,7 @@ fn handle_key(app: &mut chibi_tui::app::App, key: crossterm::event::KeyEvent) {
         // Everything else (including Ctrl+A/E, Alt+B/F, Alt+D word ops)
         // goes into the textarea's readline-compatible handler.
         (_, _) => {
-            let converted: tui_textarea::Input = key.into();
+            let converted: chibi_tui::input::Input = key.into();
             app.input.input(converted);
         }
     }
@@ -1772,8 +1939,8 @@ mod tests {
 
     fn submit_text(app: &mut chibi_tui::app::App, text: &str) -> chibi_tui::app::Submitted {
         for ch in text.chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(chibi_tui::input::Input {
+                key: chibi_tui::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -1929,6 +2096,10 @@ mod tests {
         assert_eq!(Some(request_id.as_str()), app.active_request_id());
         assert_eq!(request_id, submitted.request_id);
         assert!(!app.should_quit, "busy Ctrl+C must not quit");
+        assert!(
+            !app.quit_confirm,
+            "busy Ctrl+C must not open the quit confirmation"
+        );
     }
 
     /// Ctrl+C with queued prompts still cancels only the in-flight request;
@@ -1953,14 +2124,181 @@ mod tests {
         );
         assert_eq!(app.active_queue_len(), 1, "queue survives the cancel");
         assert!(!app.should_quit);
+        assert!(!app.quit_confirm, "cancelling must not open the confirm");
     }
 
+    /// Idle Ctrl+C no longer quits directly: it opens the quit
+    /// confirmation; `y`/Enter then performs the same shutdown transition
+    /// the old direct quit used to.
     #[test]
-    fn ctrl_c_when_idle_quits() {
+    fn ctrl_c_when_idle_opens_quit_confirmation() {
         let mut app = app_with_chats(1);
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.pending_cancel.is_none());
-        assert!(app.should_quit);
+        assert!(app.pending_cancel.is_none(), "nothing to cancel");
+        assert!(app.quit_confirm, "idle Ctrl+C must open the confirmation");
+        assert!(!app.should_quit, "opening the confirm must not quit");
+
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.should_quit, "y confirms the quit");
+        assert!(!app.quit_confirm, "popup closed by the confirm");
+    }
+
+    /// Enter confirms the quit too (same grammar as the other popups).
+    #[test]
+    fn quit_confirm_enter_quits() {
+        let mut app = app_with_chats(1);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.should_quit, "Enter confirms the quit");
+    }
+
+    /// Enter over a NON-EMPTY draft with the quit confirm open must confirm
+    /// the quit WITHOUT also submitting the draft underneath (integration
+    /// leak: the popup's confirming Enter used to reach the run_loop
+    /// submission chain and send the message right before shutdown). The
+    /// loop-gate replica below mirrors the run_loop snapshot + submission
+    /// chain exactly.
+    #[test]
+    fn quit_confirm_enter_with_nonempty_draft_does_not_submit() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "precious draft");
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit_confirm, "precondition: popup open over a draft");
+
+        // The run_loop gate replica: snapshot BEFORE the key, then the
+        // submission chain conditions in the same order.
+        let key = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let was_quit_confirm = app.quit_confirm;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let enter_consumed_by_quit_confirm = was_quit_confirm && key.code == KeyCode::Enter;
+        let would_submit =
+            app.error_popup.is_none() && should_submit(&key) && !enter_consumed_by_quit_confirm;
+
+        assert!(app.should_quit, "Enter still confirms the quit");
+        assert!(!app.quit_confirm, "popup closed by the confirm");
+        assert!(
+            !would_submit,
+            "the confirming Enter must be consumed by the popup, never submitted"
+        );
+        assert!(
+            app.take_input().is_some(),
+            "the draft was never sent — it is still intact in the buffer"
+        );
+        assert_eq!(app.active_queue_len(), 0, "nothing enqueued either");
+    }
+
+    /// While the quit confirm is open nothing leaks: no typing reaches the
+    /// textarea, no global binding fires, and `q` — which can never confirm
+    /// a quit — dismisses the popup (documented choice: `q` is treated as
+    /// "stay", matching the unbound treatment it gets in the destructive
+    /// popups).
+    #[test]
+    fn quit_confirm_isolates_keystrokes_and_q_dismisses() {
+        let mut app = app_with_chats(3);
+        type_in(&mut app, "precious draft");
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit_confirm);
+
+        // Typing must not reach the textarea (letters a/b/c avoid the
+        // popup's own y/n decision keys).
+        type_in(&mut app, "abc");
+        // Global bindings suspended.
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(app.chats.len(), 3, "Ctrl+N must not fire mid-popup");
+        assert_eq!(
+            app.mode,
+            chibi_tui::app::Mode::Normal,
+            "Ctrl+D must not fire"
+        );
+        assert_eq!(app.active, 0, "thread switching must not fire");
+        assert!(app.quit_confirm, "popup must stay open");
+
+        // q is a DISMISS here, never a quit.
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.quit_confirm, "q dismisses the confirm");
+        assert!(!app.should_quit, "q must never quit from the confirm");
+
+        // The prior state is exactly as it was.
+        assert_eq!(
+            app.input.lines().join(""),
+            "precious draft",
+            "no keystroke leaked into the textarea"
+        );
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Chat);
+    }
+
+    /// Dismissing (n/Esc) restores the exact prior state: focus, mode and
+    /// the draft all survive untouched — the popup is a flag, so opening
+    /// it never changed anything to restore.
+    #[test]
+    fn quit_confirm_dismiss_restores_prior_state() {
+        // Sidebar focus + a draft + a rename-cancelled... keep it simple:
+        // sidebar focus, draft text, then idle Ctrl+C → Esc.
+        let mut app = app_with_chats(3);
+        type_in(&mut app, "half-typed prompt");
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit_confirm);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.quit_confirm);
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.focus,
+            chibi_tui::app::Focus::Sidebar,
+            "focus restored untouched"
+        );
+        assert_eq!(
+            app.input.lines().join(""),
+            "half-typed prompt",
+            "draft restored untouched"
+        );
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+
+        // And 'n' dismisses identically.
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.quit_confirm);
+        assert!(!app.should_quit);
+        assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+    }
+
+    /// Opening the confirm is cancel-safe: with a request in flight the
+    /// quit confirm (reached through the error popup's q, since busy
+    /// Ctrl+C is a cancellation) must NOT touch the request — cancellation
+    /// still goes through its own Ctrl+C path only.
+    #[test]
+    fn opening_quit_confirm_does_not_cancel_inflight_request() {
+        let mut app = app_with_chats(1);
+        let submitted = submit_text(&mut app, "long running");
+        app.show_error("boom");
+
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.quit_confirm);
+        assert!(app.pending_cancel.is_none(), "no cancellation was staged");
+        assert_eq!(
+            app.active_request_id(),
+            Some(submitted.request_id.as_str()),
+            "the in-flight request keeps streaming"
+        );
+
+        // Dismiss: the request is STILL untouched.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.quit_confirm);
+        assert_eq!(app.active_request_id(), Some(submitted.request_id.as_str()));
+
+        // The own cancel path still works: dismiss the error popup first,
+        // then busy Ctrl+C cancels — it never opens the confirm.
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.error_popup.is_none(), "popup dismissed");
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.pending_cancel.is_some(), "cancel path intact");
+        assert!(!app.quit_confirm, "busy Ctrl+C never opens the confirm");
     }
 
     // ^P routing --------------------------------------
@@ -2013,7 +2351,7 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(
             !app.should_quit,
-            "Esc in idle must never quit — only Ctrl+C quits"
+            "Esc in idle must never quit — only a confirmed Ctrl+C does"
         );
 
         // Non-empty input: Esc clears it.
@@ -2416,8 +2754,11 @@ mod tests {
         assert!(!app.should_quit, "Esc must not quit from the popup");
     }
 
+    /// `q` / Ctrl+C from the error popup open the quit confirmation (the
+    /// exit itself still needs the confirm); the error popup stays open
+    /// underneath, so dismissing the confirm restores it exactly.
     #[test]
-    fn popup_q_and_ctrl_c_quit() {
+    fn popup_q_and_ctrl_c_open_quit_confirmation() {
         for (code, mods) in [
             (KeyCode::Char('q'), KeyModifiers::NONE),
             (KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -2425,8 +2766,36 @@ mod tests {
             let mut app = app_with_chats(1);
             app.show_error("boom");
             press(&mut app, code, mods);
-            assert!(app.should_quit, "{code:?} must quit from the popup");
+            assert!(app.quit_confirm, "{code:?} must open the confirmation");
+            assert!(!app.should_quit, "{code:?} must not quit directly");
+            assert!(
+                app.error_popup.is_some(),
+                "the error popup stays open underneath"
+            );
         }
+    }
+
+    /// Dismissing the quit confirm opened from the error popup restores
+    /// the popup state exactly (the confirm is a flag, not a Mode — the
+    /// error popup never went anywhere).
+    #[test]
+    fn dismissing_quit_confirm_over_error_popup_restores_it() {
+        let mut app = app_with_chats(1);
+        app.show_error("boom");
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.quit_confirm);
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.quit_confirm, "Esc dismisses the confirm");
+        assert!(!app.should_quit, "dismiss keeps the app alive");
+        assert!(
+            app.error_popup.is_some(),
+            "the error popup is exactly where it was"
+        );
+        assert!(app.reconnect_requested.is_none(), "no stray reconnect");
+        // And the restored popup still works end to end.
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(app.reconnect_requested.is_some(), "R still reconnects");
     }
 
     #[test]
@@ -2516,7 +2885,6 @@ mod tests {
 
     #[test]
     fn ctrl_a_and_ctrl_e_reach_textarea_readline_mappings() {
-        use tui_textarea::CursorMove;
         let mut app = app_with_chats(1);
         for ch in "abc".chars() {
             press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
@@ -2527,7 +2895,6 @@ mod tests {
         // Ctrl+E → end of line.
         press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
         assert_eq!(app.input.cursor(), (0, 3), "Ctrl+E moves to line end");
-        let _ = CursorMove::Forward; // keep import used when assertions change
     }
 
     /// Release events are ignored everywhere (macOS emits them).
@@ -2711,6 +3078,10 @@ mod tests {
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         let (request_id, _) = app.pending_cancel.expect("second Ctrl+C cancels request");
         assert_eq!(request_id, submitted.request_id);
+        assert!(
+            !app.quit_confirm,
+            "a cancel never doubles as a quit confirmation"
+        );
     }
 
     /// The error popup captures keys BEFORE rename mode can be entered:
@@ -2914,14 +3285,21 @@ mod tests {
     /// Startup/teardown pairing contract: the kitty enhancement flags are
     /// popped by the `TerminalRestore` guard exactly when they were pushed,
     /// so the terminal's kitty flag stack can never leak into the user's
-    /// shell after exit (nor under-pop an outer entry).
+    /// shell after exit (nor under-pop an outer entry). Bracketed paste is
+    /// disabled by the same guard exactly when it was enabled — a terminal
+    /// MODE, not a stack, so the guard must never toggle it blind.
     #[test]
     fn terminal_restore_pops_the_kitty_flags_exactly_when_they_were_pushed() {
-        let restore = TerminalRestore::new(push_kitty_flags());
+        let restore = TerminalRestore::new(push_kitty_flags(), !cfg!(windows));
         assert_eq!(
             restore.pop_kitty_flags,
             push_kitty_flags(),
             "the guard's pop decision must mirror the push decision"
+        );
+        assert_eq!(
+            restore.disable_bracketed_paste,
+            !cfg!(windows),
+            "the guard's disable decision must mirror the enable decision"
         );
         // The guard built from the real startup decision is internally
         // consistent by construction; the false/true branches are covered
@@ -2929,9 +3307,164 @@ mod tests {
         // leaked flag stack or an under-pop on some platform).
     }
 
-    /// Plain ↑/↓ move the text cursor vertically inside the editor — never
-    /// switching threads. Column preserved across rows (tui-textarea native
-    /// CursorMove), clamped at the first/last row. This exercises the grown
+    /// A bracketed multi-line paste inserts ALL lines into the draft as hard
+    /// newlines and NEVER submits — the paste event carries no key, so bare
+    /// Enter (the only submit path) can never fire from a paste. Regression
+    /// for the hand-tested bug: a three-line paste used to fire three
+    /// submits because the terminal delivered the paste as raw keystrokes
+    /// (no bracketed-paste mode) and each embedded newline decoded into a
+    /// submitting Enter.
+    #[test]
+    fn bracketed_multiline_paste_inserts_lines_without_submitting() {
+        let mut app = app_with_chats(1);
+        handle_paste(&mut app, "line one\nline two\nline three");
+        assert_eq!(
+            app.input.lines(),
+            ["line one", "line two", "line three"],
+            "the whole paste lands in the draft, newlines intact"
+        );
+        assert_eq!(app.input.cursor(), (2, 10));
+        // No submit happened: the draft is still there for the user to send.
+        assert!(app.take_input().is_some());
+    }
+
+    /// Windows (`\r\n`) and classic-Mac (`\r`) line endings normalize to
+    /// `\n` on paste — a foreign clipboard never leaves stray `\r` chars in
+    /// the draft.
+    #[test]
+    fn paste_normalizes_crlf_and_bare_cr_to_newlines() {
+        let mut app = app_with_chats(1);
+        handle_paste(&mut app, "alpha\r\nbeta\rgamma");
+        assert_eq!(app.input.lines(), ["alpha", "beta", "gamma"]);
+    }
+
+    /// Pasting into a non-empty draft splits lines at the caret: the tail of
+    /// the caret's line wraps to the last pasted line, exactly like
+    /// tui-textarea 0.7's `insert_str`.
+    #[test]
+    fn paste_mid_text_splits_lines_at_caret() {
+        let mut app = app_with_chats(1);
+        for ch in "hello".chars() {
+            press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        // Walk the caret back into the middle of "hello" (between 'l' and 'o').
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        handle_paste(&mut app, "X\nY");
+        assert_eq!(app.input.lines(), ["hellX", "Yo"]);
+        assert_eq!(app.input.cursor(), (1, 1));
+    }
+
+    /// Paste is editor-scoped: while the sidebar owns the keyboard, a
+    /// bracketed paste must be swallowed — it can never fill a draft the
+    /// sidebar's own Enter would submit.
+    #[test]
+    fn paste_into_sidebar_focus_is_swallowed() {
+        let mut app = app_with_chats(1);
+        app.focus = Focus::Sidebar;
+        handle_paste(&mut app, "should not land\nanywhere");
+        assert!(app.input.lines().iter().all(|l| l.is_empty()));
+    }
+
+    /// A bracketed paste while the quit-confirm popup is open is swallowed:
+    /// the popup is a flag (not a Mode), so `handle_paste` checks it
+    /// explicitly — pasted text must never mutate the draft sitting under
+    /// the popup (a paste-then-Enter there used to SEND the pasted text on
+    /// quit-confirm).
+    #[test]
+    fn paste_while_quit_confirm_is_open_is_swallowed() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "keep me");
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit_confirm, "precondition");
+
+        handle_paste(&mut app, "pasted\njunk");
+        assert_eq!(
+            app.input.lines(),
+            ["keep me"],
+            "the paste must not reach the draft under the popup"
+        );
+        assert!(app.quit_confirm, "the popup itself is unaffected");
+
+        // And a dismissal leaves the exact prior draft.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.quit_confirm);
+        assert_eq!(app.input.lines(), ["keep me"]);
+    }
+
+    /// A Shift+Enter-typed two-line draft submits the prompt with the
+    /// newline intact. Pins the submit chain end to end: whatever the
+    /// editor shows (`["alpha", "beta"]`) is what `take_input` extracts —
+    /// the backend receives `alpha\nbeta`, never the word-glued
+    /// `alphabeta`.
+    #[test]
+    fn shift_enter_multiline_draft_submits_prompt_with_newlines() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_in(&mut app, "beta");
+        assert_eq!(app.input.lines(), ["alpha", "beta"], "precondition");
+
+        let submitted = app.take_input().expect("prompt taken");
+        assert_eq!(
+            submitted.prompt, "alpha\nbeta",
+            "the submitted prompt carries the Shift+Enter newline verbatim"
+        );
+    }
+
+    /// A pasted multi-line draft submits the prompt with the newlines
+    /// intact. Regression pin for the reported word-gluing: the OLD
+    /// Ctrl+V path on main filtered `\n`/`\r` out of the clipboard text
+    /// outright, so `line one\nline two` reached the backend as the glued
+    /// single word-merged string `line oneline two`. The paste now inserts
+    /// hard newlines and the extraction joins with `\n`.
+    #[test]
+    fn pasted_multiline_draft_submits_prompt_with_newlines() {
+        let mut app = app_with_chats(1);
+        handle_paste(&mut app, "line one\nline two");
+        assert_eq!(app.input.lines(), ["line one", "line two"], "precondition");
+
+        let submitted = app.take_input().expect("prompt taken");
+        assert_eq!(
+            submitted.prompt, "line one\nline two",
+            "paste newlines must reach the wire prompt, not be stripped away"
+        );
+        assert!(
+            !submitted.prompt.contains("oneline"),
+            "words from consecutive lines must never glue together"
+        );
+    }
+
+    /// A multi-line prompt submitted while a request is in flight enqueues
+    /// with its newline intact and drains verbatim — the queued path
+    /// preserves newlines exactly like the immediate-send path.
+    #[test]
+    fn queued_multiline_prompt_preserves_newlines_through_the_fifo() {
+        let mut app = app_with_chats(1);
+        let first = submit_text(&mut app, "in flight");
+
+        // Busy chat: the multi-line draft goes to the FIFO, not the wire.
+        type_in(&mut app, "queued one");
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_in(&mut app, "queued two");
+        assert!(
+            app.take_input().is_none(),
+            "busy chat enqueues, no immediate send"
+        );
+
+        let thread = app.chats[0].id.clone();
+        let drained = app
+            .dequeue_next_for(&thread)
+            .expect("queued prompt drained");
+        assert_eq!(
+            drained.prompt, "queued one\nqueued two",
+            "the queued prompt keeps its newline through enqueue and drain"
+        );
+        assert_ne!(drained.request_id, first.request_id);
+    }
+
+    /// Plain ↑/↓ move the text cursor vertically inside the editor — never    /// Plain ↑/↓ move the text cursor vertically inside the editor — never
+    /// switching threads. Column preserved across rows (readline-native
+    /// mapping), clamped at the first/last row. This exercises the grown
     /// (MAX_INPUT_LINES-capped) block's caret navigation path.
     #[test]
     fn plain_vertical_arrows_move_caret_not_thread() {
@@ -3586,13 +4119,17 @@ mod tests {
         assert!(app.pending_search_jump.is_none());
     }
 
-    /// Ctrl+C quits from the search popup (same class as the other popups).
+    /// Ctrl+C opens the quit confirmation from the search popup (same
+    /// class as the other popups); the second Ctrl+C IS the confirmation.
     #[test]
-    fn search_popup_ctrl_c_quits() {
+    fn search_popup_ctrl_c_opens_quit_confirmation() {
         let mut app = app_with_chats(1);
         press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.should_quit);
+        assert!(app.quit_confirm, "first Ctrl+C opens the confirmation");
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit, "second Ctrl+C confirms the quit");
         assert_eq!(app.chats.len(), 1, "quit must not mutate chats");
     }
 
@@ -3669,16 +4206,34 @@ mod tests {
         );
     }
 
-    /// Ctrl+C inside the confirm popup quits the app (same class as the
-    /// error popup) — it must NOT delete the chat.
+    /// Ctrl+C inside the delete confirm opens the quit confirmation (same
+    /// class as the error popup) — it must NOT delete the chat. Dismissing
+    /// the quit confirm restores the delete popup exactly (the confirm is
+    /// a flag, not a Mode — the popup below never moved).
     #[test]
-    fn confirm_popup_ctrl_c_quits_without_deleting() {
+    fn confirm_popup_ctrl_c_opens_quit_confirmation_without_deleting() {
         let mut app = app_with_chats(1);
         press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.should_quit);
-        assert_eq!(app.chats.len(), 1, "quit must not delete the chat");
+        assert!(app.quit_confirm);
+        assert!(!app.should_quit);
+        assert_eq!(app.chats.len(), 1, "quit confirm must not delete the chat");
         assert!(app.pending_delete.is_none());
+
+        // n stays in the app AND in the delete popup.
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.quit_confirm, "n dismisses the quit confirm");
+        assert_eq!(
+            app.mode,
+            chibi_tui::app::Mode::ConfirmDelete,
+            "the delete popup is exactly where it was"
+        );
+        assert!(!app.should_quit);
+
+        // The restored popup still completes its own flow.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.mode, chibi_tui::app::Mode::Normal);
+        assert_eq!(app.chats.len(), 1);
     }
 
     /// Deleting the last chat reaches the clean empty state through the full
@@ -3893,10 +4448,10 @@ mod tests {
         assert!(app.pending_global_search_jump.is_none());
     }
 
-    /// Ctrl+C quits from the global search popup (same class as the other
-    /// popups).
+    /// Ctrl+C opens the quit confirmation from the global search popup
+    /// (same class as the other popups); the second Ctrl+C confirms.
     #[test]
-    fn global_search_popup_ctrl_c_quits() {
+    fn global_search_popup_ctrl_c_opens_quit_confirmation() {
         let mut app = app_with_chats(1);
         press(
             &mut app,
@@ -3904,7 +4459,10 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         );
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.should_quit);
+        assert!(app.quit_confirm, "first Ctrl+C opens the confirmation");
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit, "second Ctrl+C confirms the quit");
         assert_eq!(app.chats.len(), 1, "quit must not mutate chats");
     }
 
@@ -4346,13 +4904,17 @@ mod tests {
         }
     }
 
-    /// Ctrl+C keeps its popup-class meaning: quit from the log viewer.
+    /// Ctrl+C keeps its popup-class meaning: it opens the quit
+    /// confirmation from the log viewer; the second Ctrl+C confirms.
     #[test]
-    fn log_viewer_ctrl_c_quits() {
+    fn log_viewer_ctrl_c_opens_quit_confirmation() {
         let mut app = app_with_chats(1);
         press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.should_quit);
+        assert!(app.quit_confirm);
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit, "second Ctrl+C confirms the quit");
         assert_eq!(app.chats.len(), 1, "quit must not mutate chats");
     }
 
@@ -4563,8 +5125,8 @@ mod tests {
     fn the_picker_modal_swallows_everything_but_nav_confirm_cancel() {
         let mut app = app_with_chats(1);
         for ch in "precious draft".chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(chibi_tui::input::Input {
+                key: chibi_tui::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -4606,7 +5168,7 @@ mod tests {
         );
 
         // The ONLY working keys: ↑/↓ and PgUp/PgDn navigate, Enter confirms,
-        // Esc cancels, Ctrl+C quits.
+        // Esc cancels, Ctrl+C opens the quit confirmation.
         press(&mut app, KeyCode::Down, KeyModifiers::empty());
         press(&mut app, KeyCode::Down, KeyModifiers::empty());
         press(&mut app, KeyCode::Up, KeyModifiers::empty());
@@ -4621,8 +5183,8 @@ mod tests {
     fn the_picker_enters_confirm_never_touch_the_message_draft() {
         let mut app = app_with_chats(1);
         for ch in "half typed prompt".chars() {
-            app.input.input(tui_textarea::Input {
-                key: tui_textarea::Key::Char(ch),
+            app.input.input(chibi_tui::input::Input {
+                key: chibi_tui::input::Key::Char(ch),
                 ctrl: false,
                 alt: false,
                 shift: false,
@@ -4671,10 +5233,13 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_ctrl_c_quits_like_the_other_popups() {
+    fn the_picker_ctrl_c_opens_the_quit_confirmation_like_the_other_popups() {
         let mut app = app_with_chats(1);
         inject_ready_picker(&mut app, 2);
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit_confirm);
+        assert!(!app.should_quit, "the confirm itself must not quit");
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
         assert!(app.should_quit);
     }
 
@@ -4819,7 +5384,7 @@ mod tests {
         (
             "Global",
             "Ctrl+C",
-            "cancel the active request · quit when idle",
+            "cancel the active request · quit when idle (confirmation)",
         ),
         ("Global", "Ctrl+N", "new chat"),
         (
@@ -4862,6 +5427,7 @@ mod tests {
             "Drag-select",
             "highlight chat text · release copies it",
         ),
+        ("Global", "y", "copy the active chat selection"),
         (
             "Global",
             "Ctrl-chords",
@@ -4943,8 +5509,10 @@ mod tests {
         ("Log search (/)", "Enter", "commit the search"),
         ("Log search (/)", "Esc", "cancel the search"),
         ("Error popup", "R", "reconnect"),
-        ("Error popup", "q", "quit"),
+        ("Error popup", "q", "quit (confirmation)"),
         ("Error popup", "Esc · any key", "dismiss"),
+        ("Quit confirm", "y · Enter", "quit"),
+        ("Quit confirm", "Esc · n · q", "stay"),
         ("Help (F1)", "↑ / ↓ · PgUp / PgDn", "scroll the list"),
         ("Help (F1)", "F1 · Esc", "close"),
     ];
@@ -5495,7 +6063,7 @@ mod tests {
 
     /// Layout-equivalence: a Cyrillic chord must leave the app in EXACTLY
     /// the state its Latin original would — including the uppercase
-    /// Shift-decorated shapes, which tui-textarea treats as unknown ctrl
+    /// Shift-decorated shapes, which the editor treats as unknown ctrl
     /// combos (a no-op here) in BOTH flavors.
     #[test]
     fn cyrillic_chords_reach_the_identical_state_as_their_latin_originals() {
@@ -5583,6 +6151,7 @@ mod tests {
         let (request_id, _) = app.pending_cancel.expect("cancel requested");
         assert_eq!(request_id, submitted.request_id);
         assert!(!app.should_quit, "busy Ctrl+с must not quit");
+        assert!(!app.quit_confirm, "busy Ctrl+с must not confirm-quit");
     }
 
     /// Plain Cyrillic typing must never be rewritten: the textarea receives
@@ -5856,7 +6425,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    26,
+                    27,
                     2,
                 ),
                 WHEEL_AREA,
@@ -5870,7 +6439,7 @@ mod tests {
                 &mut app,
                 button(
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                    37,
+                    38,
                     2,
                 ),
                 WHEEL_AREA,
@@ -5913,7 +6482,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -5923,7 +6492,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -5933,7 +6502,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -5954,7 +6523,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -5964,7 +6533,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -5974,7 +6543,117 @@ mod tests {
         assert!(click_sink.borrow().is_empty(), "plain click copied nothing");
     }
 
-    /// Esc clears the selection (the keyboard's deselect), including a
+    /// `y` with a held chat selection copies its plain text through the
+    /// SAME injected clipboard seam as the release copy, and the selection
+    /// STAYS active afterwards (the user still sees what they copied).
+    #[test]
+    fn y_copies_the_held_selection_and_keeps_it_active() {
+        let mut app = app_with_chats(1);
+        app.chats[0]
+            .messages
+            .push(Message::assistant("hello world from selection"));
+        render_for_geometry(&mut app);
+
+        // Build a real selection through the mouse dispatch ("hello").
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    27,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    32,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    31,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            assert_eq!(
+                copied.borrow().as_slice(),
+                ["hello"],
+                "the release copied the dragged range"
+            );
+            copied.borrow_mut().clear();
+        }
+        assert!(app.selection.is_some(), "release held the selection");
+
+        // `y` copies through the keyboard seam — WITHOUT clearing.
+        let y_copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &y_copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            handle_key_with_copy(
+                &mut app,
+                key_event(KeyCode::Char('y'), KeyModifiers::NONE),
+                &copy,
+            );
+        }
+        assert_eq!(
+            y_copied.borrow().as_slice(),
+            ["hello"],
+            "y copied the selected plain text"
+        );
+        assert!(
+            app.selection.is_some(),
+            "the selection stays active after the copy"
+        );
+
+        // A later Esc clears it as before (the deselect path is untouched).
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.selection.is_none(), "Esc still deselects after a copy");
+    }
+
+    /// Without a selection `y` is NOT claimed by the copy binding: nothing
+    /// is copied and the pre-existing behavior (plain typing into the
+    /// draft) is preserved — no binding is shadowed.
+    #[test]
+    fn y_without_a_selection_copies_nothing_and_types_into_the_draft() {
+        let mut app = app_with_chats(1);
+        type_in(&mut app, "draf");
+
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+            handle_key_with_copy(
+                &mut app,
+                key_event(KeyCode::Char('y'), KeyModifiers::NONE),
+                &copy,
+            );
+        }
+        assert!(
+            copied.borrow().is_empty(),
+            "nothing selected, nothing copied"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "drafy",
+            "plain y keeps its typing behavior without a selection"
+        );
+    }
+
+    /// Esc clears the selection    /// Esc clears the selection (the keyboard's deselect), including a
     /// live drag, and never quits.
     #[test]
     fn esc_clears_the_mouse_selection() {
@@ -5987,7 +6666,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -5997,7 +6676,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                34,
+                35,
                 2,
             ),
             WHEEL_AREA,
@@ -6023,7 +6702,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6033,7 +6712,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6072,7 +6751,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6082,7 +6761,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                34,
+                35,
                 2,
             ),
             WHEEL_AREA,
@@ -6118,7 +6797,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                26,
+                27,
                 2,
             ),
             WHEEL_AREA,
@@ -6128,7 +6807,7 @@ mod tests {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                30,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -6154,5 +6833,101 @@ mod tests {
             matches!(app.selection, Some(ChatSelection { dragging: true, .. })),
             "popup press must not start a new selection nor clear"
         );
+    }
+
+    /// Mouse selection under the quit-confirm popup is swallowed: a press
+    /// must not start a new selection nor clear a held one, and a release
+    /// must not copy. The popup is a flag (not a Mode), so the mouse
+    /// `selectable` guard checks it explicitly — same isolation as the
+    /// delete-confirm popup. The wheel deliberately keeps scrolling (the
+    /// same routing the error popup gets; scrolling behind a popup is
+    /// harmless pre-existing behavior).
+    #[test]
+    fn selection_under_quit_confirm_is_swallowed() {
+        let mut app = app_with_chats(1);
+        app.chats[0].messages.push(Message::assistant("text here"));
+        render_for_geometry(&mut app);
+
+        let copied = std::cell::RefCell::new(Vec::<String>::new());
+        {
+            let sink = &copied;
+            let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+
+            // Make a selection, then open the quit confirm (idle Ctrl+C).
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    27,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    31,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            assert!(app.selection.is_some(), "precondition");
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert!(app.quit_confirm, "precondition: popup open");
+
+            // Press under the popup: no new selection, nothing cleared.
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    34,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+            assert!(
+                matches!(app.selection, Some(ChatSelection { dragging: true, .. })),
+                "press under the popup must not start a selection nor clear"
+            );
+
+            // Release under the popup: finalized nowhere, nothing copied.
+            handle_mouse_with_copy(
+                &mut app,
+                button(
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    36,
+                    2,
+                ),
+                WHEEL_AREA,
+                &copy,
+            );
+        }
+        assert!(
+            copied.borrow().is_empty(),
+            "release under the popup must not copy"
+        );
+        assert!(
+            app.selection.is_some(),
+            "the held selection stays parked underneath the popup"
+        );
+
+        // The wheel still scrolls the chat behind the popup (documented
+        // routing choice, mirroring the error popup).
+        let scroll_before = app.scroll;
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp, 60, 10),
+            WHEEL_AREA,
+        );
+        assert_eq!(
+            app.scroll,
+            scroll_before + WHEEL_STEP,
+            "the wheel keeps its routing under the popup"
+        );
+        assert!(app.quit_confirm, "the wheel must not disturb the popup");
     }
 }

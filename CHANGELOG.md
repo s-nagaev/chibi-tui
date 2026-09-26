@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.0] - 2026-09-26
+
+### Added
+
+- `y` copies the chat text selection to the clipboard; the selection stays active.
+- Quit confirmation before every manual exit: `y`/`Enter` quit, `n`/`Esc`/`q` stay; `Ctrl+C` with an in-flight request still cancels it.
+
+### Changed
+
+- The sidebar and the chat pane are outlined with full rounded borders; titles, status strip, focus, and mouse hit-testing unchanged.
+- The quit-confirmation popup is restyled as a compact rounded banner.
+- Upgraded `ratatui` to 0.30 and `crossterm` to 0.29 (closes the transitive `lru` advisory); replaced `tui-textarea` with an in-house readline editor.
+
+### Fixed
+
+- Copies reach the system clipboard on terminals that ignore OSC 52 (`arboard` fallback).
+- Newlines render in multi-line chat bubbles.
+- Multi-line paste no longer submits the prompt once per line (pinned with wire tests).
+
 ## [0.2.0] - 2026-09-22
 
 ### Added

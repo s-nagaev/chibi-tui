@@ -538,7 +538,45 @@ mod tests {
         }
     }
 
-    /// The out-of-band continuation frame parses leniently: only
+    /// A multi-line prompt travels the JSONL wire with its newlines intact:
+    /// serialized as escaped `\\n` inside the one physical frame line (a raw
+    /// newline would break the line framing the backend reads stdin with)
+    /// and parsed back verbatim. Pins the prompt-corruption class of bugs:
+    /// a draft shown as two lines must never reach the backend glued into
+    /// one word-merged line.
+    #[test]
+    fn request_prompt_newlines_serialize_escaped_and_round_trip() {
+        let msg = ClientMessage::Request {
+            request_id: "req-multi-line".into(),
+            thread_id: 7,
+            prompt: "line one\nline two".into(),
+            workspace_root: "/tmp".into(),
+            active_file: None,
+            selection: None,
+            cursor_position: None,
+            language_id: None,
+        };
+        let line = serde_json::to_string(&msg).expect("request serializes");
+        assert!(
+            !line.contains('\n'),
+            "the wire frame must stay ONE physical line: {line}"
+        );
+        assert!(
+            line.contains("line one\\nline two"),
+            "the newline must travel as an escaped sequence, never dropped: {line}"
+        );
+        match serde_json::from_str::<ClientMessage>(&line).expect("frame parses") {
+            ClientMessage::Request { prompt, .. } => {
+                assert_eq!(
+                    prompt, "line one\nline two",
+                    "the backend parses back the same multi-line prompt"
+                );
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+    }
+
+    /// The out-of-band continuation frame parses leniently: only    /// The out-of-band continuation frame parses leniently: only
     /// `thread_id` and `content` are required, optional fields default to
     /// `None`, and serialization round-trips with `message` as the type tag.
     #[test]

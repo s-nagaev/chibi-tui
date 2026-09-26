@@ -5,7 +5,8 @@
 //! nod to the original Chibi mascot. Pure Unicode/ASCII only — no Nerd Font
 //! glyphs, so it renders identically in any monospace terminal.
 //!
-//! Any keypress skips the splash; Esc/Ctrl+C exit the app.
+//! Any keypress skips the splash; Esc/Ctrl+C open the shared quit
+//! confirmation before the app exits.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -133,7 +134,10 @@ fn content_lines(theme: &Theme) -> Vec<Line<'static>> {
 }
 
 /// Draw one splash frame: theme background everywhere + centered content.
-pub fn draw(f: &mut Frame, theme: &Theme) {
+/// `quit_confirm` overlays the shared "Quit chibi-tui?" popup (the same
+/// renderer the in-app confirm uses, the same shared grammar — see
+/// [`crate::app::quit_decision`]).
+pub fn draw(f: &mut Frame, theme: &Theme, quit_confirm: bool) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::new().bg(theme.bg)), area);
 
@@ -149,37 +153,66 @@ pub fn draw(f: &mut Frame, theme: &Theme) {
         height: h.min(area.height),
     };
     f.render_widget(Paragraph::new(lines), rect);
+
+    if quit_confirm {
+        crate::ui::render_quit_confirm(f, theme);
+    }
 }
 
 /// Run the splash loop.
 ///
 /// Returns `Ok(true)` when the main UI should start (timeout or skip key),
-/// `Ok(false)` when the user aborted (Esc/Ctrl+C).
+/// `Ok(false)` when the user aborted (Esc/Ctrl+C, confirmed via the shared
+/// quit-confirmation popup: `y`/Enter quits, `n`/Esc/`q` returns to the
+/// splash). While the confirmation is open the hold deadline is suspended —
+/// a confirm opened in the last moments of the splash must never silently
+/// become a "skip into the app".
 pub async fn run(terminal: &mut Tui, reader: &mut EventStream, theme: &Theme) -> io::Result<bool> {
     let deadline = Instant::now() + MIN_HOLD;
+    let mut quit_confirm = false;
     loop {
-        terminal.draw(|f| draw(f, theme))?;
+        terminal.draw(|f| draw(f, theme, quit_confirm))?;
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if remaining.is_zero() && !quit_confirm {
             return Ok(true);
         }
 
+        // While the confirmation is open the timeout is parked: only the
+        // decision keys move the state, the hold can't expire underneath.
+        let hold = if quit_confirm {
+            tokio::time::sleep(Duration::from_secs(3600))
+        } else {
+            tokio::time::sleep(remaining)
+        };
         tokio::select! {
             maybe_event = reader.next() => match maybe_event {
                 Some(Ok(CtEvent::Key(key))) if key.kind == KeyEventKind::Press => {
-                    let ctrl_c = key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                    if key.code == KeyCode::Esc || ctrl_c {
-                        return Ok(false);
+                    if quit_confirm {
+                        match crate::app::quit_decision(key) {
+                            crate::app::QuitDecision::Confirm => return Ok(false),
+                            crate::app::QuitDecision::Dismiss => quit_confirm = false,
+                            crate::app::QuitDecision::Swallow => {}
+                        }
+                    } else {
+                        let ctrl_c = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if key.code == KeyCode::Esc || ctrl_c {
+                            quit_confirm = true; // ask before aborting
+                        } else {
+                            return Ok(true); // any other key skips the splash
+                        }
                     }
-                    return Ok(true); // any other key skips the splash
                 }
                 Some(Ok(_)) => {} // mouse/resize etc: redraw on next iteration
                 Some(Err(e)) => return Err(io::Error::other(e)),
                 None => return Ok(true), // stream ended; fall through to UI
             },
-            _ = tokio::time::sleep(remaining) => return Ok(true),
+            _ = hold => {
+                // Only reachable without the confirm (it parks the timer);
+                // the hold expired — start the main UI.
+                return Ok(true);
+            }
         }
     }
 }
@@ -231,5 +264,24 @@ mod tests {
         let theme = Theme::tokyo_night();
         let lines = content_lines(&theme);
         assert_eq!(lines.len(), 20 + 5, "logo + spacers + name/tagline/hint");
+    }
+
+    /// The quit-confirm overlay renders over the splash without panicking
+    /// and carries the shared popup text (same renderer as the in-app
+    /// confirm, per the shared-grammar contract).
+    #[test]
+    fn quit_confirm_overlay_renders_over_the_splash() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let theme = Theme::tokyo_night();
+        // Tall enough that the splash hint sits BELOW the centered popup.
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|f| draw(f, &theme, true)).unwrap();
+        let buf = terminal.backend().buffer();
+        let flat: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            flat.contains("Quit chibi-tui?"),
+            "the confirm popup must overlay the splash"
+        );
+        assert!(flat.contains("press any key"), "splash stays underneath");
     }
 }

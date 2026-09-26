@@ -15,6 +15,7 @@ pub mod backend_client;
 pub mod clipboard;
 pub mod diag;
 pub mod history;
+pub mod input;
 pub mod live;
 pub mod markdown;
 pub mod mock;
