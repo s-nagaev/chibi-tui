@@ -750,6 +750,12 @@ async fn dispatch_frame(
         ServerMessage::CwdUpdate { thread_id, cwd } => {
             let _ = cwd_tx.send(CwdUpdateUpdate { thread_id, cwd });
         }
+        // Streaming text delta: request-scoped, NON-terminal, pure
+        // frontend-state update — like `agent_event`/`cwd_update` it must
+        // never touch a pending entry or resolve a request's lifecycle.
+        // The terminal `result` stays authoritative; deltas fan out to the
+        // UI elsewhere.
+        ServerMessage::Delta { .. } => {}
         ServerMessage::Result {
             request_id,
             content,
