@@ -96,27 +96,42 @@ pub struct Capabilities {
 
 /// Feature flags the client advertises during the handshake. The backend
 /// gates each capability on an explicit `true`; absent fields mean "off".
+///
+/// Every flag parses leniently (`default`) and re-serializes only when
+/// enabled (`skip_serializing_if`): canonical handshake frames carry just
+/// the flags the editor opted into, and the frozen-bytes round-trip keeps
+/// exactly that shape. The TUI always sends the full set as `true`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientCapabilities {
+    #[serde(default, skip_serializing_if = "is_false")]
     pub thoughts: bool,
     /// Opts in to mid-turn `agent_event` frames (subagent progress).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub subagents: bool,
     /// Opts in to out-of-band `message` frames: continuation answers the
     /// backend produces after a background tool result arrives (the parent
     /// request's lifecycle is already over, so there is no request id).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub background_messages: bool,
     /// Opts in to `cwd_update` frames: the backend reports the effective
     /// working directory of the agent state per thread (including runtime
     /// changes made by the `set_working_dir` tool). Old backends ignore the
     /// unknown flag, so the field is safe to always send.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub cwd_updates: bool,
     /// Opts in to `delta` frames: the backend streams partial LLM text while
     /// a request is still running (the terminal `result` frame stays
     /// authoritative and overwrites the accumulated deltas). `default` keeps
     /// initialize frames that never carried the flag parsing; old backends
     /// ignore the unknown flag, so the field is safe to always send.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,
+}
+
+/// `skip_serializing_if` predicate: a capability flag that stays "off" is
+/// omitted from the wire frame instead of being spelled out as `false`.
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// Kind of a mid-turn `agent_event` frame: a subagent spawn began or ended
@@ -888,6 +903,31 @@ mod tests {
             }
             other => panic!("expected Initialize, got {other:?}"),
         }
+    }
+
+    /// Canonical handshake frames carry only the flags the client opted
+    /// into: absent flags parse as `false` AND are omitted again on
+    /// re-serialization, so a partial capability object round-trips to the
+    /// exact same bytes (the canonical fixtures' contract).
+    #[test]
+    fn partial_capability_object_round_trips_without_inventing_flags() {
+        let frame =
+            r#"{"type":"initialize","protocol_version":1,"capabilities":{"streaming":true}}"#;
+        let msg: ClientMessage = serde_json::from_str(frame).expect("partial caps parse");
+        match &msg {
+            ClientMessage::Initialize { capabilities, .. } => {
+                let caps = capabilities.expect("capabilities present");
+                assert!(caps.streaming, "declared flag parses true");
+                assert!(!caps.thoughts && !caps.subagents, "absent flags mean off");
+                assert!(
+                    !caps.background_messages && !caps.cwd_updates,
+                    "absent flags mean off"
+                );
+            }
+            other => panic!("expected Initialize, got {other:?}"),
+        }
+        let back = serde_json::to_string(&msg).expect("re-serializes");
+        assert_eq!(back, frame, "disabled flags must not appear on the wire");
     }
 
     /// The `cwd_update` frame parses exactly (thread-scoped, non-terminal)

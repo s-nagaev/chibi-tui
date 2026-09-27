@@ -45,6 +45,13 @@ declared in the handshake):
 ``--with-unknown-frame`` one unknown-type frame is emitted mid-turn (drives
                          the client's diag-warning path while the request
                          still completes)
+``--with-deltas``        several ``delta`` frames are emitted for the running
+                         request before its ``result`` (streaming partial
+                         text) when the handshake declared
+                         ``capabilities.streaming``; one LATE delta is
+                         additionally emitted AFTER the result (racing the
+                         authoritative text) so clients can prove the
+                         late-delta drop rule
 """
 
 from __future__ import annotations
@@ -75,6 +82,15 @@ THOUGHTS_TRACE = "\n".join(
 
 # Usage payload riding on --with-usage result frames (deterministic values
 # chosen so the TUI's ctx segment maths is checkable in render assertions).
+# Streaming contract (--with-deltas): chunks streamed while the request is
+# still running, plus one late chunk emitted AFTER the result frame — the
+# client must drop it (the result text stays authoritative).
+DELTA_CHUNKS = (
+    "Streaming chunk one. ",
+    "Streaming chunk two. ",
+    "Streaming chunk three. ",
+)
+LATE_DELTA_TEXT = " LATE-DELTA-AFTER-RESULT"
 # Out-of-band continuation answer (--with-background-message): the text the
 # model produces AFTER a background tool result came back, delivered on a
 # request-less message frame.
@@ -210,6 +226,13 @@ def main() -> int:
         "message frame (continuation answer) when the client opted in "
         "via capabilities.background_messages",
     )
+    parser.add_argument(
+        "--with-deltas",
+        action="store_true",
+        help="emit several delta frames before the result frame (and one "
+        "late delta after it) when the client opted in via "
+        "capabilities.streaming",
+    )
     args = parser.parse_args()
     if args.usage_windowless:
         args.with_usage = True
@@ -227,6 +250,7 @@ def main() -> int:
     caps_thoughts = False
     caps_subagents = False
     caps_background_messages = False
+    caps_streaming = False
     # thread id of the latest request, used by the --with-background-message
     # continuation timer (the frame carries no request id, only the thread)
     last_request_thread = None
@@ -315,7 +339,8 @@ def main() -> int:
         emit(frame)
 
     def handle_initialize(obj) -> None:
-        nonlocal initialized, caps_thoughts, caps_subagents, caps_background_messages
+        nonlocal initialized, caps_thoughts, caps_subagents
+        nonlocal caps_background_messages, caps_streaming
         version = obj.get("protocol_version")
         if version != 1:
             emit(
@@ -336,11 +361,41 @@ def main() -> int:
         caps_thoughts = caps.get("thoughts") is True
         caps_subagents = caps.get("subagents") is True
         caps_background_messages = caps.get("background_messages") is True
+        caps_streaming = caps.get("streaming") is True
 
         emit(ready_frame())
         if args.garbage_on_start:
             print("this is not json", flush=True)
         initialized = True
+
+    def emit_late_delta(request_id: str) -> None:
+        """Emit one delta frame AFTER the result frame.
+
+        A no-op unless the result actually went out (a cancelled request
+        produces neither result nor late delta). Clients must drop it: the
+        result text stays authoritative.
+
+        Args:
+            request_id: The request whose stream already ended.
+        """
+        if request_id not in results_emitted:
+            return
+        if not caps_streaming:
+            return
+        emit(
+            {
+                "type": "delta",
+                "request_id": request_id,
+                "thread_id": last_request_thread,
+                "text": LATE_DELTA_TEXT,
+            }
+        )
+
+    def schedule_late_delta(request_id: str) -> None:
+        timer = threading.Timer(0.45, emit_late_delta, args=(request_id,))
+        timer.daemon = True
+        finish_timers.append(timer)
+        timer.start()
 
     def handle_request(obj) -> None:
         nonlocal last_request_thread
@@ -485,7 +540,22 @@ def main() -> int:
                 emit(frame)
                 time.sleep(0.05)
         last_request_thread = obj["thread_id"]
+        if args.with_deltas and caps_streaming:
+            # Streaming partial text while the turn is still running; the
+            # terminal result stays authoritative and overwrites the chunks.
+            for text in DELTA_CHUNKS:
+                emit(
+                    {
+                        "type": "delta",
+                        "request_id": request_id,
+                        "thread_id": obj["thread_id"],
+                        "text": text,
+                    }
+                )
+                time.sleep(0.05)
         schedule_result(request_id)
+        if args.with_deltas and caps_streaming:
+            schedule_late_delta(request_id)
         if args.with_background_message and caps_background_messages:
             timer = threading.Timer(0.40, emit_background_message)
             timer.daemon = True

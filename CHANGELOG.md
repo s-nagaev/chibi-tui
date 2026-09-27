@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Live response streaming: the TUI opts in to `capabilities.streaming` and renders `delta` frames as plain text on the request's pending bubble while the turn runs; the terminal `result` frame stays authoritative and overwrites the partial, late deltas after it are dropped, a mid-stream error keeps the partial text, and delta frames never trigger persistence or resolve the request lifecycle. Canonical IDE-protocol fixture set re-synced from the backend (adds `valid_streaming_session_*` and `valid_subagent_events_*`).
+
 ## [0.3.1] - 2026-09-26
 
 ### Changed

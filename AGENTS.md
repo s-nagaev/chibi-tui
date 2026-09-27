@@ -108,10 +108,21 @@ summary drifts.
   renders only for the ACTIVE chat, sums across that chat's requests,
   hides at 0, and switches with the thread (session state, never
   persisted).
-- **Capabilities.** The TUI advertises `{"thoughts": true, "subagents": true}`
-  at the handshake; the protocol version stays `1`. Unknown fields inside
-  known frames are ignored; unknown frame kinds are tolerated and traced
-  to the diag log.
+- **Capabilities.** The TUI advertises `{"thoughts": true, "subagents": true,
+  "background_messages": true, "cwd_updates": true, "streaming": true}` at
+  the handshake; the protocol version stays `1`. Absent flags mean "off"
+  and disabled flags are never serialized (partial capability objects
+  round-trip byte-exact). Unknown fields inside known frames are ignored;
+  unknown frame kinds are tolerated and traced to the diag log.
+- **Streaming deltas are NON-terminal and in-memory only.** A `delta` frame
+  appends to the request's live pending placeholder (plain-text render,
+  session-only `Chat::streaming` flag — never persisted); it never resolves
+  the lifecycle, never touches queued markers, and never triggers a
+  snapshot write. The terminal `result` stays authoritative and overwrites
+  the accumulated partial; a delta racing past the result is dropped (the
+  pump retires with the terminal event AND the app's accept rule is the
+  second line of defense); a mid-stream error keeps the partial text in
+  the bubble with the error appended below it.
 - **Thoughts are per-chat, session-only view state.** The dim reasoning
   block lives on the chat that produced it (`Chat::last_thoughts`): a
   VISIBLE result of the owning chat carrying thoughts is the only writer,
@@ -163,8 +174,13 @@ summary drifts.
 
 Client → server: `initialize` (client info + capabilities), `request`,
 `cancel`, `shutdown`. Server → client: `ready`, `status`, `agent_event`,
-`result` (optional `model` / `provider` / `usage` / `thoughts`), `error`
-(`request_id: null` = global; the pipeline drops those). Wire `request_id`s
+`delta` (streaming partial text, opt-in via `capabilities.streaming`),
+`result` (optional `model` / `provider` / `usage` / `thoughts`),
+`message` (out-of-band background continuation, routed by `thread_id`),
+`cwd_update` (effective working directory, routed by `thread_id`), `error`
+(`request_id: null` = global; the pipeline drops those). `delta`, `status`,
+`agent_event`, `message`, and `cwd_update` are non-terminal — only
+`result` / `error` resolve a request's lifecycle. Wire `request_id`s
 are client-chosen UUID strings (`Submitted`); `BackendEvent` variants carry
 numeric stand-ins (`u64`, derived from the UUID hash in `live.rs`); the
 wire `thread_id` is a deterministic i64 hash of the chat's stable UUID.
