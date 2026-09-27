@@ -525,12 +525,13 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         .messages
         .iter()
         .rposition(|m| m.role == Role::Assistant);
-    // The actively-streaming row (plan D6): while delta frames are being
-    // accepted, the live pending placeholder renders its partial text as
-    // PLAIN text — a full markdown parse per chunk would cost far more
-    // than the render budget at the stream cadence. The terminal result
-    // re-renders the full markdown (intentional re-format at completion).
-    // Queued placeholders stay invisible (empty line) as always.
+    // The actively-streaming row (incremental stream render): completed
+    // top-level blocks paint as real markdown through the prefix cache
+    // (stable anchor → cache hits between delta frames); only the
+    // in-progress tail stays plain text, styled with the theme foreground.
+    // The terminal result re-renders the full markdown (intentional
+    // re-format at completion). Queued placeholders stay invisible (empty
+    // line) as always.
     let streaming_row = if chat.streaming {
         chat.messages
             .iter()
@@ -567,15 +568,15 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
             }
         }
         if Some(msg_index) == streaming_row {
-            // Plain-text render of the partial stream: no markdown pass,
-            // every source line paints as-is on its own row.
-            if msg.markdown.is_empty() {
-                lines.push(Line::from(String::new()));
-            } else {
-                for text_line in msg.markdown.lines() {
-                    lines.push(Line::from(text_line.to_owned()));
-                }
-            }
+            // Incremental stream render: completed blocks as markdown
+            // (prefix cache), in-progress tail as plain text. A free
+            // function takes `&mut stream_prefix_cache` because `render_chat`
+            // holds `&app.chats` across the loop — a disjoint field borrow.
+            lines.extend(markdown::streaming_lines(
+                &msg.markdown,
+                theme,
+                &mut app.stream_prefix_cache,
+            ));
         } else if msg.pending {
             lines.push(Line::from(Span::styled(String::new(), Style::new())));
         } else {

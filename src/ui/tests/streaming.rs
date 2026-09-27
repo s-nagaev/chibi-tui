@@ -2,7 +2,7 @@ use super::super::*;
 use super::support::*;
 use crate::model::ChatLifecycle;
 
-// ---- streaming render (plan D6) ------------------------------------------
+// ---- streaming render (incremental stream render) -------------------------
 
 /// A chat mid-stream: user prompt + live pending row carrying partial text,
 /// plus a queued marker for a prompt waiting in the FIFO.
@@ -20,9 +20,11 @@ fn streaming_app(partial: &str) -> App {
     app
 }
 
-/// THE D6 contract: the actively-streaming row paints its partial text
-/// as PLAIN text — raw markdown syntax must stay visible (no markdown
-/// parse per delta frame), while the queued placeholder stays invisible.
+/// Streaming render contract: the actively-streaming row renders its
+/// COMPLETED top-level blocks as markdown through the prefix cache; this
+/// fixture is ONE unfinished paragraph (no completed block), so it takes
+/// the all-plain tail fallback and its raw markdown syntax stays visible.
+/// Queued placeholders stay invisible.
 #[test]
 fn streaming_row_renders_plain_text_and_queued_marker_stays_hidden() {
     let mut app = streaming_app("**partial** and `code`");

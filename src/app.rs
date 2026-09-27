@@ -930,6 +930,13 @@ pub struct App {
     /// never persisted, zero serde surface. The streaming pending row
     /// renders plain text and bypasses the cache entirely.
     pub md_cache: MarkdownCache<fn(&str, &Theme) -> Vec<MdLine>>,
+    /// Content-keyed cache of the STREAMING prefix render: the completed
+    /// top-level block prefix (`md[..stable anchor]`) of the
+    /// actively-streaming pending row, rendered once per block completion
+    /// and served as cheap clones on every delta frame in between. Same
+    /// session-only App state as `md_cache` — never persisted, zero serde
+    /// surface.
+    pub stream_prefix_cache: MarkdownCache<fn(&str, &Theme) -> Vec<MdLine>>,
 }
 
 /// a clone request in flight. The `chat` waits here until the backend
@@ -1079,6 +1086,7 @@ impl App {
             selection: None,
             chat_geometry: None,
             md_cache: MarkdownCache::new(markdown::render),
+            stream_prefix_cache: MarkdownCache::new(markdown::render),
         }
     }
 

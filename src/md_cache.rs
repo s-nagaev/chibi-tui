@@ -21,10 +21,11 @@
 //! mutated without interior mutability — and keeping it out of the message
 //! types leaves the serde snapshot surface completely untouched.
 //!
-//! Streaming interplay: the actively-streaming pending row renders its
-//! partial text as plain text (plan D6, no markdown pass per chunk), so it
-//! never consults this cache. On the terminal frame the finalized row
-//! renders once and is cached from then on.
+//! Streaming interplay: the actively-streaming pending row consults a
+//! sibling cache (`App::stream_prefix_cache`, same mechanics) ONLY for its
+//! completed-block prefix (`md[..stable anchor]`); the in-progress tail
+//! renders as plain text. The finalized row renders once on the terminal
+//! frame and is cached from then on.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -35,6 +36,11 @@ use crate::theme::Theme;
 /// Cache key: content hash of the markdown source plus the theme it was
 /// rendered with. A pure content key needs no invalidation machinery.
 pub type CacheKey = (u64, Theme);
+
+/// Maximum number of cached renders before the whole map is dropped. Both
+/// caches are plain HashMaps (no ordering), so there is no LRU and no
+/// "clear oldest": a full clear at the cap is the only sound bound.
+const CACHE_CAP: usize = 512;
 
 /// Content-keyed cache of markdown render results with an injectable
 /// renderer. Production passes [`crate::markdown::render`]; tests count
@@ -61,6 +67,13 @@ impl<F: Fn(&str, &Theme) -> Vec<MdLine>> MarkdownCache<F> {
         let key = (content_hash(md), *theme);
         if let Some(cached) = self.entries.get(&key).cloned() {
             return cached;
+        }
+        // Growth bound (plan D2): the streaming prefix cache sees a new key
+        // per completed block, so the map must not grow unbounded. Plain
+        // full clear at the cap — no LRU, no "clear oldest" (HashMaps have
+        // no usable ordering).
+        if self.entries.len() > CACHE_CAP {
+            self.entries.clear();
         }
         let lines = (self.renderer)(md, theme);
         self.entries.insert(key, lines.clone());
@@ -160,6 +173,22 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    /// Growth bound (plan D2): past [`CACHE_CAP`] the whole map clears —
+    /// plain HashMaps have no ordering, so there is no LRU to build.
+    #[test]
+    fn cache_clears_at_the_cap_instead_of_growing_unbounded() {
+        let mut cache = MarkdownCache::new(|md: &str, _theme: &Theme| marker_lines(md, ":r1"));
+        let theme = Theme::tokyo_night();
+        for i in 0..(CACHE_CAP as u32 + 5) {
+            let _ = cache.render(&format!("md {i}"), &theme);
+        }
+        assert!(
+            cache.len() <= CACHE_CAP,
+            "cache must clear at the cap, len={}",
+            cache.len()
+        );
+    }
+
     #[test]
     fn populated_cache_stays_outside_the_snapshot_surface() {
         // App-level storage (plan D1): the cache is session state on App,
@@ -185,6 +214,14 @@ mod tests {
         let rendered = app.md_cache.render(md, &theme);
         assert!(!rendered.is_empty());
         assert!(!app.md_cache.is_empty(), "the render populated the cache");
+
+        // Same contract for the streaming prefix cache (plan D2): it is
+        // session state on App, never part of the persisted format.
+        let streamed = app
+            .stream_prefix_cache
+            .render("# Head\n\nin progress tail", &theme);
+        assert!(!streamed.is_empty());
+        assert!(!app.stream_prefix_cache.is_empty());
 
         let path = save_chat_in(Some(&root), &app.chats[0]).expect("save");
         let raw = std::fs::read_to_string(&path).expect("read snapshot");

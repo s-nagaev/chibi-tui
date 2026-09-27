@@ -17,6 +17,185 @@ use crate::theme::{self, Theme};
 /// One rendered markdown line.
 pub type MdLine = Line<'static>;
 
+/// Kind of the last COMPLETED top-level block at the streaming anchor
+/// ([`stable_prefix`]). Drives the anchor→tail separator decision in
+/// [`streaming_lines`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    Paragraph,
+    Heading,
+    CodeBlock,
+    Table,
+    List,
+    BlockQuote,
+    /// Horizontal rule — a standalone event with no Start/End pair.
+    Rule,
+}
+
+/// The markdown prefix up to (and including) the last COMPLETED top-level
+/// block of a partially streamed document.
+///
+/// `md[..len]` renders (through the markdown pipeline) to a sequence of
+/// lines that is stable while the tail after `len` keeps growing — the
+/// anchor only advances when another top-level block completes. A fence
+/// opened but not yet closed is never part of the anchor: the parse of an
+/// open fence yields its `End` only at EOF, which is not promoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StablePrefix {
+    /// Byte length of the completed prefix.
+    pub len: usize,
+    /// Kind of the block that ends at `len`.
+    pub last_block: BlockKind,
+}
+
+/// Find the last completed top-level block of a partial markdown document.
+///
+/// Walks `Parser::into_offset_iter` tracking Start/End tag depth and
+/// commits the anchor ONLY on an `End` event whose close returns the depth
+/// to 0 (top-level Paragraph/Heading/CodeBlock/Table/List/BlockQuote) or on
+/// a standalone top-level `Rule`. Nested `End` events (e.g. a code fence
+/// inside a list item) are ignored — otherwise the anchor would cut
+/// mid-list and `md[..len]` would not render as a stable prefix.
+///
+/// A top-level `End` is committed only once a FOLLOW-UP event arrives:
+/// pulldown-cmark synthesizes `End` events for the trailing open block at
+/// EOF, and that block is still in progress while streaming. Returns
+/// `None` until at least one block completes (empty input, a single
+/// paragraph, one open list/quote/fence → `None`).
+pub fn stable_prefix(md: &str) -> Option<StablePrefix> {
+    let parser = Parser::new_ext(md, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
+
+    let mut depth: usize = 0;
+    // Candidate from the most recent depth-0 End / Rule, promoted to the
+    // anchor by the next event (proving the block was followed by content).
+    let mut pending: Option<(usize, BlockKind)> = None;
+    let mut anchor: Option<StablePrefix> = None;
+
+    for (event, range) in parser.into_offset_iter() {
+        if let Some((len, kind)) = pending.take() {
+            anchor = Some(StablePrefix {
+                len,
+                last_block: kind,
+            });
+        }
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(tag_end) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(kind) = block_kind_of(tag_end) {
+                        pending = Some((range.end, kind));
+                    }
+                }
+            }
+            // A horizontal rule is a standalone event: it IS the completed
+            // block, no Start/End pair around it.
+            Event::Rule => pending = Some((range.end, BlockKind::Rule)),
+            _ => {}
+        }
+    }
+    // `pending` never promoted → the trailing block is still open at EOF.
+    anchor
+}
+
+/// Map a closed tag to its top-level block kind (None for inline /
+/// untracked structures — those still participate in depth bookkeeping).
+fn block_kind_of(end: TagEnd) -> Option<BlockKind> {
+    match end {
+        TagEnd::Paragraph => Some(BlockKind::Paragraph),
+        TagEnd::Heading(_) => Some(BlockKind::Heading),
+        TagEnd::CodeBlock => Some(BlockKind::CodeBlock),
+        TagEnd::Table => Some(BlockKind::Table),
+        TagEnd::List(_) => Some(BlockKind::List),
+        TagEnd::BlockQuote(_) => Some(BlockKind::BlockQuote),
+        _ => None,
+    }
+}
+
+/// Render one line whose spans are all empty (no visible content).
+fn is_blank_line(line: &MdLine) -> bool {
+    line.spans.iter().all(|s| s.content.is_empty())
+}
+
+/// Streaming render of a partial markdown document (plan: incremental
+/// stream render, options B+C).
+///
+/// The COMPLETED top-level blocks (the [`stable_prefix`] anchor) render as
+/// real markdown through `prefix_cache` — stable between block
+/// completions, so consecutive delta frames hit the cache. The in-progress
+/// tail renders as plain text styled with the theme foreground (option C:
+/// `Span::raw` used to paint the terminal-default "gray").
+///
+/// Separator rules at the anchor→tail join (see plan D2 for the rationale
+/// — `render()` pushes separator blanks from block terminators and one
+/// unconditional terminal line):
+/// - paragraph anchor → content line kept, one blank inserted before the
+///   tail;
+/// - code/heading/table anchor → the terminator already pushed one blank,
+///   drop the remaining trailing empty so the join stays within one line
+///   of the full render (known cosmetic exception: those adjacencies show
+///   one blank streamed vs two in a full render, self-correcting when the
+///   next block completes);
+/// - list/quote/rule anchor → no extra separator.
+///
+/// Fallback (no completed block yet — empty input, single paragraph, one
+/// open list/quote/fence): the WHOLE document renders as plain text styled
+/// with the theme foreground.
+pub fn streaming_lines<F: Fn(&str, &Theme) -> Vec<MdLine>>(
+    md: &str,
+    theme: &Theme,
+    prefix_cache: &mut crate::md_cache::MarkdownCache<F>,
+) -> Vec<MdLine> {
+    let tail_style = Style::new().fg(theme.fg);
+    let mut out: Vec<MdLine> = Vec::new();
+
+    let tail = match stable_prefix(md) {
+        Some(sp) => {
+            let mut prefix = prefix_cache.render(&md[..sp.len], theme);
+            // `render()` appends exactly one unconditional terminal line
+            // when its span buffer is empty at EOF — drop it before the join.
+            if prefix.last().is_some_and(is_blank_line) {
+                prefix.pop();
+            }
+            match sp.last_block {
+                // The paragraph content line is the prefix's last line; the
+                // blank separator between two paragraphs is inserted here.
+                BlockKind::Paragraph => {}
+                // Terminators of these blocks push one separator blank;
+                // drop the REMAINING trailing empty (artifact already gone)
+                // so the join stays within one line of the full render.
+                BlockKind::CodeBlock | BlockKind::Heading | BlockKind::Table => {
+                    if prefix.last().is_some_and(is_blank_line) {
+                        prefix.pop();
+                    }
+                }
+                // End-flush of a top-level list already pushed the
+                // separator blank; quotes and rules push none.
+                BlockKind::List | BlockKind::BlockQuote | BlockKind::Rule => {}
+            }
+            out.extend(prefix);
+            if sp.last_block == BlockKind::Paragraph {
+                out.push(MdLine::default());
+            }
+            &md[sp.len..]
+        }
+        // No completed block: everything stays a plain-text tail.
+        None => md,
+    };
+
+    // The in-progress tail paints raw, one source line per row, styled
+    // with the theme foreground instead of the terminal default. Leading
+    // newlines are separator blanks already handled above.
+    for text_line in tail.trim_start_matches('\n').lines() {
+        out.push(MdLine::from(Span::styled(text_line.to_owned(), tail_style)));
+    }
+    if out.is_empty() {
+        // Preserve the empty-row contract for an empty pending message.
+        out.push(MdLine::default());
+    }
+    out
+}
+
 /// Renders a markdown string into styled lines.
 pub fn render(md: &str, theme: &Theme) -> Vec<MdLine> {
     let parser = Parser::new_ext(md, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
@@ -859,5 +1038,230 @@ mod diag3 {
             let plain: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("[{i}] {plain}");
         }
+    }
+}
+
+/// Streaming render (incremental stream render, options B+C): the
+/// completed top-level block prefix renders as markdown through the prefix
+/// cache, the in-progress tail stays plain text styled with the theme
+/// foreground.
+#[cfg(test)]
+mod streaming_render {
+    use super::*;
+    use crate::md_cache::MarkdownCache;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn theme() -> Theme {
+        Theme::tokyo_night()
+    }
+
+    fn plain(lines: &[MdLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn streamed(md: &str) -> Vec<String> {
+        let mut cache = MarkdownCache::new(render);
+        plain(&streaming_lines(md, &theme(), &mut cache))
+    }
+
+    fn full(md: &str) -> Vec<String> {
+        plain(&render(md, &theme()))
+    }
+
+    /// The known cosmetic exception: X→{code,heading,table} adjacency has
+    /// TWO blanks between the blocks in a full render (terminator push +
+    /// start-flush) but ONE in the streamed join. The renders must
+    /// otherwise be identical: the whole difference is one dropped blank.
+    fn assert_within_one_line(streamed: &[String], full: &[String], md: &str) {
+        if streamed == full {
+            return;
+        }
+        let diff = streamed
+            .iter()
+            .zip(full.iter())
+            .position(|(s, f)| s != f)
+            .unwrap_or(streamed.len().min(full.len()));
+        assert!(
+            full.get(diff) == Some(&String::new()),
+            "expected exactly one dropped blank at the join for {md:?}:\nstreamed {streamed:?}\nfull     {full:?}"
+        );
+        assert_eq!(
+            &streamed[diff..],
+            &full[diff + 1..],
+            "one blank line must explain the whole difference for {md:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_requires_a_completed_top_level_block() {
+        assert_eq!(stable_prefix(""), None, "empty input anchors nothing");
+        assert_eq!(
+            stable_prefix("single paragraph"),
+            None,
+            "the trailing (EOF-synthesized) paragraph is not completed"
+        );
+        assert_eq!(
+            stable_prefix("- one\n- two"),
+            None,
+            "an open list at EOF does not anchor"
+        );
+        assert_eq!(
+            stable_prefix("> quoted"),
+            None,
+            "an open quote at EOF does not anchor"
+        );
+        assert_eq!(
+            stable_prefix("```rust\nlet x = 1;"),
+            None,
+            "an open fence at EOF does not anchor"
+        );
+
+        let md = "alpha para\n\nbeta para";
+        let sp = stable_prefix(md).expect("first paragraph completes once the second starts");
+        assert_eq!(sp.last_block, BlockKind::Paragraph);
+        assert!(md[..sp.len].contains("alpha"));
+        assert!(
+            !md[..sp.len].contains("beta"),
+            "anchor must not cover the in-progress block"
+        );
+    }
+
+    #[test]
+    fn paragraph_anchor_join_matches_full_render_exactly() {
+        let md = "alpha para\n\nbeta para";
+        assert_eq!(streamed(md), full(md));
+    }
+
+    /// Exact-prefix stability for X→{paragraph, list, quote} and the
+    /// Rule anchor: the streamed join equals the full render line for line.
+    #[test]
+    fn list_quote_and_rule_anchor_joins_match_full_render_exactly() {
+        for md in [
+            "alpha para\n\n- one\n- two\n\ntail text",
+            "alpha para\n\n> quoted line\n\ntail text",
+            "alpha para\n\n---\n\ntail text",
+        ] {
+            assert_eq!(streamed(md), full(md), "exact join expected for {md:?}");
+        }
+    }
+
+    /// ±1-line tolerance for X→{code,heading,table} adjacency: the full
+    /// render carries two blanks between the blocks, the streamed join one.
+    #[test]
+    fn code_heading_table_anchor_joins_stay_within_one_line() {
+        for md in [
+            "alpha para\n\n```rust\nlet x = 1;\n```\n\ntail text",
+            "alpha para\n\n## Section head\n\ntail text",
+            "alpha para\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\ntail text",
+        ] {
+            assert_within_one_line(&streamed(md), &full(md), md);
+        }
+    }
+
+    /// A fence opened but never closed must never enter the anchor — the
+    /// whole fence stays raw in the plain tail.
+    #[test]
+    fn anchor_never_cuts_inside_an_open_fence() {
+        let md = "alpha para\n\n```rust\nlet x = 1;\nlet y = 2";
+        let sp = stable_prefix(md).expect("the paragraph before the fence completed");
+        assert_eq!(sp.last_block, BlockKind::Paragraph);
+        assert!(
+            !md[..sp.len].contains("```"),
+            "anchor must stop before the open fence"
+        );
+
+        let lines = streamed(md);
+        assert!(
+            lines.iter().any(|l| l.contains("```rust")),
+            "open fence marker stays raw in the tail"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("let y = 2")),
+            "fence body stays raw in the tail"
+        );
+    }
+
+    /// Depth-0 filtering: a code fence NESTED in a list item is a nested
+    /// End event — the anchor must not cut mid-list when it closes.
+    #[test]
+    fn nested_code_fence_inside_a_list_does_not_cut_mid_list() {
+        let md = "- item one\n\n  ```rust\n  let x = 1;\n  ```\n- item two\n\ntail text";
+        let sp = stable_prefix(md).expect("the list completes once the tail paragraph starts");
+        assert_eq!(sp.last_block, BlockKind::List, "anchor is the whole list");
+        assert!(
+            md[..sp.len].contains("item two"),
+            "anchor must cover the WHOLE list, not cut at the inner fence"
+        );
+        assert!(!md[..sp.len].contains("tail text"));
+    }
+
+    #[test]
+    fn all_tail_fallback_for_empty_input_and_open_list() {
+        assert_eq!(
+            streamed(""),
+            vec![String::new()],
+            "an empty pending message keeps its one blank row"
+        );
+        assert_eq!(
+            streamed("- one\n- two"),
+            vec!["- one".to_string(), "- two".to_string()],
+            "a doc with no completed block paints entirely raw"
+        );
+    }
+
+    /// Option C: the in-progress tail (and the all-tail fallback) paint
+    /// with the theme foreground — not `Span::raw`'s terminal default,
+    /// which surfaced as the "gray" streaming text.
+    #[test]
+    fn tail_and_fallback_paint_theme_foreground_not_terminal_default() {
+        let theme = theme();
+        let mut cache = MarkdownCache::new(render);
+        for md in ["alpha para\n\nin progress **tail**", "solo paragraph"] {
+            let lines = streaming_lines(md, &theme, &mut cache);
+            let last = lines.last().expect("tail row present");
+            assert!(
+                last.spans.iter().all(|s| s.style.fg == Some(theme.fg)),
+                "tail spans must carry theme.fg, got {:?}",
+                last.spans
+            );
+        }
+    }
+
+    /// The anchor is stable between block completions: consecutive deltas
+    /// inside the same trailing block hit the prefix cache; completing the
+    /// block advances the anchor and renders exactly once more.
+    #[test]
+    fn prefix_cache_hits_between_deltas_within_one_block() {
+        let calls = Rc::new(Cell::new(0usize));
+        let counter = Rc::clone(&calls);
+        let mut cache = MarkdownCache::new(move |md: &str, theme: &Theme| {
+            counter.set(counter.get() + 1);
+            render(md, theme)
+        });
+        let t = theme();
+
+        let _ = streaming_lines("alpha para\n\nbeta is growing", &t, &mut cache);
+        let _ = streaming_lines("alpha para\n\nbeta is growing longer", &t, &mut cache);
+        assert_eq!(
+            calls.get(),
+            1,
+            "stable anchor: the second delta is a cache hit"
+        );
+
+        let _ = streaming_lines("alpha para\n\nbeta done\n\ngamma", &t, &mut cache);
+        assert_eq!(
+            calls.get(),
+            2,
+            "anchor advanced to the second block: exactly one new render"
+        );
     }
 }
