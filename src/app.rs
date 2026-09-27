@@ -927,8 +927,10 @@ pub struct App {
     /// once per `(content, theme)` pair instead of being re-parsed and
     /// re-highlighted on every frame. Session-only App state (the renderer
     /// borrows `chats` immutably, so a per-chat cache could not mutate) —
-    /// never persisted, zero serde surface. The streaming pending row
-    /// renders plain text and bypasses the cache entirely.
+    /// never persisted, zero serde surface. The streaming pending row does
+    /// NOT go through `md_cache`: its completed top-level prefix renders via
+    /// `stream_prefix_cache` below, and the in-progress tail paints as plain
+    /// text.
     pub md_cache: MarkdownCache<fn(&str, &Theme) -> Vec<MdLine>>,
     /// Content-keyed cache of the STREAMING prefix render: the completed
     /// top-level block prefix (`md[..stable anchor]`) of the

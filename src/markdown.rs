@@ -54,14 +54,25 @@ pub struct StablePrefix {
 /// commits the anchor ONLY on an `End` event whose close returns the depth
 /// to 0 (top-level Paragraph/Heading/CodeBlock/Table/List/BlockQuote) or on
 /// a standalone top-level `Rule`. Nested `End` events (e.g. a code fence
-/// inside a list item) are ignored — otherwise the anchor would cut
-/// mid-list and `md[..len]` would not render as a stable prefix.
+/// inside a list item) AND nested `Rule` events (a `---` inside an open
+/// list or blockquote) are ignored — otherwise the anchor would cut
+/// mid-container and `md[..len]` would not render as a stable prefix (and
+/// for an open container the cut is permanent: the container's `End` never
+/// arrives while it is still open).
 ///
 /// A top-level `End` is committed only once a FOLLOW-UP event arrives:
 /// pulldown-cmark synthesizes `End` events for the trailing open block at
 /// EOF, and that block is still in progress while streaming. Returns
 /// `None` until at least one block completes (empty input, a single
 /// paragraph, one open list/quote/fence → `None`).
+///
+/// KNOWN LIMITATION (defer-by-one): a block that completes as the LAST
+/// block of the text seen so far is not anchored until the next event
+/// arrives — there is nothing to prove it was followed by more content.
+/// A completed trailing block therefore renders plain text for that one
+/// frame (and `None` is returned when the document so far is exactly one
+/// completed block). This self-corrects on the next delta, and the final
+/// frame after the stream ends renders through the full `render()` path.
 pub fn stable_prefix(md: &str) -> Option<StablePrefix> {
     let parser = Parser::new_ext(md, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
 
@@ -88,9 +99,13 @@ pub fn stable_prefix(md: &str) -> Option<StablePrefix> {
                     }
                 }
             }
-            // A horizontal rule is a standalone event: it IS the completed
-            // block, no Start/End pair around it.
-            Event::Rule => pending = Some((range.end, BlockKind::Rule)),
+            // A horizontal rule is a standalone event: at depth 0 it IS the
+            // completed block, no Start/End pair around it. NESTED rules
+            // (a `---` inside an open list or blockquote) are ignored like
+            // nested `End`s — otherwise the anchor would cut mid-container
+            // and stay cut (the container's `End` never arrives while it
+            // is still open at EOF).
+            Event::Rule if depth == 0 => pending = Some((range.end, BlockKind::Rule)),
             _ => {}
         }
     }
@@ -1202,6 +1217,78 @@ mod streaming_render {
             "anchor must cover the WHOLE list, not cut at the inner fence"
         );
         assert!(!md[..sp.len].contains("tail text"));
+    }
+
+    /// Regression (review r1, Issue 1): a `---` NESTED inside an OPEN
+    /// top-level blockquote is a nested Rule — it must never become the
+    /// anchor, or the prefix cuts mid-quote permanently (the quote's `End`
+    /// never arrives while it is still open at EOF). The anchor stays at
+    /// the last completed top-level block (the paragraph).
+    #[test]
+    fn nested_rule_inside_open_blockquote_does_not_cut_mid_quote() {
+        let md = "alpha para\n\n> quoted\n>\n> ---\n>\n> more quote";
+        let sp = stable_prefix(md).expect("the paragraph before the quote completed");
+        assert_eq!(
+            sp.last_block,
+            BlockKind::Paragraph,
+            "anchor is the last completed top-level block, not the nested rule"
+        );
+        assert!(
+            !md[..sp.len].contains("---"),
+            "anchor must stop before the nested rule"
+        );
+
+        // The streamed render keeps the quote tail raw and intact — no
+        // mid-container cut, gutter lines preserved as source lines.
+        let lines = streamed(md);
+        assert_eq!(
+            lines,
+            vec![
+                "alpha para".to_string(),
+                String::new(),
+                "> quoted".to_string(),
+                ">".to_string(),
+                "> ---".to_string(),
+                ">".to_string(),
+                "> more quote".to_string(),
+            ],
+            "open-quote doc must stream all-tail, not cut at the nested rule"
+        );
+
+        // Once the quote CLOSES in the source, the whole quote becomes the
+        // anchor (the nested Rule must not leave stale pending behind).
+        let closed = "alpha para\n\n> quoted\n>\n> ---\n>\n> more\n\ntail";
+        let sp2 = stable_prefix(closed).expect("the quote completed once the tail started");
+        assert_eq!(sp2.last_block, BlockKind::BlockQuote);
+        assert!(
+            closed[..sp2.len].contains("---"),
+            "anchor must cover the WHOLE closed quote incl. its nested rule"
+        );
+        assert!(!closed[..sp2.len].contains("tail"));
+    }
+
+    /// Regression (review r1, Issue 1): a `---` NESTED inside an OPEN
+    /// top-level list must never anchor — with a top-level-only `Rule` arm
+    /// the prefix cut mid-list (`last_block=Rule`). No top-level block has
+    /// completed here, so the doc streams all-tail.
+    #[test]
+    fn nested_rule_inside_open_list_does_not_cut_mid_list() {
+        let md = "- item one\n\n  ---\n- item two";
+        assert_eq!(
+            stable_prefix(md),
+            None,
+            "nested rule must not anchor; the open list has no completed block"
+        );
+        assert_eq!(
+            streamed(md),
+            vec![
+                "- item one".to_string(),
+                String::new(),
+                "  ---".to_string(),
+                "- item two".to_string(),
+            ],
+            "open-list doc must stream all-tail, not cut at the nested rule"
+        );
     }
 
     #[test]
