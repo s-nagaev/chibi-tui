@@ -52,6 +52,10 @@ declared in the handshake):
                          additionally emitted AFTER the result (racing the
                          authoritative text) so clients can prove the
                          late-delta drop rule
+``--with-md-deltas``     like ``--with-deltas`` but the chunks compose a
+                         MARKDOWN document: a complete fenced code block
+                         early, then an open fence as the in-progress tail
+                         (drives the incremental md stream renderer)
 """
 
 from __future__ import annotations
@@ -91,6 +95,20 @@ DELTA_CHUNKS = (
     "Streaming chunk three. ",
 )
 LATE_DELTA_TEXT = " LATE-DELTA-AFTER-RESULT"
+# Markdown streaming contract (--with-md-deltas): the chunks compose a
+# document with a COMPLETE fenced code block early and an OPEN fence as the
+# in-progress tail — the incremental stream renderer must paint the
+# completed block as a markdown panel while the tail stays plain text.
+# NOTE: chunk 1 appends the start of a follow-up paragraph because the
+# anchor is deferred by one event (a completed TRAILING block is promoted
+# only when a next event proves it was followed by content).
+MD_DELTA_CHUNKS = (
+    # A COMPLETE fenced code block + the start of the next paragraph.
+    "```rust\nlet answer = 42;\n```\n\nNext paragraph",
+    # The paragraph grows and an OPEN fence begins the trailing block.
+    " growing\n\n```python\n",
+    "def greet():\n    return \"hi\"\n",
+)
 # Out-of-band continuation answer (--with-background-message): the text the
 # model produces AFTER a background tool result came back, delivered on a
 # request-less message frame.
@@ -232,6 +250,13 @@ def main() -> int:
         help="emit several delta frames before the result frame (and one "
         "late delta after it) when the client opted in via "
         "capabilities.streaming",
+    )
+    parser.add_argument(
+        "--with-md-deltas",
+        action="store_true",
+        help="like --with-deltas but the chunks carry MARKDOWN: a complete "
+        "fenced code block early, then an OPEN fence as the in-progress "
+        "tail (exercises incremental md rendering of completed blocks)",
     )
     args = parser.parse_args()
     if args.usage_windowless:
@@ -540,10 +565,11 @@ def main() -> int:
                 emit(frame)
                 time.sleep(0.05)
         last_request_thread = obj["thread_id"]
-        if args.with_deltas and caps_streaming:
+        if (args.with_deltas or args.with_md_deltas) and caps_streaming:
             # Streaming partial text while the turn is still running; the
             # terminal result stays authoritative and overwrites the chunks.
-            for text in DELTA_CHUNKS:
+            chunks = MD_DELTA_CHUNKS if args.with_md_deltas else DELTA_CHUNKS
+            for text in chunks:
                 emit(
                     {
                         "type": "delta",

@@ -1040,7 +1040,177 @@ fn fake_backend_gates_delta_frames_on_streaming_capability() {
     );
 }
 
-// /stop and /reset through the real glue ----// /stop and /reset through the real glue ----
+/// Incremental markdown stream rendering through the real glue path
+/// (`--with-md-deltas`): the fake backend streams a COMPLETE fenced code
+/// block early and grows an OPEN fence as the in-progress tail. Intermediate
+/// frames must render the completed block as a real markdown panel
+/// (bordered, language-labeled) while the open-fence tail stays plain text
+/// styled with the theme foreground — and after the terminal result the
+/// final render must be IDENTICAL to a non-streamed render of the same
+/// content (golden compare through the same `ui::draw` path).
+#[tokio::test]
+async fn streaming_md_deltas_render_completed_block_then_reconcile_to_golden() {
+    let live = connect(&["--with-md-deltas", "--result-delay", "1"]).await;
+    let theme = Theme::tokyo_night();
+    let mut app = app_with_one_chat();
+    let submitted = submitted_for(&app, "stream markdown");
+    app.begin_request(&submitted);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    live.submit_encoded(submitted.clone(), tx);
+
+    let mut chunks_seen = 0usize;
+    let mut result_event: Option<BackendEvent> = None;
+    let mut golden_markdown = String::new();
+    loop {
+        let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+            .await
+            .expect("event in time")
+            .expect("channel alive");
+        match evt.clone() {
+            BackendEvent::Delta { .. } => {
+                app.apply_backend_event(evt);
+                chunks_seen += 1;
+                assert!(app.chats[0].streaming, "deltas arm the streaming flag");
+                let (rows, buf) = render_grid_with_buffer(&mut app);
+                let flat = rows.join("\n");
+                // Code panels inside the transcript start `╭─`; the sidebar
+                // and pane borders use `╭ Chats` / `╭ #` and must not count.
+                let panel_count = flat.matches("\u{256d}\u{2500} ").count();
+                match chunks_seen {
+                    1 => {
+                        // Chunk 1 is a COMPLETE rust fence: it must render
+                        // as one bordered, language-labeled panel.
+                        assert!(
+                            flat.contains("\u{256d}\u{2500} rust"),
+                            "the completed code block must render as a panel:\n{flat}"
+                        );
+                        assert!(
+                            flat.contains("let answer = 42"),
+                            "the completed block's body must be visible:\n{flat}"
+                        );
+                        assert_eq!(
+                            panel_count, 1,
+                            "exactly one panel for the one completed block:\n{flat}"
+                        );
+                        // The panel border carries the code-border styling.
+                        let row = rows
+                            .iter()
+                            .position(|r| r.contains("\u{256d}\u{2500} rust"))
+                            .expect("panel top border row");
+                        let col = rows[row].find('\u{256d}').unwrap();
+                        // `find` is a byte offset; buffer cells count chars.
+                        let col = rows[row][..col].chars().count() as u16;
+                        assert_eq!(
+                            buf[(col, row as u16)].fg,
+                            theme.code_border,
+                            "the completed block must be styled as markdown, not plain"
+                        );
+                        // The follow-up paragraph that promoted the anchor
+                        // (defer-by-one) streams as a plain-theme tail.
+                        assert!(
+                            flat.contains("Next paragraph"),
+                            "the in-progress tail text must be visible:\n{flat}"
+                        );
+                        let tail_row = rows
+                            .iter()
+                            .position(|r| r.contains("Next paragraph"))
+                            .expect("plain tail row");
+                        let tail_col = rows[tail_row].find("Next paragraph").unwrap();
+                        let tail_col = rows[tail_row][..tail_col].chars().count() as u16;
+                        assert_eq!(
+                            buf[(tail_col, tail_row as u16)].fg,
+                            theme.fg,
+                            "the in-progress tail must be plain theme-fg text"
+                        );
+                    }
+                    _ => {
+                        // Chunks 2-3 grow an OPEN python fence: the tail
+                        // must stay plain text — no second panel, no python
+                        // label — and paint with the theme foreground.
+                        assert!(
+                            flat.contains("```python"),
+                            "the open-fence tail text must be visible:\n{flat}"
+                        );
+                        if chunks_seen >= 3 {
+                            assert!(
+                                flat.contains("def greet()"),
+                                "the growing tail must stay visible:\n{flat}"
+                            );
+                        }
+                        assert_eq!(
+                            panel_count, 1,
+                            "the OPEN fence must NOT render as a second panel:\n{flat}"
+                        );
+                        assert!(
+                            !flat.contains("\u{256d}\u{2500} python"),
+                            "the open fence must not gain a language label:\n{flat}"
+                        );
+                        let row = rows
+                            .iter()
+                            .position(|r| r.contains("```python"))
+                            .expect("plain tail row");
+                        let col = rows[row].find("```python").unwrap();
+                        let col = rows[row][..col].chars().count() as u16;
+                        assert_eq!(
+                            buf[(col, row as u16)].fg,
+                            theme.fg,
+                            "the in-progress tail must be plain theme-fg text"
+                        );
+                    }
+                }
+            }
+            BackendEvent::Result { markdown, .. } => {
+                app.apply_backend_event(evt.clone());
+                golden_markdown = markdown;
+                result_event = Some(evt);
+            }
+            BackendEvent::QueueDrain { .. } => {
+                app.apply_backend_event(evt);
+                break;
+            }
+            other => app.apply_backend_event(other),
+        }
+    }
+
+    assert_eq!(chunks_seen, 3, "three pre-result md chunks on the wire");
+    assert!(
+        result_event.is_some(),
+        "the terminal result preceded the drain"
+    );
+    assert!(matches!(app.chats[0].lifecycle, ChatLifecycle::Idle));
+
+    // The late scripted delta must still be dropped: nothing follows the
+    // drain on the channel.
+    let late = tokio::time::timeout(Duration::from_millis(1200), rx.recv()).await;
+    assert!(
+        late.is_err(),
+        "a delta after the result must never surface: {late:?}"
+    );
+
+    // ---- golden compare: streamed final render == non-streamed render ----
+    let streamed_rows = render_grid(&mut app);
+    let _ = live.shutdown().await;
+
+    // Fold the SAME result frame into a fresh app (same Submitted → same
+    // tracked request id, same chat id → the frame routes to the same
+    // thread) with NO deltas at all: the plain, non-streamed reference
+    // render of the identical content.
+    let mut fresh = app_with_one_chat();
+    fresh.chats[0].id = app.chats[0].id.clone();
+    fresh.begin_request(&submitted);
+    fresh.apply_backend_event(result_event.expect("terminal Result present"));
+    let fresh_rows = render_grid(&mut fresh);
+
+    assert_eq!(
+        streamed_rows,
+        fresh_rows,
+        "the streamed final render must be identical to the non-streamed \
+         render of the same content ({} bytes)",
+        golden_markdown.len()
+    );
+}
+
+// /stop and /reset through the real glue ----
 
 use chibi_tui::app::{Mode, StopResetAction};
 
