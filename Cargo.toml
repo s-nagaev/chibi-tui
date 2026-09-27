@@ -19,11 +19,16 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 syntect = { version = "5", default-features = false, features = [
     "parsing",
     "regex-fancy",
-    "default-syntaxes",
     "default-themes",
     "dump-load",
     "plist-load",
 ] }
+# Extended syntax definitions (~130 extra grammars on top of the syntect
+# defaults: TypeScript/TSX, Swift, Kotlin, Zig, Elixir, TOML, Dockerfile, …).
+# `default-features = false` is mandatory: the default `syntect-onig` feature
+# would pull the oniguruma C build and mix regex engines with our
+# `regex-fancy` syntect setup.
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "0.2"
 
 serde = { version = "1", features = ["derive"] }

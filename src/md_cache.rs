@@ -79,7 +79,8 @@ impl<F: Fn(&str, &Theme) -> Vec<MdLine>> MarkdownCache<F> {
 }
 
 /// Stable-per-process content hash (SipHash via `DefaultHasher`; a hash
-/// collision would only cost one redundant re-render, never a wrong result).
+/// collision would serve the other entry's cached content — a wrong result —
+/// but the probability is ~2⁻⁶⁴ and therefore negligible).
 fn content_hash(md: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     md.hash(&mut hasher);
