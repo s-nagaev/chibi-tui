@@ -137,11 +137,11 @@ impl Highlighter {
                 "sh" | "shell" | "console" => self.syntaxes.find_syntax_by_token("bash"),
                 "js" => self.syntaxes.find_syntax_by_token("javascript"),
                 "ts" => self.syntaxes.find_syntax_by_token("typescript"),
-                // The grammar names ("C#", "Objective-C++") don't match
-                // these fence tokens, so resolve them by their file
-                // extension instead.
+                // The grammar names ("C#", "Objective-C") don't match
+                // these fence tokens, so resolve them via their canonical
+                // token names instead.
                 "csharp" => self.syntaxes.find_syntax_by_token("cs"),
-                "objc" => self.syntaxes.find_syntax_by_extension("mm"),
+                "objc" => self.syntaxes.find_syntax_by_token("objective-c"),
                 "rs" => self.syntaxes.find_syntax_by_token("rust"),
                 _ => None,
             })
@@ -185,6 +185,10 @@ mod tests {
                 "token `{token}` must resolve to a real grammar"
             );
         }
+        // `objc` must hit the pure Objective-C grammar, not Objective-C++
+        // (its `mm` extension belongs to Objective-C++; `objective-c` is
+        // the correct canonical token).
+        assert_eq!(hl.syntax_for("objc").name, "Objective-C");
     }
 
     /// The long-standing defaults must keep resolving after the loader
