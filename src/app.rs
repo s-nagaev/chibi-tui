@@ -2776,6 +2776,11 @@ impl App {
                 request_id,
                 thread_id,
                 ..
+            }
+            | BackendEvent::Delta {
+                request_id,
+                thread_id,
+                ..
             } => {
                 thread_id == &pending.thread_id
                     && event_matches_request(*request_id, &pending.request_id)
@@ -2937,6 +2942,11 @@ impl App {
                 thread_id,
             }
             | BackendEvent::AgentProgress {
+                request_id,
+                thread_id,
+                ..
+            }
+            | BackendEvent::Delta {
                 request_id,
                 thread_id,
                 ..
@@ -3110,6 +3120,7 @@ impl App {
             BackendEvent::Queued { thread_id, .. } => Some(thread_id.clone()),
             BackendEvent::Running { thread_id, .. } => Some(thread_id.clone()),
             BackendEvent::AgentProgress { thread_id, .. } => Some(thread_id.clone()),
+            BackendEvent::Delta { thread_id, .. } => Some(thread_id.clone()),
             BackendEvent::Result { thread_id, .. } => Some(thread_id.clone()),
             BackendEvent::Error { thread_id, .. } => thread_id.clone(),
             // Internal pump signal: handled by the event loop, never here.
@@ -3309,6 +3320,12 @@ impl App {
             BackendEvent::AgentProgress { .. }
             | BackendEvent::QueueDrain { .. }
             | BackendEvent::Disconnected => {}
+            // Live text chunk for the tracked running request: it must
+            // never resolve the lifecycle or touch sticky state. The
+            // in-flight placeholder append (with the D4 accept rule — drop
+            // deltas for unknown/queued/resolved requests) is applied by
+            // the streaming UI layer; until then the chunk is absorbed.
+            BackendEvent::Delta { .. } => {}
             // Unreachable: handled by the early returns above.
             BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => {}
         }

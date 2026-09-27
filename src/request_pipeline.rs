@@ -122,6 +122,19 @@ pub struct CwdUpdateUpdate {
     pub cwd: String,
 }
 
+/// Live streaming text chunk delivered out-of-band from a `delta` frame
+/// (opt-in via `capabilities.streaming` at handshake). Request-scoped like
+/// [`AgentEventUpdate`]: it correlates to the request that is still
+/// running, yet is NON-terminal — it must never resolve or consume a
+/// request's final-outcome receiver. `text` is the incremental chunk, not
+/// the body accumulated so far; consumers append.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaUpdate {
+    pub request_id: String,
+    pub thread_id: i64,
+    pub text: String,
+}
+
 /// A fully-formed protocol request ready for
 /// [`RequestPipeline::send_request`].
 ///
@@ -294,6 +307,7 @@ pub struct RequestPipeline {
     agent_tx: broadcast::Sender<AgentEventUpdate>,
     background_tx: broadcast::Sender<BackgroundMessageUpdate>,
     cwd_tx: broadcast::Sender<CwdUpdateUpdate>,
+    delta_tx: broadcast::Sender<DeltaUpdate>,
     /// Slash commands the backend advertised in the handshake `ready` frame
     ///. Captured once at connect; a reconnect
     /// spawns the same program, so the set stays valid for the handle's life.
@@ -345,6 +359,7 @@ impl RequestPipeline {
         let (agent_tx, _) = broadcast::channel(status_channel_capacity.max(1));
         let (background_tx, _) = broadcast::channel(status_channel_capacity.max(1));
         let (cwd_tx, _) = broadcast::channel(status_channel_capacity.max(1));
+        let (delta_tx, _) = broadcast::channel(status_channel_capacity.max(1));
 
         tokio::spawn(actor_loop(
             parts,
@@ -353,6 +368,7 @@ impl RequestPipeline {
             agent_tx.clone(),
             background_tx.clone(),
             cwd_tx.clone(),
+            delta_tx.clone(),
             ActorConfig {
                 workspace_root: workspace_root.display().to_string(),
                 script_path,
@@ -365,6 +381,7 @@ impl RequestPipeline {
             agent_tx,
             background_tx,
             cwd_tx,
+            delta_tx,
             commands,
         })
     }
@@ -449,6 +466,15 @@ impl RequestPipeline {
         self.cwd_tx.subscribe()
     }
 
+    /// Subscribe to live streaming text chunks (`delta` frames, emitted
+    /// only for clients that declared `capabilities.streaming`).
+    /// Request-scoped like [`RequestPipeline::subscribe_agent_events`]:
+    /// same broadcast semantics, and these updates are structurally unable
+    /// to consume a request's final-outcome receiver.
+    pub fn subscribe_deltas(&self) -> broadcast::Receiver<DeltaUpdate> {
+        self.delta_tx.subscribe()
+    }
+
     /// Respawn the backend after a broken pipe / premature exit and restore
     /// handshake state. Pending requests were already failed with
     /// [`BackendError::Broken`] at breakage time.
@@ -483,6 +509,7 @@ fn actor_gone() -> BackendError {
 // Actor
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn actor_loop(
     initial_parts: PartsTuple,
     mut cmd_rx: mpsc::Receiver<Command>,
@@ -490,6 +517,7 @@ async fn actor_loop(
     agent_tx: broadcast::Sender<AgentEventUpdate>,
     background_tx: broadcast::Sender<BackgroundMessageUpdate>,
     cwd_tx: broadcast::Sender<CwdUpdateUpdate>,
+    delta_tx: broadcast::Sender<DeltaUpdate>,
     config: ActorConfig,
 ) {
     let mut state = ActorState {
@@ -533,8 +561,16 @@ async fn actor_loop(
             }
             event = event_rx.recv() => match event {
                 Some(ActorEvent::Frame(msg)) => {
-                    dispatch_frame(&mut state, &status_tx, &agent_tx, &background_tx, &cwd_tx, msg)
-                        .await;
+                    dispatch_frame(
+                        &mut state,
+                        &status_tx,
+                        &agent_tx,
+                        &background_tx,
+                        &cwd_tx,
+                        &delta_tx,
+                        msg,
+                    )
+                    .await;
                 }
                 Some(ActorEvent::Died(reason)) => {
                     // pipe death is a diagnostic lifecycle event too:
@@ -695,6 +731,7 @@ async fn dispatch_frame(
     agent_tx: &broadcast::Sender<AgentEventUpdate>,
     background_tx: &broadcast::Sender<BackgroundMessageUpdate>,
     cwd_tx: &broadcast::Sender<CwdUpdateUpdate>,
+    delta_tx: &broadcast::Sender<DeltaUpdate>,
     msg: ServerMessage,
 ) {
     match msg {
@@ -754,8 +791,18 @@ async fn dispatch_frame(
         // frontend-state update — like `agent_event`/`cwd_update` it must
         // never touch a pending entry or resolve a request's lifecycle.
         // The terminal `result` stays authoritative; deltas fan out to the
-        // UI elsewhere.
-        ServerMessage::Delta { .. } => {}
+        // UI through the delta channel.
+        ServerMessage::Delta {
+            request_id,
+            thread_id,
+            text,
+        } => {
+            let _ = delta_tx.send(DeltaUpdate {
+                request_id,
+                thread_id,
+                text,
+            });
+        }
         ServerMessage::Result {
             request_id,
             content,
@@ -973,6 +1020,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = broadcast::channel(4);
         let (background_tx, _background_rx) = broadcast::channel(4);
         let (cwd_tx, _cwd_rx) = broadcast::channel(4);
+        let (delta_tx, _delta_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
             stdin: None,
@@ -992,6 +1040,7 @@ mod tests {
             &agent_tx,
             &background_tx,
             &cwd_tx,
+            &delta_tx,
             frame,
         )
         .await;
@@ -1027,6 +1076,7 @@ mod tests {
         let (agent_tx, _agent_rx) = broadcast::channel(4);
         let (background_tx, mut background_rx) = broadcast::channel(4);
         let (cwd_tx, _cwd_rx) = broadcast::channel(4);
+        let (delta_tx, _delta_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
             stdin: None,
@@ -1046,6 +1096,7 @@ mod tests {
             &agent_tx,
             &background_tx,
             &cwd_tx,
+            &delta_tx,
             frame,
         )
         .await;
@@ -1082,6 +1133,7 @@ mod tests {
         let (agent_tx, _agent_rx) = broadcast::channel(4);
         let (background_tx, _background_rx) = broadcast::channel(4);
         let (cwd_tx, mut cwd_rx) = broadcast::channel(4);
+        let (delta_tx, _delta_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
             stdin: None,
@@ -1101,6 +1153,7 @@ mod tests {
             &agent_tx,
             &background_tx,
             &cwd_tx,
+            &delta_tx,
             frame,
         )
         .await;
@@ -1119,6 +1172,59 @@ mod tests {
             CwdUpdateUpdate {
                 thread_id: 42,
                 cwd: "/Users/dev/chibi".to_owned(),
+            }
+        );
+    }
+
+    /// Non-terminal lifecycle: a `delta` frame fans out to the delta
+    /// channel and must NEVER resolve the request's pending final-outcome
+    /// receiver — the terminal `result` stays authoritative.
+    #[tokio::test]
+    async fn delta_dispatch_never_resolves_pending() {
+        let (status_tx, _status_rx) = broadcast::channel(4);
+        let (agent_tx, _agent_rx) = broadcast::channel(4);
+        let (background_tx, _background_rx) = broadcast::channel(4);
+        let (cwd_tx, _cwd_rx) = broadcast::channel(4);
+        let (delta_tx, mut delta_rx) = broadcast::channel(4);
+        let (result_tx, mut result_rx) = oneshot::channel();
+        let mut state = ActorState {
+            stdin: None,
+            reaper: None,
+            pending: HashMap::new(),
+            broken_reason: None,
+        };
+        state.pending.insert("r1".to_owned(), result_tx);
+
+        let frame: ServerMessage = serde_json::from_str(
+            r#"{"type":"delta","request_id":"r1","thread_id":42,"text":"hel"}"#,
+        )
+        .expect("delta frame parses");
+        dispatch_frame(
+            &mut state,
+            &status_tx,
+            &agent_tx,
+            &background_tx,
+            &cwd_tx,
+            &delta_tx,
+            frame,
+        )
+        .await;
+
+        assert!(
+            state.pending.contains_key("r1"),
+            "mid-turn frame must not consume the pending entry"
+        );
+        assert!(
+            result_rx.try_recv().is_err(),
+            "final-outcome receiver must stay unresolved"
+        );
+        let update = delta_rx.try_recv().expect("delta fanned out");
+        assert_eq!(
+            update,
+            DeltaUpdate {
+                request_id: "r1".to_owned(),
+                thread_id: 42,
+                text: "hel".to_owned(),
             }
         );
     }

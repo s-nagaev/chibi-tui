@@ -678,11 +678,17 @@ async fn run_loop(
                         persist_chat(chat, history_dir);
                     }
                 } else {
+                    // Deltas are in-memory only: persisting on every chunk
+                    // would run a full-transcript serialize + blocking
+                    // fs::write on the UI loop at the stream cadence.
+                    let persist = should_persist_after(&evt);
                     app.apply_backend_event(evt);
                     // Persist the chat the event belongs to (routed by
                     // thread id when present; otherwise the active one).
-                    if let Some(chat) = app.chats.get(app.active) {
-                        persist_chat(chat, history_dir);
+                    if persist {
+                        if let Some(chat) = app.chats.get(app.active) {
+                            persist_chat(chat, history_dir);
+                        }
                     }
                 }
             }
@@ -766,6 +772,15 @@ fn persist_chat(chat: &chibi_tui::app::Chat, dir_override: Option<&std::path::Pa
     if let Err(e) = history::save_chat_in(dir_override, chat) {
         eprintln!("chibi-tui: could not save chat history: {e}");
     }
+}
+
+/// Does this backend event deserve a snapshot write? Streaming deltas are
+/// in-memory only: `persist_chat` is a full-transcript serialize plus a
+/// blocking `fs::write` on the UI loop, and a delta flood would repeat that
+/// at the stream cadence. Terminal `Result` / `Error` (and every other
+/// event kind) persist as before, so the authoritative text always lands.
+fn should_persist_after(evt: &BackendEvent) -> bool {
+    !matches!(evt, BackendEvent::Delta { .. })
 }
 
 /// Build the live-mode startup app: persisted history (or one fresh chat on
