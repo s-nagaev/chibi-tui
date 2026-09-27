@@ -516,6 +516,15 @@ pub struct Chat {
     /// polluting another request's counters; the entry disappears when its
     /// frame reports `active == 0`. Session state only — never persisted.
     pub subagent_counts: HashMap<u64, (u64, u64)>,
+    /// True while THIS thread's live pending row is accepting streaming
+    /// delta frames and must render as PLAIN text (no markdown pass per
+    /// chunk — the terminal result re-renders the full markdown). Session
+    /// state only — never persisted (`subagent_counts` precedent): a new
+    /// serialized `Message` field would break every existing snapshot.
+    /// Set when a delta frame is accepted, cleared at every terminal
+    /// resolution (result / error / cancel / reset), so the authoritative
+    /// full-text render always returns on the terminal frame.
+    pub streaming: bool,
 }
 
 impl Chat {
@@ -533,6 +542,7 @@ impl Chat {
             last_model: None,
             last_thoughts: None,
             subagent_counts: HashMap::new(),
+            streaming: false,
         }
     }
 
@@ -2803,6 +2813,7 @@ impl App {
                         chat.queue.clear();
                         chat.last_thoughts = None;
                         chat.subagent_counts.clear();
+                        chat.streaming = false;
                         chat.lifecycle = ChatLifecycle::Idle;
                     }
                     if self.active_thread_id() == Some(pending.thread_id.as_str()) {
@@ -3028,6 +3039,7 @@ impl App {
     pub fn resolve_cancel_locally(&mut self) {
         if let Some(chat) = self.chats.get_mut(self.active) {
             resolve_live_placeholder(chat, "_Cancelled._".to_owned(), None);
+            chat.streaming = false;
             chat.lifecycle = ChatLifecycle::Idle;
         }
     }
@@ -3238,6 +3250,10 @@ impl App {
                                 .map(str::to_owned);
                             let thread_id = self.chats[chat_index].id.clone();
                             let chat = &mut self.chats[chat_index];
+                            // The terminal result carries the authoritative
+                            // full text: plain-text streaming render ends
+                            // here, the row re-renders full markdown (D6).
+                            chat.streaming = false;
                             if is_invisible_result(&markdown) {
                                 // an empty or pure-ACK answer is
                                 // a protocol-level acknowledgement, not a user-facing
@@ -3296,7 +3312,11 @@ impl App {
                     }
 
                     let chat = &mut self.chats[chat_index];
-                    resolve_live_placeholder(chat, format!("**Error:** {message}"), None);
+                    // D5: a mid-stream failure must NOT discard the
+                    // partial text the user already watched arrive — it
+                    // stays in the bubble with the error appended.
+                    resolve_live_placeholder_with_error(chat, &message);
+                    chat.streaming = false;
                     // an inline failure is also a
                     // reply the user has not seen in a background thread.
                     self.mark_unread_if_background(chat_index);
@@ -3321,11 +3341,35 @@ impl App {
             | BackendEvent::QueueDrain { .. }
             | BackendEvent::Disconnected => {}
             // Live text chunk for the tracked running request: it must
-            // never resolve the lifecycle or touch sticky state. The
-            // in-flight placeholder append (with the D4 accept rule — drop
-            // deltas for unknown/queued/resolved requests) is applied by
-            // the streaming UI layer; until then the chunk is absorbed.
-            BackendEvent::Delta { .. } => {}
+            // never resolve the lifecycle or touch sticky state. D4 accept
+            // rule: apply ONLY when the tracked lifecycle request id
+            // matches AND a live (pending, non-queued) row exists. Deltas
+            // for unknown, queued, or already-resolved requests are
+            // dropped — the delta pump and the terminal oneshot race on the
+            // shared mpsc, and a late delta appended after Result would
+            // corrupt the final row and never self-heal. The chunk is
+            // appended to the placeholder's markdown IN MEMORY only (the
+            // terminal result frame carries the authoritative full text and
+            // overwrites whatever the deltas accumulated).
+            BackendEvent::Delta {
+                request_id, text, ..
+            } => {
+                if event_matches_request(request_id, &tracked_request_id) {
+                    let chat = &mut self.chats[chat_index];
+                    if let Some(row) = chat
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.pending && !is_queued_marker(m))
+                    {
+                        row.markdown.push_str(&text);
+                        // The live row now holds partial streamed text:
+                        // the renderer paints it as plain text until the
+                        // terminal frame re-renders full markdown (D6).
+                        chat.streaming = true;
+                    }
+                }
+            }
             // Unreachable: handled by the early returns above.
             BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => {}
         }
@@ -3626,7 +3670,7 @@ fn enqueue_prompt(chat: &mut Chat, prompt: String) {
 
 /// Marker predicate for the visible "⏳ queued (#n)" placeholder rows.
 fn is_queued_marker(message: &Message) -> bool {
-    message.pending && message.markdown.starts_with("\u{23f3} queued")
+    message.is_queued_marker()
 }
 
 /// Collect case-insensitive substring matches of `query` over the RENDERED
@@ -3715,6 +3759,28 @@ fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<Str
         row.pending = false;
         row.markdown = markdown;
         row.model = model;
+    }
+}
+
+/// Resolve the live pending placeholder with an ERROR outcome, keeping the
+/// streamed partial text (plan D5): the partial becomes the bubble body and
+/// the error message is appended below it, so a mid-stream failure does not
+/// throw away what the user already watched arrive. A blank/absent partial
+/// degrades to the plain error bubble (the pre-streaming shape).
+fn resolve_live_placeholder_with_error(chat: &mut Chat, message: &str) {
+    if let Some(row) = chat
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.pending && !is_queued_marker(m))
+    {
+        let partial = std::mem::take(&mut row.markdown);
+        row.markdown = if partial.trim().is_empty() {
+            format!("**Error:** {message}")
+        } else {
+            format!("{partial}\n\n**Error:** {message}")
+        };
+        row.pending = false;
     }
 }
 /// is this answer content invisible-by-contract?

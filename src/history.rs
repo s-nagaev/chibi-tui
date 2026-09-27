@@ -154,6 +154,9 @@ impl From<StoredChat> for Chat {
             // live subagent counters are session-only —
             // a restart starts every thread with an empty counter map.
             subagent_counts: std::collections::HashMap::new(),
+            // streaming view state is session-only: a restored thread has
+            // no live delta stream to render as plain text.
+            streaming: false,
         }
     }
 }

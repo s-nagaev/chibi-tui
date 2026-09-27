@@ -525,6 +525,19 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         .messages
         .iter()
         .rposition(|m| m.role == Role::Assistant);
+    // The actively-streaming row (plan D6): while delta frames are being
+    // accepted, the live pending placeholder renders its partial text as
+    // PLAIN text — a full markdown parse per chunk would cost far more
+    // than the render budget at the stream cadence. The terminal result
+    // re-renders the full markdown (intentional re-format at completion).
+    // Queued placeholders stay invisible (empty line) as always.
+    let streaming_row = if chat.streaming {
+        chat.messages
+            .iter()
+            .rposition(|m| m.pending && !m.is_queued_marker())
+    } else {
+        None
+    };
     let thoughts = app
         .thoughts_visible
         .then_some(chat.last_thoughts.as_deref())
@@ -553,7 +566,17 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
                 lines.push(assistant_header_line(msg.model_label(), theme));
             }
         }
-        if msg.pending {
+        if Some(msg_index) == streaming_row {
+            // Plain-text render of the partial stream: no markdown pass,
+            // every source line paints as-is on its own row.
+            if msg.markdown.is_empty() {
+                lines.push(Line::from(String::new()));
+            } else {
+                for text_line in msg.markdown.lines() {
+                    lines.push(Line::from(text_line.to_owned()));
+                }
+            }
+        } else if msg.pending {
             lines.push(Line::from(Span::styled(String::new(), Style::new())));
         } else {
             lines.extend(markdown::render(&msg.markdown, theme));

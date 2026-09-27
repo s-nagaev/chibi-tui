@@ -25,6 +25,7 @@ mod selection;
 mod sidebar_order;
 mod status_strip;
 mod sticky_state;
+mod streaming;
 mod subagent;
 mod submit_result;
 mod support;
