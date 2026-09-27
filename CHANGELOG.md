@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Added a content-keyed markdown render cache: finalized chat messages are parsed and syntax-highlighted once per (content, theme) pair instead of on every frame, sharply cutting CPU while streaming or scrolling through a rich transcript. Session-only app state — the history snapshot format is untouched, and the streaming pending row keeps its plain-text render.
+
 ### Added
 
 - Live response streaming: the TUI opts in to `capabilities.streaming` and renders `delta` frames as plain text on the request's pending bubble while the turn runs; the terminal `result` frame stays authoritative and overwrites the partial, late deltas after it are dropped, a mid-stream error keeps the partial text, and delta frames never trigger persistence or resolve the request lifecycle. Canonical IDE-protocol fixture set re-synced from the backend (adds `valid_streaming_session_*` and `valid_subagent_events_*`).

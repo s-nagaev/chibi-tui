@@ -579,7 +579,10 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         } else if msg.pending {
             lines.push(Line::from(Span::styled(String::new(), Style::new())));
         } else {
-            lines.extend(markdown::render(&msg.markdown, theme));
+            // Finalized row: the content-keyed markdown cache (plan D1)
+            // re-parses + re-highlights once per (content, theme) pair and
+            // serves cheap `Line<'static>` clones on every later frame.
+            lines.extend(app.md_cache.render(&msg.markdown, theme));
         }
         lines.push(Line::from(""));
         msg_ranges.push((start, lines.len()));

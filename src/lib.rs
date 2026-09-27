@@ -18,6 +18,7 @@ pub mod history;
 pub mod input;
 pub mod live;
 pub mod markdown;
+pub mod md_cache;
 pub mod mock;
 pub mod model;
 pub mod model_picker;

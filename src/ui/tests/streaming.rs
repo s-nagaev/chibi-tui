@@ -91,3 +91,37 @@ fn non_streaming_pending_row_stays_an_empty_line() {
         "a non-streaming pending row paints no content"
     );
 }
+
+/// The markdown render cache (plan D1) only serves FINALIZED rows. Even
+/// when an identical finalized message already sits in the history — i.e.
+/// the same content is cached from an earlier frame — the actively
+/// streaming pending row must keep painting its raw partial text (no
+/// markdown pass, no cache consult) while the finalized row is
+/// markdown-interpreted as usual.
+#[test]
+fn streaming_row_stays_plain_beside_cached_history_content() {
+    let mut app = App::new(vec![Chat::new("s")]);
+    let chat = &mut app.chats[0];
+    chat.messages.push(Message::user("prompt"));
+    // A finalized historical message whose markdown equals the live
+    // partial's prefix: markdown syntax must vanish from THIS row...
+    chat.messages.push(Message::assistant("**shared** body"));
+    // ...while the live pending row paints the very same markers raw.
+    chat.messages.push(Message::assistant_pending());
+    chat.messages[2].markdown.push_str("**shared** live");
+    chat.lifecycle = ChatLifecycle::Awaiting {
+        request_id: "req-1".into(),
+    };
+    chat.streaming = true;
+
+    let rows = render_grid(&mut app);
+
+    assert!(
+        rows.iter().any(|r| r.contains("**shared** live")),
+        "streaming row paints its partial raw, even next to cached content"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("shared body")),
+        "the finalized history row is markdown-interpreted (cache path)"
+    );
+}

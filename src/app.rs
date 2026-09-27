@@ -8,7 +8,8 @@ use ratatui::layout::{Position, Rect};
 use crate::backend::BackendEvent;
 use crate::diag::LogEntry;
 use crate::input::InputArea;
-use crate::markdown;
+use crate::markdown::{self, MdLine};
+use crate::md_cache::MarkdownCache;
 use crate::model::{ChatLifecycle, Message};
 use crate::model_picker::{parse_model_listing, parse_selection_confirmation, ModelEntry};
 use crate::popup::ErrorPopup;
@@ -921,6 +922,14 @@ pub struct App {
     /// rejected by consumers when its `chat_id` no longer matches the
     /// active thread.
     pub chat_geometry: Option<ChatGeometry>,
+    /// Content-keyed cache of rendered markdown lines
+    /// ([`MarkdownCache`], plan D1): a finalized message renders exactly
+    /// once per `(content, theme)` pair instead of being re-parsed and
+    /// re-highlighted on every frame. Session-only App state (the renderer
+    /// borrows `chats` immutably, so a per-chat cache could not mutate) —
+    /// never persisted, zero serde surface. The streaming pending row
+    /// renders plain text and bypasses the cache entirely.
+    pub md_cache: MarkdownCache<fn(&str, &Theme) -> Vec<MdLine>>,
 }
 
 /// a clone request in flight. The `chat` waits here until the backend
@@ -1069,6 +1078,7 @@ impl App {
             thoughts_visible: true,
             selection: None,
             chat_geometry: None,
+            md_cache: MarkdownCache::new(markdown::render),
         }
     }
 

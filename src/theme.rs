@@ -4,7 +4,9 @@ use ratatui::style::Color;
 use syntect::highlighting::Theme as SynTheme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-#[derive(Clone, Copy)]
+/// Hashable/eq-comparable so the markdown render cache can key entries by
+/// the theme a message was rendered with (see [`crate::md_cache`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Theme {
     pub bg: Color,
     pub panel: Color,
