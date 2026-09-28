@@ -4,7 +4,9 @@ use ratatui::style::Color;
 use syntect::highlighting::Theme as SynTheme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-#[derive(Clone, Copy)]
+/// Hashable/eq-comparable so the markdown render cache can key entries by
+/// the theme a message was rendered with (see [`crate::md_cache`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Theme {
     pub bg: Color,
     pub panel: Color,
@@ -108,7 +110,10 @@ pub struct Highlighter {
 
 impl Highlighter {
     fn new() -> Self {
-        let syntaxes = SyntaxSet::load_defaults_nonewlines();
+        // two_face bundles every syntect default grammar plus ~130 extra
+        // ones (TypeScript/TSX, Swift, Kotlin, Zig, Elixir, TOML,
+        // Dockerfile, Objective-C, …) in the same regex-fancy dump format.
+        let syntaxes = two_face::syntax::extra_no_newlines();
         let defaults = syntect::highlighting::ThemeSet::load_defaults();
         let theme = defaults
             .themes
@@ -132,6 +137,11 @@ impl Highlighter {
                 "sh" | "shell" | "console" => self.syntaxes.find_syntax_by_token("bash"),
                 "js" => self.syntaxes.find_syntax_by_token("javascript"),
                 "ts" => self.syntaxes.find_syntax_by_token("typescript"),
+                // The grammar names ("C#", "Objective-C") don't match
+                // these fence tokens, so resolve them via their canonical
+                // token names instead.
+                "csharp" => self.syntaxes.find_syntax_by_token("cs"),
+                "objc" => self.syntaxes.find_syntax_by_token("objective-c"),
                 "rs" => self.syntaxes.find_syntax_by_token("rust"),
                 _ => None,
             })
@@ -144,4 +154,77 @@ static HIGHLIGHTER: std::sync::OnceLock<Highlighter> = std::sync::OnceLock::new(
 /// Process-wide highlighter (syntax set loading happens at most once).
 pub fn highlighter() -> &'static Highlighter {
     HIGHLIGHTER.get_or_init(Highlighter::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two-face's extended set must cover the mainstream grammars the
+    /// syntect defaults lack; `syntax_for` resolves them by token.
+    #[test]
+    fn syntax_for_resolves_extended_language_tokens() {
+        let hl = highlighter();
+        for token in [
+            "ts",
+            "typescript",
+            "tsx",
+            "elixir",
+            "zig",
+            "swift",
+            "kotlin",
+            "cs",
+            "csharp",
+            "toml",
+            "dockerfile",
+            "objc",
+        ] {
+            let syntax = hl.syntax_for(token);
+            assert_ne!(
+                syntax.name, "Plain Text",
+                "token `{token}` must resolve to a real grammar"
+            );
+        }
+        // `objc` must hit the pure Objective-C grammar, not Objective-C++
+        // (its `mm` extension belongs to Objective-C++; `objective-c` is
+        // the correct canonical token).
+        assert_eq!(hl.syntax_for("objc").name, "Objective-C");
+    }
+
+    /// The long-standing defaults must keep resolving after the loader
+    /// swap (two-face bundles them, but the guarantee is worth pinning).
+    #[test]
+    fn syntax_for_still_resolves_core_defaults() {
+        let hl = highlighter();
+        for token in [
+            "rust",
+            "python",
+            "py",
+            "javascript",
+            "js",
+            "bash",
+            "sh",
+            "go",
+        ] {
+            let syntax = hl.syntax_for(token);
+            assert_ne!(
+                syntax.name, "Plain Text",
+                "token `{token}` must resolve to a real grammar"
+            );
+        }
+    }
+
+    /// Genuinely unknown tokens fall back to plain text.
+    #[test]
+    fn syntax_for_falls_back_to_plain_text_for_unknown_tokens() {
+        let hl = highlighter();
+        let plain = hl.syntaxes.find_syntax_plain_text().name.clone();
+        for token in ["notalanguage", "", "   "] {
+            assert_eq!(
+                hl.syntax_for(token).name,
+                plain,
+                "token `{token}` is plain text"
+            );
+        }
+    }
 }

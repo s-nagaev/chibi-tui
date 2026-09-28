@@ -4,7 +4,21 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-28
+
+### Changed
+
+- Event-driven redraw with dirty-flag frame painting: the UI now repaints only on real state changes instead of a hot render loop, dropping idle CPU from 35.6% to 0.10% and cutting CPU during streaming by roughly 6.5x.
+- Added a content-keyed markdown render cache: finalized chat messages are parsed and syntax-highlighted once per (content, theme) pair instead of on every frame, sharply cutting CPU while streaming or scrolling through a rich transcript. Session-only app state — the history snapshot format is untouched, and the streaming pending row keeps its plain-text render.
+
+### Added
+
+- Incremental streaming markdown render: completed blocks (code panels, tables) render as full markdown while the response streams, the in-progress tail stays plain text, and the final result reconciles byte-identically with a from-scratch render.
+- Live response streaming: the TUI opts in to `capabilities.streaming` and renders `delta` frames as plain text on the request's pending bubble while the turn runs; the terminal `result` frame stays authoritative and overwrites the partial, late deltas after it are dropped, a mid-stream error keeps the partial text, and delta frames never trigger persistence or resolve the request lifecycle. Canonical IDE-protocol fixture set re-synced from the backend (adds `valid_streaming_session_*` and `valid_subagent_events_*`).
+
+### Fixed
+
+- Syntax highlighting now covers TypeScript/TSX, Swift, Kotlin, Zig, Elixir, TOML, Dockerfile, Objective-C and more via a bundled extended grammar set; previously only the ~75 default syntect grammars were available, so several mainstream languages had never been highlighted since v0.1.0.
 
 ## [0.3.1] - 2026-09-26
 

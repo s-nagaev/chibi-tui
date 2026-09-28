@@ -213,6 +213,9 @@ async fn forward_one_request(
     // Same race removed for mid-turn subagent progress: subscribed before
     // the request hits the wire, so the first `agent_event` cannot slip by.
     let agent_rx = pipeline.subscribe_agent_events();
+    // Same race removed for streaming text: the first `delta` of a fast
+    // stream must not be dropped before this pump even exists.
+    let delta_rx = pipeline.subscribe_deltas();
 
     // Debug counter for BackendEvent ids (UI ignores them; kept monotonic).
     let event_id = submitted_event_id(&submitted);
@@ -253,9 +256,21 @@ async fn forward_one_request(
         event_id,
         tx.clone(),
     ));
+    // Aborted with the terminal event: deltas are only meaningful while the
+    // request runs, and aborting here enforces the late-delta drop rule at
+    // the source — a chunk that lost the race with `result` is dropped
+    // instead of leaking into the UI stream after the authoritative text.
+    let delta_pump = tokio::spawn(pump_deltas(
+        delta_rx,
+        submitted.request_id.clone(),
+        submitted.thread_id.clone(),
+        event_id,
+        tx.clone(),
+    ));
 
     let event = terminal_event(result_rx.await, event_id, submitted.thread_id.clone());
     pump.abort();
+    delta_pump.abort();
 
     // Per-thread async: after THIS chat's terminal event the event loop may
     // need to start the next queued prompt of that chat. `send().await`
@@ -414,6 +429,41 @@ async fn pump_agent_events(
                 }
                 if update.event == AgentEventKind::Finished && update.active == 0 {
                     return; // backend retired this request's counter: end-of-stream
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue, // best effort
+            Err(broadcast::error::RecvError::Closed) => return,      // pipeline gone
+        }
+    }
+}
+
+/// Forward live streaming text chunks (`delta` frames) for `request_id` as
+/// UI events (same shape as [`pump_statuses`]): filter by request id, stamp
+/// the owning chat's stable thread id, never terminal. The glue task aborts
+/// the pump once the request's terminal outcome arrives — a delta that
+/// races the authoritative `result` is dropped rather than appended after
+/// it, which is the TUI-side half of the late-delta drop rule (the app's
+/// accept rule remains the second line of defense).
+async fn pump_deltas(
+    mut delta_rx: broadcast::Receiver<crate::request_pipeline::DeltaUpdate>,
+    request_id: String,
+    thread_id: String,
+    event_id: u64,
+    tx: mpsc::Sender<BackendEvent>,
+) {
+    loop {
+        match delta_rx.recv().await {
+            Ok(update) => {
+                if update.request_id != request_id {
+                    continue; // some other request's stream
+                }
+                let event = BackendEvent::Delta {
+                    request_id: event_id,
+                    thread_id: thread_id.clone(),
+                    text: update.text,
+                };
+                if tx.send(event).await.is_err() {
+                    return; // UI receiver dropped
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => continue, // best effort
@@ -856,6 +906,7 @@ mod tests {
                 BackendEvent::Queued { .. }
                 | BackendEvent::Running { .. }
                 | BackendEvent::AgentProgress { .. }
+                | BackendEvent::Delta { .. }
                 | BackendEvent::QueueDrain { .. } => continue,
                 BackendEvent::Result { .. } => panic!("cancelled request must not yield Result"),
                 BackendEvent::BackgroundMessage { .. } => continue,

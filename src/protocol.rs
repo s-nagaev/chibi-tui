@@ -5,7 +5,7 @@
 //!
 //! Client → server: [`ClientMessage`] — `initialize` / `request` / `cancel` /
 //! `shutdown`. Server → client: [`ServerMessage`] — `ready` / `status` /
-//! `agent_event` / `result` / `error`.
+//! `agent_event` / `delta` / `result` / `error`.
 //!
 //! Protocol-version enforcement is part of the type contract:
 //! [`ProtocolVersion`] only deserializes from the literal `1`, so a handshake
@@ -96,20 +96,42 @@ pub struct Capabilities {
 
 /// Feature flags the client advertises during the handshake. The backend
 /// gates each capability on an explicit `true`; absent fields mean "off".
+///
+/// Every flag parses leniently (`default`) and re-serializes only when
+/// enabled (`skip_serializing_if`): canonical handshake frames carry just
+/// the flags the editor opted into, and the frozen-bytes round-trip keeps
+/// exactly that shape. The TUI always sends the full set as `true`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientCapabilities {
+    #[serde(default, skip_serializing_if = "is_false")]
     pub thoughts: bool,
     /// Opts in to mid-turn `agent_event` frames (subagent progress).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub subagents: bool,
     /// Opts in to out-of-band `message` frames: continuation answers the
     /// backend produces after a background tool result arrives (the parent
     /// request's lifecycle is already over, so there is no request id).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub background_messages: bool,
     /// Opts in to `cwd_update` frames: the backend reports the effective
     /// working directory of the agent state per thread (including runtime
     /// changes made by the `set_working_dir` tool). Old backends ignore the
     /// unknown flag, so the field is safe to always send.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub cwd_updates: bool,
+    /// Opts in to `delta` frames: the backend streams partial LLM text while
+    /// a request is still running (the terminal `result` frame stays
+    /// authoritative and overwrites the accumulated deltas). `default` keeps
+    /// initialize frames that never carried the flag parsing; old backends
+    /// ignore the unknown flag, so the field is safe to always send.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub streaming: bool,
+}
+
+/// `skip_serializing_if` predicate: a capability flag that stays "off" is
+/// omitted from the wire frame instead of being spelled out as `false`.
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// Kind of a mid-turn `agent_event` frame: a subagent spawn began or ended
@@ -253,6 +275,17 @@ pub enum ServerMessage {
         total: u64,
         #[serde(default)]
         name: Option<String>,
+    },
+    /// Live text chunk for a request whose turn is still running (opt-in via
+    /// `capabilities.streaming` at handshake). NON-terminal: like
+    /// `status`/`agent_event` it must never end the request lifecycle — the
+    /// final `result` frame carries the authoritative full text and
+    /// overwrites whatever the deltas accumulated. `text` is the incremental
+    /// chunk, not the body accumulated so far; consumers append.
+    Delta {
+        request_id: String,
+        thread_id: i64,
+        text: String,
     },
     /// Final successful answer; terminal for its `request_id`.
     Result {
@@ -496,8 +529,8 @@ mod tests {
 
     /// Handshake: the client's initialize frame carries
     /// `capabilities: {"thoughts": true, "subagents": true,
-    /// "background_messages": true, "cwd_updates": true}` on the wire,
-    /// protocol_version 1.
+    /// "background_messages": true, "cwd_updates": true, "streaming": true}`
+    /// on the wire, protocol_version 1.
     #[test]
     fn initialize_serializes_client_capabilities() {
         let msg = ClientMessage::Initialize {
@@ -511,6 +544,7 @@ mod tests {
                 subagents: true,
                 background_messages: true,
                 cwd_updates: true,
+                streaming: true,
             }),
         };
         let line = serde_json::to_string(&msg).expect("initialize serializes");
@@ -520,6 +554,7 @@ mod tests {
         assert_eq!(value["capabilities"]["subagents"], true);
         assert_eq!(value["capabilities"]["background_messages"], true);
         assert_eq!(value["capabilities"]["cwd_updates"], true);
+        assert_eq!(value["capabilities"]["streaming"], true);
 
         // Deserializing it back keeps the capabilities (round-trip sanity).
         match serde_json::from_str::<ClientMessage>(&line).expect("round-trips") {
@@ -531,6 +566,7 @@ mod tests {
                         subagents: true,
                         background_messages: true,
                         cwd_updates: true,
+                        streaming: true,
                     })
                 );
             }
@@ -787,6 +823,111 @@ mod tests {
             }
             other => panic!("expected AgentEvent, got {other:?}"),
         }
+    }
+
+    /// The `delta` frame parses exactly (request-scoped, non-terminal) and
+    /// round-trips with `delta` as the type tag.
+    #[test]
+    fn delta_frame_parses_and_round_trips() {
+        let frame = r#"{"type":"delta","request_id":"r1","thread_id":42,"text":"hel"}"#;
+        let msg: ServerMessage = serde_json::from_str(frame).expect("delta parses");
+        assert_eq!(
+            msg,
+            ServerMessage::Delta {
+                request_id: "r1".into(),
+                thread_id: 42,
+                text: "hel".into(),
+            }
+        );
+        let line = serde_json::to_string(&msg).expect("serializes");
+        assert_eq!(
+            line,
+            r#"{"type":"delta","request_id":"r1","thread_id":42,"text":"hel"}"#
+        );
+    }
+
+    /// delta frame: unknown extra fields are ignored (forward compatibility),
+    /// known fields keep their values.
+    #[test]
+    fn delta_extra_unknown_fields_ignored() {
+        let frame = r#"{
+            "type": "delta",
+            "request_id": "r1",
+            "thread_id": 42,
+            "text": "chunk",
+            "future_thing": {"nested": [1, 2, 3]}
+        }"#;
+        match serde_json::from_str::<ServerMessage>(frame).expect("extra fields ignored") {
+            ServerMessage::Delta {
+                request_id,
+                thread_id,
+                text,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(thread_id, 42);
+                assert_eq!(text, "chunk");
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    /// delta frame: `request_id`/`thread_id`/`text` are all required — a
+    /// frame missing any of them fails the parse (the reader drops it and
+    /// traces it), never silently mapping to an empty/default value.
+    #[test]
+    fn delta_missing_required_fields_fail_parse() {
+        for frame in [
+            r#"{"type":"delta","thread_id":42,"text":"x"}"#,
+            r#"{"type":"delta","request_id":"r1","text":"x"}"#,
+            r#"{"type":"delta","request_id":"r1","thread_id":42}"#,
+            r#"{"type":"delta"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ServerMessage>(frame).is_err(),
+                "missing-field delta must not parse: {frame}"
+            );
+        }
+    }
+
+    /// An old-style capabilities object without `streaming` still parses:
+    /// `#[serde(default)]` maps the absent flag to `false` instead of
+    /// failing the handshake parse (backward compatibility with frames
+    /// written before the flag existed).
+    #[test]
+    fn initialize_capabilities_without_streaming_parse_with_default_false() {
+        let frame = r#"{"type":"initialize","protocol_version":1,"capabilities":{"thoughts":true,"subagents":true,"background_messages":true,"cwd_updates":true}}"#;
+        match serde_json::from_str::<ClientMessage>(frame).expect("old capabilities parse") {
+            ClientMessage::Initialize { capabilities, .. } => {
+                let caps = capabilities.expect("capabilities present");
+                assert!(!caps.streaming, "absent flag defaults to false");
+            }
+            other => panic!("expected Initialize, got {other:?}"),
+        }
+    }
+
+    /// Canonical handshake frames carry only the flags the client opted
+    /// into: absent flags parse as `false` AND are omitted again on
+    /// re-serialization, so a partial capability object round-trips to the
+    /// exact same bytes (the canonical fixtures' contract).
+    #[test]
+    fn partial_capability_object_round_trips_without_inventing_flags() {
+        let frame =
+            r#"{"type":"initialize","protocol_version":1,"capabilities":{"streaming":true}}"#;
+        let msg: ClientMessage = serde_json::from_str(frame).expect("partial caps parse");
+        match &msg {
+            ClientMessage::Initialize { capabilities, .. } => {
+                let caps = capabilities.expect("capabilities present");
+                assert!(caps.streaming, "declared flag parses true");
+                assert!(!caps.thoughts && !caps.subagents, "absent flags mean off");
+                assert!(
+                    !caps.background_messages && !caps.cwd_updates,
+                    "absent flags mean off"
+                );
+            }
+            other => panic!("expected Initialize, got {other:?}"),
+        }
+        let back = serde_json::to_string(&msg).expect("re-serializes");
+        assert_eq!(back, frame, "disabled flags must not appear on the wire");
     }
 
     /// The `cwd_update` frame parses exactly (thread-scoped, non-terminal)

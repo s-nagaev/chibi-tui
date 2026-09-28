@@ -19,6 +19,7 @@ mod spinner;
 mod status_bar;
 mod status_hints;
 mod status_strip;
+mod streaming;
 mod support;
 mod thoughts;
 mod wrap;

@@ -98,6 +98,106 @@ fn valid_shutdown_output_roundtrip() {
 }
 
 #[test]
+fn valid_subagent_events_input_roundtrip() {
+    for line in read_lines("valid_subagent_events_input.jsonl") {
+        let msg: ClientMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            value(&line),
+            "round-trip mismatch for: {line}"
+        );
+    }
+}
+
+#[test]
+fn valid_subagent_events_output_roundtrip() {
+    for line in read_lines("valid_subagent_events_output.jsonl") {
+        let msg: ServerMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            value(&line),
+            "round-trip mismatch for: {line}"
+        );
+    }
+}
+
+#[test]
+fn valid_streaming_session_input_roundtrip() {
+    for line in read_lines("valid_streaming_session_input.jsonl") {
+        let msg: ClientMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            value(&line),
+            "round-trip mismatch for: {line}"
+        );
+    }
+}
+
+#[test]
+fn valid_streaming_session_output_roundtrip() {
+    for line in read_lines("valid_streaming_session_output.jsonl") {
+        let msg: ServerMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            value(&line),
+            "round-trip mismatch for: {line}"
+        );
+    }
+}
+
+/// The streaming fixture's `delta` frames decode into the exact
+/// `ServerMessage::Delta` variant: request id + i64 thread id + incremental
+/// chunk text (append semantics, never a full body). The handshake declares
+/// `capabilities.streaming`, and the `ready` frame stays canonical — the
+/// server never advertises `streaming` in `ready.capabilities`.
+#[test]
+fn streaming_fixture_decodes_delta_frames_and_capability() {
+    let input = read_lines("valid_streaming_session_input.jsonl");
+    match serde_json::from_str::<ClientMessage>(&input[0]).unwrap() {
+        ClientMessage::Initialize { capabilities, .. } => {
+            let caps = capabilities.expect("streaming handshake carries capabilities");
+            assert!(caps.streaming, "the client opts in to streaming");
+        }
+        other => panic!("expected Initialize, got {other:?}"),
+    }
+
+    let output = read_lines("valid_streaming_session_output.jsonl");
+    match serde_json::from_str::<ServerMessage>(&output[0]).unwrap() {
+        ServerMessage::Ready { capabilities, .. } => {
+            let caps = capabilities.expect("ready carries the command set");
+            assert!(!caps.commands.is_empty());
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    let mut streamed = String::new();
+    for line in &output[2..4] {
+        match serde_json::from_str::<ServerMessage>(line).unwrap() {
+            ServerMessage::Delta {
+                request_id,
+                thread_id,
+                text,
+            } => {
+                assert_eq!(request_id, "01HXY9K4STREAM01");
+                assert_eq!(thread_id, 3);
+                streamed.push_str(&text);
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+    assert!(streamed.starts_with("Streaming chunk."));
+    assert!(streamed.ends_with(" Final tail."));
+
+    // The result frame stays authoritative over the accumulated chunks.
+    match serde_json::from_str::<ServerMessage>(&output[4]).unwrap() {
+        ServerMessage::Result { content, .. } => {
+            assert_ne!(content, streamed, "result text differs from the partial");
+        }
+        other => panic!("expected Result, got {other:?}"),
+    }
+}
+
+#[test]
 fn session_fixture_decodes_into_expected_variants() {
     // Stronger than round-trip: assert the exact variants and key payloads.
     let input = read_lines("valid_session_input.jsonl");

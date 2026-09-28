@@ -74,6 +74,20 @@ pub enum BackendEvent {
     /// it to the owning chat. NON-terminal by construction: it must never
     /// resolve any request lifecycle, spinner or queue state.
     CwdUpdate { wire_thread_id: i64, cwd: String },
+    /// Live text chunk for a running request (real backend only, emitted
+    /// for clients that declared `capabilities.streaming`). NON-terminal:
+    /// the app appends it to the request's in-flight placeholder; the
+    /// final [`BackendEvent::Result`] carries the authoritative full text
+    /// and overwrites whatever the deltas accumulated. `request_id`
+    /// follows the same numeric correlation convention as every other
+    /// request-scoped variant. Deltas are in-memory only: they must never
+    /// trigger persistence (guarded in the bin event loop) and a delta
+    /// racing a resolved request is dropped.
+    Delta {
+        request_id: u64,
+        thread_id: String,
+        text: String,
+    },
     /// The event source itself reported the transport link down (no
     /// particular request to blame). Flips the connection indicator; never
     /// opens the popup by itself.

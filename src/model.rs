@@ -104,6 +104,14 @@ impl Message {
     pub fn model_label(&self) -> Option<&str> {
         self.model.as_deref().filter(|m| !m.trim().is_empty())
     }
+
+    /// Marker predicate for the visible "⏳ queued (#n)" placeholder rows
+    /// (prompts waiting in the chat's FIFO queue). The renderer paints them
+    /// as an empty line, and terminal-event resolution must never touch
+    /// them — they are owned by the queue drain, not by a live request.
+    pub fn is_queued_marker(&self) -> bool {
+        self.pending && self.markdown.starts_with("\u{23f3} queued")
+    }
 }
 
 /// Per-chat request lifecycle (feature: per-thread async).

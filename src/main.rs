@@ -363,11 +363,21 @@ async fn run_loop(
     // the thread the user was reading.
     let mut tracked_thread: Option<String> = None;
 
+    // First paint is unconditional: connect completes BEFORE run_loop is
+    // entered, so a "draw only after the first event" scheme could leave a
+    // blank terminal on startup. From here on the viewport is repainted only
+    // when something actually changed (dirty flag), not on a fixed 10 FPS
+    // cadence — the flag starts dirty so the first loop iteration paints too.
+    terminal.draw(|f| ui::draw(f, &mut app, theme))?;
+    let mut redraw = RedrawController::fresh();
+
     loop {
-        // Resize events force a full repaint of the next frame anyway; the
-        // layout (sidebar width, code panels) adapts purely from the new
-        // frame size. There is no cached geometry anywhere in the render path.
-        terminal.draw(|f| ui::draw(f, &mut app, theme))?;
+        if redraw.take() {
+            // Resize events force a full repaint of the next frame anyway; the
+            // layout (sidebar width, code panels) adapts purely from the new
+            // frame size. There is no cached geometry anywhere in the render path.
+            terminal.draw(|f| ui::draw(f, &mut app, theme))?;
+        }
 
         tokio::select! {
             // ---- keyboard / resize ----
@@ -608,13 +618,18 @@ async fn run_loop(
                                 }
                             }
 
+                            // Any key press that reached the handlers may have
+                            // changed state (draft, mode, popups, ...): mark
+                            // the frame dirty for the next loop iteration.
+                            redraw.request();
                         }
                     }
                     Some(Ok(CtEvent::Resize(_, _))) => {
-                        // Repaint immediately on the new size so the layout
-                        // (sidebar width, code panels) adapts without waiting
-                        // for the next event.
-                        terminal.draw(|f| ui::draw(f, &mut app, theme))?;
+                        // Repaint on the new size so the layout (sidebar
+                        // width, code panels) adapts: flagging the dirty bit
+                        // makes the very next loop iteration paint the
+                        // resized frame, before any further event is awaited.
+                        redraw.request();
                     }
                     Some(Ok(CtEvent::Mouse(mouse))) => {
                         // Wheel routing hit-tests against the SAME layout the
@@ -624,6 +639,7 @@ async fn run_loop(
                         let size = terminal.size()?;
                         let area = Rect::new(0, 0, size.width, size.height);
                         mouse::handle_mouse(&mut app, mouse, area);
+                        redraw.request();
                     }
                     Some(Ok(CtEvent::Paste(text))) => {
                         // A bracketed paste is NOT a key: it never reaches
@@ -631,6 +647,7 @@ async fn run_loop(
                         // never submit. The whole payload — newlines
                         // included — lands in the draft in one insert.
                         handle_paste(&mut app, &text);
+                        redraw.request();
                     }
                     Some(Ok(_)) => {} // focus and other crossterm events
                     Some(Err(e)) => return Err(io::Error::other(e)),
@@ -678,26 +695,38 @@ async fn run_loop(
                         persist_chat(chat, history_dir);
                     }
                 } else {
+                    // Deltas are in-memory only: persisting on every chunk
+                    // would run a full-transcript serialize + blocking
+                    // fs::write on the UI loop at the stream cadence.
+                    let persist = should_persist_after(&evt);
                     app.apply_backend_event(evt);
                     // Persist the chat the event belongs to (routed by
                     // thread id when present; otherwise the active one).
-                    if let Some(chat) = app.chats.get(app.active) {
-                        persist_chat(chat, history_dir);
+                    if persist {
+                        if let Some(chat) = app.chats.get(app.active) {
+                            persist_chat(chat, history_dir);
+                        }
                     }
                 }
+                // Backend events (deltas, statuses, results, errors) all
+                // mutate visible state: repaint on the next iteration.
+                redraw.request();
             }
 
             // ---- spinner animation (~10 fps while busy) ----
             _ = spinner_tick.tick() => {
-                // Animate whenever ANY chat is busy so a background request's
-                // sidebar marker keeps pulsing-style freshness; the visible
-                // spinner line itself only renders for the ACTIVE chat.
-                if app.any_busy() {
-                    app.tick_spinner();
+                // Idle gate: when nothing is animating, the 100 ms tick is a
+                // no-op wake-up — no state change, no repaint — and the loop
+                // stays parked on its event sources. The gate must include
+                // the status toast: its countdown expires on this cadence
+                // even when no request is in flight.
+                if should_redraw(&app) {
+                    if app.any_busy() {
+                        app.tick_spinner();
+                    }
+                    app.tick_status_message();
+                    redraw.request();
                 }
-                // the transient status toast (busy
-                // refusal) auto-expires on the same 100 ms cadence.
-                app.tick_status_message();
             }
         }
 
@@ -707,6 +736,44 @@ async fn run_loop(
             return Ok(());
         }
     }
+}
+
+/// Dirty-flag controller for the run loop's frame painting.
+///
+/// The loop used to repaint the whole viewport at a fixed 10 FPS cadence,
+/// burning CPU even while fully idle. Painting is event-driven now: every
+/// state-mutating `select!` arm requests a frame, and the loop top paints
+/// only when the flag is set — consuming it, so an unchanged UI stays
+/// untouched between events.
+struct RedrawController {
+    needs_redraw: bool,
+}
+
+impl RedrawController {
+    /// Starts dirty so the first loop iteration paints a frame even if no
+    /// event has arrived yet.
+    fn fresh() -> Self {
+        Self { needs_redraw: true }
+    }
+
+    /// Mark the UI as changed: the next loop iteration repaints.
+    fn request(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    /// Consume the flag: `true` means a frame must be painted now.
+    fn take(&mut self) -> bool {
+        std::mem::take(&mut self.needs_redraw)
+    }
+}
+
+/// Whether the 100 ms tick still has visible work to do: any chat's spinner
+/// is animating, or a transient status toast is on screen (its countdown
+/// expires on the tick cadence). When this returns `false` the tick arm is a
+/// no-op and no frame is painted — that gate is what drops idle CPU to ~0%
+/// instead of burning a full redraw ten times per second.
+fn should_redraw(app: &chibi_tui::app::App) -> bool {
+    app.any_busy() || app.status_message.is_some()
 }
 
 /// Mock sources never reconnect — `R` just clears the popup.
@@ -766,6 +833,15 @@ fn persist_chat(chat: &chibi_tui::app::Chat, dir_override: Option<&std::path::Pa
     if let Err(e) = history::save_chat_in(dir_override, chat) {
         eprintln!("chibi-tui: could not save chat history: {e}");
     }
+}
+
+/// Does this backend event deserve a snapshot write? Streaming deltas are
+/// in-memory only: `persist_chat` is a full-transcript serialize plus a
+/// blocking `fs::write` on the UI loop, and a delta flood would repeat that
+/// at the stream cadence. Terminal `Result` / `Error` (and every other
+/// event kind) persist as before, so the authoritative text always lands.
+fn should_persist_after(evt: &BackendEvent) -> bool {
+    !matches!(evt, BackendEvent::Delta { .. })
 }
 
 /// Build the live-mode startup app: persisted history (or one fresh chat on

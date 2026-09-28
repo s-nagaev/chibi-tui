@@ -28,6 +28,7 @@ fn chat(name: &str, messages: Vec<Message>) -> crate::app::Chat {
         last_model: None,
         last_thoughts: None,
         subagent_counts: std::collections::HashMap::new(),
+        streaming: false,
     }
 }
 

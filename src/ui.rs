@@ -525,6 +525,20 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         .messages
         .iter()
         .rposition(|m| m.role == Role::Assistant);
+    // The actively-streaming row (incremental stream render): completed
+    // top-level blocks paint as real markdown through the prefix cache
+    // (stable anchor → cache hits between delta frames); only the
+    // in-progress tail stays plain text, styled with the theme foreground.
+    // The terminal result re-renders the full markdown (intentional
+    // re-format at completion). Queued placeholders stay invisible (empty
+    // line) as always.
+    let streaming_row = if chat.streaming {
+        chat.messages
+            .iter()
+            .rposition(|m| m.pending && !m.is_queued_marker())
+    } else {
+        None
+    };
     let thoughts = app
         .thoughts_visible
         .then_some(chat.last_thoughts.as_deref())
@@ -553,10 +567,23 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
                 lines.push(assistant_header_line(msg.model_label(), theme));
             }
         }
-        if msg.pending {
+        if Some(msg_index) == streaming_row {
+            // Incremental stream render: completed blocks as markdown
+            // (prefix cache), in-progress tail as plain text. A free
+            // function takes `&mut stream_prefix_cache` because `render_chat`
+            // holds `&app.chats` across the loop — a disjoint field borrow.
+            lines.extend(markdown::streaming_lines(
+                &msg.markdown,
+                theme,
+                &mut app.stream_prefix_cache,
+            ));
+        } else if msg.pending {
             lines.push(Line::from(Span::styled(String::new(), Style::new())));
         } else {
-            lines.extend(markdown::render(&msg.markdown, theme));
+            // Finalized row: the content-keyed markdown cache (plan D1)
+            // re-parses + re-highlights once per (content, theme) pair and
+            // serves cheap `Line<'static>` clones on every later frame.
+            lines.extend(app.md_cache.render(&msg.markdown, theme));
         }
         lines.push(Line::from(""));
         msg_ranges.push((start, lines.len()));
