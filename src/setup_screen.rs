@@ -87,7 +87,7 @@ pub fn content_lines(os: TargetOs, theme: &Theme) -> Vec<Line<'static>> {
         )),
         Line::from(String::new()),
         Line::from(Span::styled("pipx (recommended)", head)),
-        Line::from(Span::styled("  pipx install chibi", cmd)),
+        Line::from(Span::styled("  pipx install chibi-bot", cmd)),
         Line::from(String::new()),
         Line::from(Span::styled("venv (manual)", head)),
     ];
@@ -269,7 +269,7 @@ mod tests {
     fn unix_content_lists_pipx_and_venv_commands() {
         let text = flat(&content_lines(TargetOs::Unix, &Theme::tokyo_night()));
         assert!(text.contains("not found on PATH"), "got: {text}");
-        assert!(text.contains("pipx install chibi"));
+        assert!(text.contains("pipx install chibi-bot"));
         assert!(text.contains("python3 -m venv ~/.local/share/chibi-tui/venv"));
         assert!(text.contains("~/.local/share/chibi-tui/venv/bin/pip install chibi-bot"));
         assert!(text.contains("export CHIBI_BACKEND_BIN=~/.local/share/chibi-tui/venv/bin/chibi"));
@@ -284,7 +284,7 @@ mod tests {
         assert!(text.contains(r"set CHIBI_BACKEND_BIN=%USERPROFILE%"));
         assert!(text.contains(r"set CHIBI_BACKEND_BIN=C:\path\to\chibi.exe"));
         // pipx works on Windows too, so it stays on that page as well.
-        assert!(text.contains("pipx install chibi"));
+        assert!(text.contains("pipx install chibi-bot"));
     }
 
     #[test]
