@@ -12,6 +12,7 @@
 pub mod app;
 pub mod backend;
 pub mod backend_client;
+pub mod backend_install;
 pub mod backend_settings;
 pub mod backend_store;
 pub mod clipboard;
