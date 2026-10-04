@@ -102,6 +102,73 @@ fn backend_override_prefers_env_then_existing_persisted_path() {
     );
 }
 
+/// Full gate matrix: the setup screen applies ONLY to a bare spawn failure
+/// with no effective override. The override is `CHIBI_BACKEND_BIN` (even a
+/// broken one — the user's explicit choice wins and the generic popup keeps
+/// the error text) or a persisted installer path — but only while that
+/// binary still exists; a vanished persisted path re-opens the screen so the
+/// reinstall flow can run.
+#[test]
+fn gate_matrix_env_and_live_persisted_close_the_screen_vanished_persisted_reopens() {
+    let spawn = || BackendError::Spawn {
+        program: "chibi".to_owned(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+    };
+    // 1. Nothing set: the screen applies.
+    assert!(applies(
+        &spawn(),
+        backend_override_with(None, None).as_deref()
+    ));
+    // 2. CHIBI_BACKEND_BIN set — even pointing at a nonexistent binary:
+    //    the user's explicit override closes the screen (the generic error
+    //    popup owns the message; see the backend_client test that pins the
+    //    error text naming the binary).
+    let broken_env = OsStr::new("/nonexistent/broken-chibi");
+    let override_env_only = backend_override_with(Some(broken_env), None);
+    assert!(!applies(&spawn(), override_env_only.as_deref()));
+    // 3. Env beats a live persisted path.
+    let live = std::env::temp_dir().join(format!("chibi-tui-gatemtx-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&live, b"").unwrap();
+    let override_env_and_persisted = backend_override_with(Some(broken_env), Some(live.as_path()));
+    assert_eq!(override_env_and_persisted.as_deref(), Some(broken_env));
+    assert!(!applies(&spawn(), override_env_and_persisted.as_deref()));
+    // 4. Persisted path present + binary exists: gate closed.
+    let override_persisted = backend_override_with(None, Some(live.as_path()));
+    assert!(!applies(&spawn(), override_persisted.as_deref()));
+    // 5. Persisted path present + binary vanished: the screen applies again
+    //    (reinstall flow owns the case; the stale path must not masquerade
+    //    as an override).
+    std::fs::remove_file(&live).unwrap();
+    let override_stale = backend_override_with(None, Some(live.as_path()));
+    assert_eq!(override_stale, None);
+    assert!(applies(&spawn(), override_stale.as_deref()));
+}
+
+/// Persistence integration: what the setup screen writes via the store
+/// feeds the gate exactly while the binary survives on disk.
+#[test]
+fn persisted_store_feeds_the_gate_only_while_the_binary_exists() {
+    let root = std::env::temp_dir().join(format!("chibi-tui-gatestore-{}", uuid::Uuid::new_v4()));
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bin = bin_dir.join("chibi");
+    std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+
+    // The installer flow: verify → save the store → next launch's gate.
+    backend_store::save_backend_path_at(&root, &bin).unwrap();
+    let persisted = backend_store::load_backend_path_at(&root);
+    assert_eq!(persisted.as_deref(), Some(bin.as_path()));
+    assert!(backend_override_with(None, persisted.as_deref()).is_some());
+
+    // The binary vanished (user deleted the venv / pipx uninstall): the
+    // stored path must not close the gate anymore.
+    std::fs::remove_file(&bin).unwrap();
+    let persisted = backend_store::load_backend_path_at(&root);
+    assert_eq!(backend_override_with(None, persisted.as_deref()), None);
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 /// The quit-confirm overlay renders over the setup screen without
 /// panicking and carries the shared popup text (same renderer and
 /// grammar as the in-app confirm).
