@@ -1044,4 +1044,235 @@ mod tests {
         assert!(f.python.is_none());
         assert_eq!(first_applicable_rung(&f), None);
     }
+
+    /// Probe mock that answers the canned `-c` probe codes for ANY program,
+    /// so `discover` is testable without knowing the host's candidate paths
+    /// (PATH-dependent enumeration stays opaque; only the canned answers
+    /// matter). `versions` are handed out in order, one per interpreter
+    /// probe, so the version gate's skip-to-next-candidate path is
+    /// observable too.
+    struct AnyProbe {
+        versions: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        externally_managed: Option<&'static str>,
+        pipx_version_ok: bool,
+        pipx_bin_dir: Option<&'static str>,
+    }
+
+    impl AnyProbe {
+        fn new(versions: Vec<&'static str>, externally_managed: Option<&'static str>) -> Self {
+            Self {
+                versions: std::sync::Arc::new(std::sync::Mutex::new(versions)),
+                externally_managed,
+                pipx_version_ok: false,
+                pipx_bin_dir: None,
+            }
+        }
+
+        fn with_pipx(mut self, bin_dir: Option<&'static str>) -> Self {
+            self.pipx_version_ok = true;
+            self.pipx_bin_dir = bin_dir;
+            self
+        }
+    }
+
+    impl ProbeExec for AnyProbe {
+        fn run(&self, program: &str, args: &[String]) -> BoxFuture<'static, Option<ProbeOutput>> {
+            let pipx_version_ok = self.pipx_version_ok;
+            let pipx_bin_dir = self.pipx_bin_dir;
+            let externally_managed = self.externally_managed;
+            // Version answers are handed out one per interpreter probe; the
+            // queue lives behind a shared mutex because the trait takes
+            // `&self` and returns a `'static` future (discovery is
+            // sequential, so the lock is never contended).
+            let versions = std::sync::Arc::clone(&self.versions);
+            // Match keys are computed OUTSIDE the future: the future must be
+            // 'static, and `program`/`args` only borrow the call site.
+            let is_version_probe = args.last().is_some_and(|a| a == VERSION_CODE);
+            let is_em_probe = args.last().is_some_and(|a| a == EXTERNALLY_MANAGED_CODE);
+            let is_pipx_version = program == "pipx" && args == ["--version".to_owned()];
+            let is_pipx_env = program == "pipx"
+                && args
+                    == [
+                        "environment".to_owned(),
+                        "--value".to_owned(),
+                        "PIPX_BIN_DIR".to_owned(),
+                    ];
+            Box::pin(async move {
+                let out = if is_version_probe {
+                    let mut q = versions.lock().unwrap();
+                    if q.is_empty() {
+                        None
+                    } else {
+                        Some(ProbeOutput {
+                            success: true,
+                            stdout: format!("{}\n", q.remove(0)),
+                        })
+                    }
+                } else if is_em_probe {
+                    Some(match externally_managed {
+                        Some(flag) => ProbeOutput {
+                            success: true,
+                            stdout: format!("{flag}\n"),
+                        },
+                        // Probe failure (spawn error / timeout) must read
+                        // exactly like "not externally managed".
+                        None => ProbeOutput {
+                            success: false,
+                            stdout: String::new(),
+                        },
+                    })
+                } else if is_pipx_version {
+                    Some(ProbeOutput {
+                        success: pipx_version_ok,
+                        stdout: if pipx_version_ok {
+                            "1.6.0\n".into()
+                        } else {
+                            String::new()
+                        },
+                    })
+                } else if is_pipx_env {
+                    pipx_bin_dir.map(|d| ProbeOutput {
+                        success: true,
+                        stdout: format!("{d}\n"),
+                    })
+                } else {
+                    None
+                };
+                out
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_pep668_marker_drives_the_pip_user_rung() {
+        // Externally-managed interpreter (PEP 668 marker present): the
+        // `pip --user` rung is never offered, even as a fallback.
+        let mut exec = AnyProbe::new(vec!["3.12.4"], Some("True"));
+        let f = discover(&exec, TargetOs::Unix).await;
+        assert!(f.python.is_some());
+        assert!(f.externally_managed, "marker=True must be reported");
+        assert!(!applicable_rungs(&f).contains(&Rung::PipUser));
+        assert_eq!(
+            next_applicable_rung(Rung::Venv, &f),
+            Some(Rung::BreakSystemPackages)
+        );
+
+        // Marker absent (`False`): `pip --user` becomes a legal fallback.
+        *exec.versions.lock().unwrap() = vec!["3.12.4"];
+        exec.externally_managed = Some("False");
+        let f = discover(&exec, TargetOs::Unix).await;
+        assert!(!f.externally_managed);
+        assert_eq!(next_applicable_rung(Rung::Venv, &f), Some(Rung::PipUser));
+
+        // Marker probe itself fails (no output): the safe reading is
+        // "not externally managed" — the rung stays available.
+        *exec.versions.lock().unwrap() = vec!["3.12.4"];
+        exec.externally_managed = None;
+        let f = discover(&exec, TargetOs::Unix).await;
+        assert!(!f.externally_managed);
+        assert!(applicable_rungs(&f).contains(&Rung::PipUser));
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_too_old_interpreter_and_takes_the_next_candidate() {
+        let exec = AnyProbe::new(vec!["3.9.6", "3.13.1"], Some("False"));
+        let f = discover(&exec, TargetOs::Unix).await;
+        let py = f.python.expect("second candidate must pass the gate");
+        assert_eq!(py.version, "3.13.1", "3.9.6 must be skipped by the gate");
+    }
+
+    #[tokio::test]
+    async fn pipx_shim_without_backing_install_falls_through_to_venv() {
+        // A pyenv-style shim that exits nonzero on `pipx --version` is NOT a
+        // working pipx: the ladder must not offer the pipx rung.
+        let exec = AnyProbe::new(vec!["3.12.4"], Some("False"));
+        let f = discover(&exec, TargetOs::Unix).await;
+        assert!(!f.pipx_ok);
+        assert_eq!(first_applicable_rung(&f), Some(Rung::Venv));
+        assert!(!applicable_rungs(&f).contains(&Rung::Pipx));
+    }
+
+    #[tokio::test]
+    async fn pipx_bin_dir_query_failure_keeps_the_pipx_rung() {
+        // pipx works but the PIPX_BIN_DIR query failed: the rung stays
+        // applicable, binary resolution later degrades to ~/.local/bin.
+        let exec = AnyProbe::new(vec!["3.12.4"], Some("False")).with_pipx(None);
+        let f = discover(&exec, TargetOs::Unix).await;
+        assert!(f.pipx_ok);
+        assert_eq!(f.pipx_bin_dir, None);
+        assert_eq!(first_applicable_rung(&f), Some(Rung::Pipx));
+    }
+
+    /// Full ladder-transition matrix: every (pipx availability × PEP 668)
+    /// combination, walked from the first rung to exhaustion. This pins the
+    /// complete branch surface of the fallback chain.
+    #[test]
+    fn ladder_transition_matrix_walks_every_rung_branch() {
+        let scenarios: [(bool, bool); 4] = [
+            (true, true),   // pipx + externally-managed
+            (true, false),  // pipx + not externally-managed
+            (false, true),  // no pipx + externally-managed
+            (false, false), // no pipx + not externally-managed
+        ];
+        for (pipx, em) in scenarios {
+            let f = facts(true, pipx, em);
+            let mut chain = Vec::new();
+            let mut current = first_applicable_rung(&f);
+            while let Some(rung) = current {
+                chain.push(rung);
+                current = next_applicable_rung(rung, &f);
+            }
+            // pipx first only when the probe passed; venv always present;
+            // bsp always last; pip --user only when not externally-managed.
+            assert_eq!(
+                chain.last(),
+                Some(&Rung::BreakSystemPackages),
+                "{pipx}/{em}"
+            );
+            assert!(chain.contains(&Rung::Venv), "{pipx}/{em}");
+            assert_eq!(chain.contains(&Rung::Pipx), pipx, "{pipx}/{em}");
+            assert_eq!(chain.contains(&Rung::PipUser), !em, "{pipx}/{em}");
+            assert_eq!(
+                chain.first(),
+                Some(if pipx { &Rung::Pipx } else { &Rung::Venv })
+            );
+            // Rung 4 (`--break-system-packages`) is reachable ONLY as an
+            // explicit next-step after a failed earlier rung, never as the
+            // initial offer.
+            assert_ne!(first_applicable_rung(&f), Some(Rung::BreakSystemPackages));
+        }
+        // Explicit opt-in walk: venv fails on an externally-managed
+        // interpreter → the ONLY next offer is the warned last resort.
+        let em = facts(true, false, true);
+        assert_eq!(
+            next_applicable_rung(Rung::Venv, &em),
+            Some(Rung::BreakSystemPackages)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_binary_requires_a_successful_stdio_help_run() {
+        let bin = Path::new("/fake/bin/chibi");
+        let ok = mock_with(vec![(
+            "/fake/bin/chibi",
+            vec!["stdio", "--help"],
+            true,
+            "usage: chibi stdio\n",
+        )]);
+        assert!(verify_binary(&ok, bin).await);
+
+        let failing = mock_with(vec![(
+            "/fake/bin/chibi",
+            vec!["stdio", "--help"],
+            false,
+            "",
+        )]);
+        assert!(!verify_binary(&failing, bin).await, "exit != 0 must fail");
+
+        let unreachable = mock_with(vec![]);
+        assert!(
+            !verify_binary(&unreachable, bin).await,
+            "spawn failure must fail"
+        );
+    }
 }
