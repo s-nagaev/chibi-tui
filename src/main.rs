@@ -173,7 +173,16 @@ async fn main() -> io::Result<()> {
         // loop exists, so a retry (`r` on the screen) is just another
         // connect attempt. A quit from the screen leaves the app cleanly.
         loop {
-            match chibi_tui::LiveBackend::connect(&cli.workspace).await {
+            // Spawn resolution: explicit env override → persisted install
+            // path (written by the setup screen's installer) → plain PATH.
+            // The bin dir (when persisted) also rides the child's PATH (R1-A).
+            let persisted_bin = chibi_tui::backend_store::load_backend_path();
+            let bin_dir = persisted_bin
+                .as_ref()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            match chibi_tui::LiveBackend::connect_with_bin_dir(&cli.workspace, bin_dir.as_deref())
+                .await
+            {
                 Ok(live) => {
                     app.connection = Connection::Connected;
                     // feature gates read the handshake's
@@ -185,9 +194,13 @@ async fn main() -> io::Result<()> {
                     // Spawn failure with no explicit binary override means
                     // the default `chibi` is simply absent: show the
                     // dedicated setup screen instead of the generic popup.
+                    // The override is `CHIBI_BACKEND_BIN` OR a persisted
+                    // installer path whose binary still exists — a persisted
+                    // path pointing at a vanished binary must NOT suppress
+                    // the screen (the reinstall flow owns that case).
                     // Everything else (a broken custom binary, handshake
                     // problems) keeps the old path below.
-                    let override_set = std::env::var_os("CHIBI_BACKEND_BIN");
+                    let override_set = setup_screen::backend_override();
                     if setup_screen::applies(&e, override_set.as_deref()) {
                         let mut reader = EventStream::new();
                         let flow = setup_screen::run(&mut terminal, &mut reader, &theme).await?;

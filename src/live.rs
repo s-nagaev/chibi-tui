@@ -72,6 +72,21 @@ impl LiveBackend {
         Ok(Self { pipeline, commands })
     }
 
+    /// [`LiveBackend::connect`] with an extra bin dir prepended to the
+    /// backend child's `PATH` (setup-screen R1-A): the directory of a freshly
+    /// installed `chibi` that the TUI's own `PATH` may lack. Also survives
+    /// reconnects (carried in the pipeline actor's static config).
+    pub async fn connect_with_bin_dir(
+        workspace_root: impl AsRef<Path>,
+        extra_bin_dir: Option<&Path>,
+    ) -> Result<Self, BackendError> {
+        let pipeline =
+            RequestPipeline::connect_with_bin_dir(workspace_root.as_ref(), 64, &[], extra_bin_dir)
+                .await?;
+        let commands = pipeline.commands().to_vec();
+        Ok(Self { pipeline, commands })
+    }
+
     /// Slash commands the backend advertised in the handshake `ready` frame.
     /// Empty when the peer sent no capabilities (mocks, very old backends).
     pub fn backend_commands(&self) -> &[String] {

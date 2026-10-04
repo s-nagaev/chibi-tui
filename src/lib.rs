@@ -13,6 +13,7 @@ pub mod app;
 pub mod backend;
 pub mod backend_client;
 pub mod backend_settings;
+pub mod backend_store;
 pub mod clipboard;
 pub mod config_screen;
 pub mod diag;
@@ -58,6 +59,9 @@ pub use crate::backend_settings::{
     write_generated_settings, FileMeta, Group, KeyDef, Kind, Line, SettingsDoc, SettingsError,
     ValueState, REGISTRY, VENDORED_TEMPLATE,
 };
+
+// Public re-exports: persisted backend binary path (installer handoff).
+pub use crate::backend_store::{load_backend_path, resolve_root, save_backend_path};
 
 // Public re-exports: config-screen component surface (both shells).
 pub use crate::config_screen::{

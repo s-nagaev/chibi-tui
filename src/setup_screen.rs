@@ -10,7 +10,7 @@
 //! The screen runs before the main event loop starts, so `r` needs no extra
 //! wiring: the caller just re-enters its connect attempt.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -52,6 +52,34 @@ impl TargetOs {
 /// useful part.
 pub fn applies(err: &BackendError, backend_bin_env: Option<&OsStr>) -> bool {
     matches!(err, BackendError::Spawn { .. }) && backend_bin_env.is_none()
+}
+
+/// The effective binary override for the spawn/gate decision: an explicit
+/// `CHIBI_BACKEND_BIN` env value, else the installer's persisted path — but
+/// ONLY while that binary still exists. A persisted path whose binary has
+/// vanished must NOT masquerade as an override: the gate rule requires the
+/// setup screen to still apply so the user can reinstall. Pure helper takes
+/// both inputs explicitly (unit-testable without touching process env).
+pub fn backend_override_with(
+    env: Option<&OsStr>,
+    persisted: Option<&std::path::Path>,
+) -> Option<OsString> {
+    if let Some(v) = env {
+        if !v.is_empty() {
+            return Some(v.to_owned());
+        }
+    }
+    match persisted {
+        Some(p) if p.exists() => Some(p.as_os_str().to_owned()),
+        _ => None,
+    }
+}
+
+/// [`backend_override_with`] against the live process env + persisted store.
+pub fn backend_override() -> Option<OsString> {
+    let env = std::env::var_os("CHIBI_BACKEND_BIN");
+    let persisted = crate::backend_store::load_backend_path();
+    backend_override_with(env.as_deref(), persisted.as_deref())
 }
 
 /// Outcome of the screen loop.
@@ -250,6 +278,7 @@ pub async fn run(terminal: &mut Tui, reader: &mut EventStream, theme: &Theme) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// Flatten styled lines into one plain string for substring checks.
     fn flat(lines: &[Line<'static>]) -> String {
@@ -301,6 +330,34 @@ mod tests {
         let text = flat(&content_lines(TargetOs::Unix, &Theme::tokyo_night()));
         assert!(text.contains("r retry"));
         assert!(text.contains("q/Esc quit"));
+    }
+
+    #[test]
+    fn backend_override_prefers_env_then_existing_persisted_path() {
+        // Explicit env wins, always.
+        assert_eq!(
+            backend_override_with(Some(OsStr::new("/explicit/chibi")), None),
+            Some(OsString::from("/explicit/chibi"))
+        );
+        // Persisted path counts as an override only while the binary exists.
+        let live = std::env::temp_dir().join(format!("chibi-tui-gate-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&live, b"").unwrap();
+        assert_eq!(
+            backend_override_with(None, Some(&live)),
+            Some(live.clone().into_os_string())
+        );
+        // A persisted path whose binary is gone must NOT suppress the screen.
+        assert_eq!(
+            backend_override_with(None, Some(Path::new("/no/such/chibi"))),
+            None
+        );
+        assert_eq!(backend_override_with(None, None), None);
+        // Empty env value counts as unset.
+        assert_eq!(
+            backend_override_with(Some(OsStr::new("")), Some(&live)),
+            Some(live.clone().into_os_string())
+        );
+        std::fs::remove_file(&live).ok();
     }
 
     #[test]
