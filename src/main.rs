@@ -218,7 +218,7 @@ async fn main() -> io::Result<()> {
     // configure) and under CHIBI_ENV=dev (the backend ignores the file in
     // dev mode — the editor's own banner carries the same warning).
     if !cli.mock
-        && std::env::var_os("CHIBI_ENV").is_none()
+        && !chibi_tui::config_screen::is_dev_mode()
         && !chibi_tui::config_screen::provider_key_configured()
     {
         app.mode = chibi_tui::app::Mode::ConfigEditor {

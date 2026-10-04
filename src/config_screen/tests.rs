@@ -537,16 +537,38 @@ fn screen_renders_groups_descriptions_and_dirty_marker() {
 }
 
 #[test]
-fn dev_banner_renders_when_chibi_env_dev() {
+fn dev_banner_tracks_exact_chibi_env_value() {
     // SAFETY (single-threaded test binary ordering): setting an env var for
-    // a render assertion; the render reads it per frame.
+    // a render assertion; the render reads it per frame. Both values are
+    // exercised inside ONE test — the var is process-global and the suite
+    // runs in parallel threads.
     std::env::set_var("CHIBI_ENV", "dev");
     let mut state = state_at("devbanner", "DEFAULT_MODEL=x\n");
     let rendered = render_to_string(&mut state);
-    std::env::remove_var("CHIBI_ENV");
     assert!(
         rendered.contains("CHIBI_ENV=dev"),
         "dev warning banner in the header: {rendered}"
+    );
+    // Any value other than exactly `dev` (case-insensitive) leaves the file
+    // live on the backend — the banner must NOT show and auto-open stays on.
+    std::env::set_var("CHIBI_ENV", "production");
+    let mut state = state_at("devbanner-prod", "DEFAULT_MODEL=x\n");
+    let rendered = render_to_string(&mut state);
+    std::env::set_var("CHIBI_ENV", "DEV");
+    let mut state = state_at("devbanner-upper", "DEFAULT_MODEL=x\n");
+    let rendered_upper = render_to_string(&mut state);
+    std::env::remove_var("CHIBI_ENV");
+    assert!(
+        !rendered.contains("CHIBI_ENV=dev"),
+        "no banner for CHIBI_ENV=production: {rendered}"
+    );
+    assert!(
+        !crate::config_screen::is_dev_mode(),
+        "is_dev_mode() is false for non-dev values"
+    );
+    assert!(
+        rendered_upper.contains("CHIBI_ENV=dev"),
+        "banner is case-insensitive on the value: {rendered_upper}"
     );
 }
 
@@ -571,4 +593,32 @@ fn discard_confirm_covers_save_discard_and_stay() {
     assert_eq!(action, ConfigAction::Closed);
     assert!(!state.dirty(), "discard reloaded the on-disk bytes");
     assert_eq!(state.display_value(state.rows()[state.row]), "old");
+}
+
+#[test]
+fn discard_confirm_s_is_a_save_alias() {
+    // The modal hint and HOTKEY_ROWS advertise `s/Enter save` — a bare `s`
+    // must confirm-save-and-close, not fall through as a no-op (regression:
+    // `s` used to hit the shared grammar's Swallow arm and the modal stayed
+    // open forever).
+    let mut state = state_at("discard-save", "DEFAULT_MODEL=old\n");
+    select_row(&mut state, "DEFAULT_MODEL");
+    press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    for ch in "new".chars() {
+        press(&mut state, KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut state, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(state.confirm(), Confirm::Discard);
+    let action = press(&mut state, KeyCode::Char('s'), KeyModifiers::NONE);
+    assert_eq!(
+        action,
+        ConfigAction::Save {
+            close: true,
+            overwrite: false
+        },
+        "`s` saves and closes from the Discard modal"
+    );
+    assert_eq!(state.confirm(), Confirm::None);
+    assert!(state.dirty(), "save action leaves the staged change intact");
 }

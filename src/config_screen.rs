@@ -499,11 +499,20 @@ impl ConfigState {
     }
 
     fn handle_discard_confirm(&mut self, key: KeyEvent, ctrl: bool) -> ConfigAction {
-        // `d` (discard & close) rides outside the shared two-decision grammar.
+        // `d` (discard & close) and `s` (save & close) ride outside the shared
+        // two-decision grammar — the modal hint and HOTKEY_ROWS advertise
+        // `s/Enter save · d discard · Esc/n stay`.
         if !ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
             self.reload_from_disk();
             self.note = None;
             return ConfigAction::Closed;
+        }
+        if !ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+            self.confirm = Confirm::None;
+            return ConfigAction::Save {
+                close: true,
+                overwrite: false,
+            };
         }
         match quit_decision(key) {
             QuitDecision::Confirm => {
@@ -760,6 +769,16 @@ pub fn mask_secret(value: &str) -> String {
     }
 }
 
+/// True when `CHIBI_ENV` equals `dev` (case-insensitive). This mirrors the
+/// backend's exact check (`chibi/config/app.py`: `os.getenv("CHIBI_ENV",
+/// "no-dev").lower() != "dev"` skips the settings file) — any other value
+/// leaves the file live, so no warning is shown.
+pub fn is_dev_mode() -> bool {
+    std::env::var("CHIBI_ENV")
+        .map(|v| v.eq_ignore_ascii_case("dev"))
+        .unwrap_or(false)
+}
+
 /// Render the screen (full-frame overlay for Shell B, whole terminal for
 /// Shell A). Purely visual — all key handling lives in
 /// [`ConfigState::handle_key`].
@@ -767,7 +786,7 @@ pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect)
     f.render_widget(Clear, area);
     f.render_widget(Block::default().style(Style::new().bg(theme.bg)), area);
 
-    let dev_mode = std::env::var_os("CHIBI_ENV").is_some();
+    let dev_mode = is_dev_mode();
     let mut title = " Backend configuration ".to_owned();
     if state.dirty {
         title.push_str("\u{00b7} \u{25cf} unsaved ");
