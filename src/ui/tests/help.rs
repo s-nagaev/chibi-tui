@@ -88,7 +88,8 @@ fn help_modal_scrolls_when_the_table_exceeds_the_viewport() {
     let (rows, _) = render_grid_at_with_buffer(&mut app, 120, 14);
     let joined = rows.join("\n");
     assert!(
-        joined.contains("Help (F1)") && joined.contains("scroll the list"),
+        joined.contains("reload / overwrite / cancel (file changed on disk)")
+            && joined.contains("restart now / when idle / stay (after saving)"),
         "last rows visible at the bottom clamp: {joined}"
     );
     assert!(

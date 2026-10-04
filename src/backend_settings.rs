@@ -102,6 +102,7 @@ impl Eol {
 /// rebuilt from their fields.
 ///
 /// The `Debug` impl is manual and redacts `value` (secrets invariant).
+#[derive(Clone)]
 pub struct KeyLine {
     /// Complete raw text of the record, including EOLs of all its physical
     /// lines (a double-quoted value may span several lines).
@@ -146,6 +147,7 @@ impl fmt::Debug for KeyLine {
 /// A line of the settings file. `Banner` marks the `# ====…` frame lines used
 /// as section anchors; `Other` holds non-key, non-comment junk lines that
 /// python-dotenv would ignore — they are preserved verbatim.
+#[derive(Clone)]
 pub enum Line {
     Blank { raw: String },
     Banner { raw: String },
@@ -217,6 +219,7 @@ impl Eq for ValueState {}
 
 /// Line-preserving document: parse → edit → render, with byte-exact
 /// round-trips for untouched lines.
+#[derive(Clone)]
 pub struct SettingsDoc {
     lines: Vec<Line>,
     bom: bool,

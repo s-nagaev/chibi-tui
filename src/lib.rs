@@ -14,6 +14,7 @@ pub mod backend;
 pub mod backend_client;
 pub mod backend_settings;
 pub mod clipboard;
+pub mod config_screen;
 pub mod diag;
 pub mod history;
 pub mod input;
@@ -56,4 +57,10 @@ pub use crate::backend_settings::{
     settings_base_dir, settings_path, stat_settings, validate_doc, validate_value,
     write_generated_settings, FileMeta, Group, KeyDef, Kind, Line, SettingsDoc, SettingsError,
     ValueState, REGISTRY, VENDORED_TEMPLATE,
+};
+
+// Public re-exports: config-screen component surface (both shells).
+pub use crate::config_screen::{
+    provider_key_configured, resolve_settings_path, ConfigAction, ConfigState, Confirm, Flow,
+    SaveOutcome,
 };

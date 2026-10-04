@@ -393,6 +393,15 @@ pub enum Mode {
     /// dispatch-side test pins it against the real key handlers so future
     /// chords cannot silently miss the modal.
     HelpViewing { state: HelpModalState },
+    /// The F2 backend-configuration editor modal is open — a full-frame
+    /// editor over `~/chibi-bot/settings` built on the shared
+    /// [`crate::config_screen::ConfigState`] component (the SAME component
+    /// the pre-loop Shell A screen runs). Modal isolation like the popup
+    /// family: the component owns every key until Esc/F2 closes it (dirty
+    /// close asks first), Ctrl+C opens the quit confirmation. F2 toggles.
+    ConfigEditor {
+        state: crate::config_screen::ConfigState,
+    },
 }
 
 impl Mode {
@@ -916,6 +925,16 @@ pub struct App {
     /// `App::select_chat` seam). `dragging` marks the live press →
     /// release window.
     pub selection: Option<ChatSelection>,
+    /// deferred backend restart staged by the config editor's
+    /// "restart when idle" choice: consumed by the event loop once
+    /// [`App::any_busy`] turns false (the last in-flight request resolved).
+    pub config_restart_when_idle: bool,
+    /// one-shot toast arm: a config save staged a restart, so the first
+    /// successful re-handshake should surface "Configuration applied".
+    pub config_apply_pending: bool,
+    /// this session runs on mocks (`--mock`): the config editor hides the
+    /// restart offer (reconnect is a no-op there) and the auto-open skips.
+    pub mock_session: bool,
     /// the wrapped-row geometry the renderer painted THIS frame
     /// ([`ChatGeometry`]), the hit-test seam the mouse router maps
     /// cursor positions through. Refreshed on every `render_chat`;
@@ -1087,6 +1106,9 @@ impl App {
             thoughts_visible: true,
             selection: None,
             chat_geometry: None,
+            config_restart_when_idle: false,
+            config_apply_pending: false,
+            mock_session: false,
             md_cache: MarkdownCache::new(markdown::render),
             stream_prefix_cache: MarkdownCache::new(markdown::render),
         }
@@ -1342,7 +1364,8 @@ impl App {
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
-            | Mode::HelpViewing { .. } => None,
+            | Mode::HelpViewing { .. }
+            | Mode::ConfigEditor { .. } => None,
         }
     }
 
@@ -1367,7 +1390,8 @@ impl App {
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
-            | Mode::HelpViewing { .. } => self.input.lines().len(),
+            | Mode::HelpViewing { .. }
+            | Mode::ConfigEditor { .. } => self.input.lines().len(),
         };
         buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
     }
@@ -1391,7 +1415,8 @@ impl App {
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
-            | Mode::HelpViewing { .. } => return false,
+            | Mode::HelpViewing { .. }
+            | Mode::ConfigEditor { .. } => return false,
         };
         self.mode = Mode::Normal;
         // a closed modal returns keyboard ownership to
@@ -2262,6 +2287,20 @@ impl App {
             Mode::ModelPicking { state } => state.selected,
             _ => 0,
         }
+    }
+
+    /// Open the F2 backend-configuration editor modal with a pre-loaded
+    /// [`crate::config_screen::ConfigState`]. The STATE arrives from the
+    /// caller (the key dispatch loads the settings file — bin-level I/O,
+    /// same tier as the loop's persistence calls) so this entry point stays
+    /// I/O-free and tests can inject a temp-path state. Normal mode only,
+    /// like every other popup entry point; F2 on an open editor is the
+    /// toggle-close handled inside the component.
+    pub fn begin_config_editor(&mut self, state: crate::config_screen::ConfigState) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        self.mode = Mode::ConfigEditor { state };
     }
 
     /// Enter in the picker: close the popup and stage a hidden

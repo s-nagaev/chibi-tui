@@ -165,6 +165,7 @@ async fn main() -> io::Result<()> {
     let mut source = if cli.mock {
         app = chibi_tui::app::App::new(mock::initial_chats());
         app.connection = Connection::Connected; // mocks are always "up"
+        app.mock_session = true; // the config editor hides the restart offer
         Source::Mock(Box::new(chibi_tui::backend::MockBackend::new()))
     } else {
         app = bootstrap_app(restore_dir.as_deref());
@@ -209,6 +210,21 @@ async fn main() -> io::Result<()> {
     // reactively by the renderer each frame; the workspace is CLI-only
     // today, so the value never changes at runtime.
     app.workspace_root = Some(cli.workspace.to_string_lossy().into_owned());
+
+    // Auto-open the config editor (once per session, dismissable): a live
+    // session whose settings file has NO provider key configured opens the
+    // editor on startup — a warning, never a block (stdio does not fail
+    // fast on a missing config, verified). Skipped in mock mode (nothing to
+    // configure) and under CHIBI_ENV=dev (the backend ignores the file in
+    // dev mode — the editor's own banner carries the same warning).
+    if !cli.mock
+        && std::env::var_os("CHIBI_ENV").is_none()
+        && !chibi_tui::config_screen::provider_key_configured()
+    {
+        app.mode = chibi_tui::app::Mode::ConfigEditor {
+            state: chibi_tui::config_screen::ConfigState::load(true),
+        };
+    }
 
     // Single channel: backend tasks push progress events, UI consumes.
     let (event_tx, mut event_rx) = mpsc::channel::<BackendEvent>(64);
@@ -443,6 +459,11 @@ async fn run_loop(
                             // plain Enter over a full draft and send it right
                             // before shutting down.
                             let was_quit_confirm = app.quit_confirm;
+                            // the config editor's Enter belongs to the
+                            // component (value staging), never to message
+                            // submission.
+                            let was_config_editor =
+                                matches!(app.mode, Mode::ConfigEditor { .. });
 
                             handle_key(&mut app, key);
 
@@ -523,6 +544,8 @@ async fn run_loop(
                             // "send the draft underneath".
                             let enter_consumed_by_quit_confirm =
                                 was_quit_confirm && key.code == KeyCode::Enter;
+                            let enter_consumed_by_config =
+                                was_config_editor && key.code == KeyCode::Enter;
 
                             // A confirmed thread deletion removes the persisted
                             // history file (idempotent: a missing file is
@@ -535,17 +558,6 @@ async fn run_loop(
                                     eprintln!(
                                         "chibi-tui: could not delete chat history: {e}"
                                     );
-                                }
-                            }
-
-                            // Popup-requested reconnect (R).
-                            if let Some(ReconnectRequest {}) = app.reconnect_requested.take() {
-                                if !cli_mock_source(source) {
-                                    connect_live(source, &mut app, workspace, event_tx.clone()).await;
-                                } else {
-                                    // Mocks never go down; treat R as dismiss.
-                                    app.dismiss_error();
-                                    app.connection = Connection::Connected;
                                 }
                             }
 
@@ -604,6 +616,7 @@ async fn run_loop(
                                 && !enter_consumed_by_picker
                                 && !enter_consumed_by_help
                                 && !enter_consumed_by_quit_confirm
+                                && !enter_consumed_by_config
                             {
                                 let submitted = app.take_input();
                                 if let Some(submitted) = submitted {
@@ -727,6 +740,40 @@ async fn run_loop(
                     app.tick_status_message();
                     redraw.request();
                 }
+            }
+        }
+
+        // Deferred config restart: the editor's "restart when idle" choice
+        // fires once the last in-flight request resolved (any_busy false).
+        if app.config_restart_when_idle && !app.any_busy() {
+            app.config_restart_when_idle = false;
+            if !cli_mock_source(source) {
+                app.reconnect_requested = Some(ReconnectRequest {});
+            } else {
+                app.config_apply_pending = false;
+            }
+        }
+
+        // Popup-requested reconnect (R from the error popup, or the config
+        // editor's restart confirmation). Runs on EVERY loop iteration — a
+        // request staged anywhere (key arm or the deferred check above) is
+        // consumed on the same pass.
+        if let Some(ReconnectRequest {}) = app.reconnect_requested.take() {
+            if !cli_mock_source(source) {
+                connect_live(source, &mut app, workspace, event_tx.clone()).await;
+                // One-shot feedback for a config-save restart: the first
+                // successful re-handshake closes the loop ("applied"); a
+                // failed connect leaves the error popup as the surface.
+                if app.config_apply_pending {
+                    app.config_apply_pending = false;
+                    if app.connection == Connection::Connected {
+                        app.show_status("Configuration applied");
+                    }
+                }
+            } else {
+                // Mocks never go down; treat R as dismiss.
+                app.dismiss_error();
+                app.connection = Connection::Connected;
             }
         }
 

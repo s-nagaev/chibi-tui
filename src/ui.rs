@@ -146,7 +146,8 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         | Mode::SearchingAll { .. }
         | Mode::LogViewer { .. }
         | Mode::ModelPicking { .. }
-        | Mode::HelpViewing { .. } => render_input(f, app, theme, chat_column),
+        | Mode::HelpViewing { .. }
+        | Mode::ConfigEditor { .. } => render_input(f, app, theme, chat_column),
     }
     render_status(f, app, theme, rects.root[3]);
 
@@ -177,6 +178,12 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // model picker popup (rendered last).
     if matches!(app.mode, Mode::ModelPicking { .. }) {
         render_model_picker(f, app, theme);
+    }
+    // backend-configuration editor (rendered last — it owns the frame).
+    if matches!(app.mode, Mode::ConfigEditor { .. }) {
+        if let Mode::ConfigEditor { state } = &mut app.mode {
+            crate::config_screen::render(f, state, theme, f.area());
+        }
     }
     // keybindings help modal (rendered last).
     if matches!(app.mode, Mode::HelpViewing { .. }) {
@@ -1629,6 +1636,11 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
     },
     HotkeyRow {
         group: "Global",
+        chord: "F2",
+        action: "open / close the backend configuration editor",
+    },
+    HotkeyRow {
+        group: "Global",
         chord: "Ctrl+C",
         action: "cancel the active request · quit when idle (confirmation)",
     },
@@ -1976,6 +1988,66 @@ pub const HOTKEY_ROWS: &[HotkeyRow] = &[
         group: "Help (F1)",
         chord: "F1 · Esc",
         action: "close",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "↑ / ↓ · j / k",
+        action: "move the row selection",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "← / →",
+        action: "switch the key group",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "PgUp / PgDn",
+        action: "page the rows",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "g / G",
+        action: "jump to the first / last row",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "Enter · Space",
+        action: "edit the value · toggle booleans",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "Backspace",
+        action: "delete backwards while editing",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "v",
+        action: "reveal the secret while editing",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "s",
+        action: "save the settings file",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "Esc · F2",
+        action: "close (asks when there are unsaved changes)",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "s/Enter · d · Esc/n",
+        action: "save / discard / stay (closing unsaved)",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "y/Enter · d · Esc/n",
+        action: "restart now / when idle / stay (after saving)",
+    },
+    HotkeyRow {
+        group: "Config editor (F2)",
+        chord: "r · o · Esc",
+        action: "reload / overwrite / cancel (file changed on disk)",
     },
 ];
 

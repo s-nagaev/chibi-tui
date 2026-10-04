@@ -58,6 +58,7 @@ src/
 ├── protocol.rs         serde types of IDE protocol v1 (internally tagged; ProtocolVersion parses only the literal 1)
 ├── backend_client.rs   child-process lifecycle: spawn, handshake, JSONL framing, stderr → diag log
 ├── backend_settings.rs lossless dotenv engine + key registry for ~/chibi-bot/settings (config screen core; + validation, template generation, atomic save; tests in backend_settings/tests/)
+├── config_screen.rs    shared config-screen component (state + render + key handler) for both shells: Shell B = Mode::ConfigEditor in-app modal, Shell A = config_screen::run pre-loop screen (+ tests in config_screen/tests/)
 ├── request_pipeline.rs request correlation, targeted cancel, status/agent_event broadcast, reconnect; one owner actor task
 ├── live.rs             LiveBackend: real backend source; frames → BackendEvent; wire ids: thread = i64 UUID hash, request = u64 stand-in
 ├── backend.rs          Backend trait + MockBackend + BackendEvent — the seam the UI consumes
