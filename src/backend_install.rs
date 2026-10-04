@@ -512,7 +512,7 @@ pub async fn verify_binary(exec: &dyn ProbeExec, binary: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Bounded tail of streamed installer output (ANSI-stripped, CR-split).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LogTail {
     lines: VecDeque<String>,
     cap: usize,
@@ -588,8 +588,8 @@ pub enum InstallOutcome {
 /// Handle over a running install: shared log tail, cancel flag, completion.
 pub struct InstallHandle {
     pub log: Arc<Mutex<LogTail>>,
-    cancel_flag: Arc<AtomicBool>,
-    done: oneshot::Receiver<InstallOutcome>,
+    pub cancel_flag: Arc<AtomicBool>,
+    pub done: oneshot::Receiver<InstallOutcome>,
 }
 
 impl InstallHandle {

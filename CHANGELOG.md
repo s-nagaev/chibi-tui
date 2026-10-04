@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Full missing-backend onboarding: when the backend binary is missing, the setup screen now probes for a usable Python (>=3.11,<4) and pipx **by execution** (never by binary name — stock macOS `/usr/bin/python3` is 3.9.6), offers a one-click install from an owner-approved ladder (pipx → TUI-owned venv under the platform data dir → `pip --user` only when the interpreter is not externally-managed → `--break-system-packages` as an explicitly warned last resort), streams installer output into a live tail pane with Esc-cancel and Ctrl+C quit-anyway, verifies the installed binary by running `stdio --help`, and then unconditionally opens the backend config screen before respawning.
+- Persisted backend binary path store (`<data>/chibi-tui/backend.json`): the spawn path resolves `CHIBI_BACKEND_BIN` → persisted install path → PATH, and the resolved bin dir is injected into the backend child's `PATH` (also across reconnects). A persisted path whose binary has vanished does not suppress the setup screen.
+
+### Fixed
+
+- The setup screen's pipx hint installed the wrong package (`pipx install chibi`); it now reads `pipx install chibi-bot`.
+
 ## [0.4.0] - 2026-09-28
 
 ### Changed

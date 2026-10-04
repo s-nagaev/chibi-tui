@@ -205,10 +205,31 @@ async fn main() -> io::Result<()> {
                         let mut reader = EventStream::new();
                         let flow = setup_screen::run(&mut terminal, &mut reader, &theme).await?;
                         drop(reader);
-                        if flow == setup_screen::Flow::Quit {
-                            return Ok(()); // user quit from the setup screen
+                        match flow {
+                            setup_screen::Flow::Quit => {
+                                return Ok(()); // user quit from the setup screen
+                            }
+                            setup_screen::Flow::Installed => {
+                                // Unconditional handoff (BYOK): after a
+                                // verified install the backend config screen
+                                // always opens — running without keys would
+                                // be pointless. Save-and-close respawns the
+                                // backend; cancel keeps the quit semantics.
+                                let mut cfg_reader = EventStream::new();
+                                let cfg_flow = chibi_tui::config_screen::run(
+                                    &mut terminal,
+                                    &mut cfg_reader,
+                                    &theme,
+                                )
+                                .await?;
+                                drop(cfg_reader);
+                                if cfg_flow == chibi_tui::config_screen::Flow::Cancelled {
+                                    return Ok(());
+                                }
+                                continue; // respawn the backend with the new config
+                            }
+                            setup_screen::Flow::Retry => continue, // r: re-attempt the spawn
                         }
-                        continue; // r: re-attempt the spawn
                     }
                     app.connection = Connection::Disconnected;
                     app.show_error(format!("{e}\n(hint: use --mock for the offline demo mode)"));
