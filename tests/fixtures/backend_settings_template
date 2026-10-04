@@ -1,0 +1,531 @@
+# Vendored canonical copy of the backend settings template (Chibi backend, chibi-bot).
+# Source file: chibi/config_generator.py, DEFAULT_CONFIG f-string body.
+# Source branch: main, commit: 14495621940c01a51ebea89a502ddd57ed988d90 (Chore: Release 1.18.0 #128).
+# Snapshot date: 2026-10-04.
+# NEVER edit the template body here: fix upstream and re-copy.
+# The provenance header above is stripped by generation and by the drift-guard
+# test (everything before the first '# Chibi Agent Configuration File' line).
+# Chibi Agent Configuration File
+# Chibi comes fully preconfigured with a set of optimal parameters.
+# However, for security reasons, its access to the file system is DISABLED by default.
+
+# If you only need a chatbot without access to your PC’s file system, just set the following values:
+# • TELEGRAM_BOT_TOKEN
+# • USERS_WHITELIST - enter your nickname or Telegram user ID here; you can also specify multiple
+#                     nicknames or IDs separated by commas for everyone who should have access to your bot
+# • at least one LLM provider key, for example, OPENAI_API_KEY
+# That’s it, you’re awesome! :) The chatbot is ready to launch!
+
+# For advanced usage (agent mode), you additionally need to set:
+# • FILESYSTEM_ACCESS=true
+# • ENABLE_MCP_STDIO=true (optional but recommended)
+
+# Official documentation: https://chibi.bot/configuration
+
+# ============================================================================
+#                                PLEASE NOTE
+#                    If you change the value of a setting,
+#              please make sure that this setting is uncommented
+#                   (does not contain a leading `#` symbol).
+# ============================================================================
+
+# ============================================================================
+# 1. GETTING STARTED (Required)
+# ============================================================================
+
+# Telegram bot token (REQUIRED) - Get one from @BotFather on Telegram
+TELEGRAM_BOT_TOKEN=
+
+# Comma-separated list of Telegram user IDs or nicnames allowed to interact with the bot
+# Example: "123456789,987654321,@FooBar"
+USERS_WHITELIST=
+
+# Comma-separated list of Telegram group IDs where the bot can operate
+# Example: "-1001234567890,-1009876543210"
+GROUPS_WHITELIST=
+
+
+# ============================================================================
+# 2. LLM PROVIDERS (At least one required for private mode)
+# ============================================================================
+
+# GPT-5.2, Whisper, Dall-E, etc. https://platform.openai.com/api-keys
+OPENAI_API_KEY=
+
+# Claude models. https://console.anthropic.com/settings/keys
+ANTHROPIC_API_KEY=
+
+# Gemini, Nano Banana, Imagen models. https://makersuite.google.com/app/apikey
+GEMINI_API_KEY=
+
+# Grok from xAI. https://console.x.ai/
+GROK_API_KEY=
+
+# Mistral, Magistral, Codestral, etc. https://console.mistral.ai/
+MISTRALAI_API_KEY=
+
+# Qwen, Wan models. https://modelstudio.console.alibabacloud.com?tab=playground#/api-key
+ALIBABA_API_KEY=
+
+# Deepseek-chat, deepseek-reasoner. https://platform.deepseek.com/api_keys
+DEEPSEEK_API_KEY=
+
+# MiniMax models. https://www.minimax.io
+MINIMAX_API_KEY=
+
+# Kimi models. https://platform.moonshot.cn/
+MOONSHOTAI_API_KEY=
+
+# Zhipu AI, GLM models. https://z.ai/manage-apikey/apikey-list
+ZHIPUAI_API_KEY=
+
+# OpenRouter models. https://openrouter.ai/keys
+OPENROUTER_API_KEY=
+
+# Kimi, GLM, MiniMax and other open models. https://melious.ai
+MELIOUS_API_KEY=
+
+# Open-source models served in EU data centres. https://lyceum.technology
+LYCEUM_API_KEY=
+
+# GLM, Kimi, DeepSeek and other open models in the EU. https://greenpt.com
+GREENPT_API_KEY=
+
+# Open-source and community models (GLM, Qwen, etc.). https://novita.ai
+NOVITA_AI_API_KEY=
+
+# Xiaomi MiMo models. https://xiaomimimo.com
+MIMO_API_KEY=
+
+# Budget inference for open models (GLM, DeepSeek). https://cheaperinference.com
+CHEAPERINFERENCE_API_KEY=
+
+# Open-source models from DeepInfra. https://deepinfra.com
+DEEPINFRA_API_KEY=
+
+# Open-source models from Together AI. https://together.ai
+TOGETHER_API_KEY=
+
+# Fast inference for open models. https://fireworks.ai
+FIREWORKS_API_KEY=
+
+# Token Factory open-model inference. https://tokenfactory.nebius.com
+NEBIUS_API_KEY=
+
+# Open-source model inference. https://baseten.co
+BASETEN_API_KEY=
+
+# Fast inference for open models. https://cloud.sambanova.ai
+SAMBANOVA_API_KEY=
+
+# Open-source models from SiliconFlow. https://siliconflow.com
+SILICONFLOW_API_KEY=
+
+# DeepSeek and open-model inference. https://parasail.io
+PARASAIL_API_KEY=
+
+# Llama and open-model inference. https://featherless.ai
+FEATHERLESS_API_KEY=
+
+# DeepSeek, GLM and other open models. https://entrim.ai
+ENTRIM_API_KEY=
+
+# Open-source models from Cloudflare. Chat-only. https://dash.cloudflare.com/profile/api-tokens
+CLOUDFLARE_API_KEY=
+# Cloudflare account ID. Required if CLOUDFLARE_API_KEY set.
+CLOUDFLARE_ACCOUNT_ID=
+
+# Custom OpenAI API key (for local/self-hosted models)
+CUSTOMOPENAI_API_KEY=
+# Custom OpenAI URL (default: http://localhost:1234/v1)
+CUSTOMOPENAI_URL=http://localhost:1234/v1
+
+
+# ============================================================================
+# 3. MEDIA PROVIDERS
+# ============================================================================
+
+# API key for unofficial Suno API music generation service. https://sunoapi.org
+SUNO_API_ORG_API_KEY=
+
+# ElevenLabs API key for text-to-speech. https://elevenlabs.io/app/settings/api-keys
+ELEVEN_LABS_API_KEY=
+
+
+# ============================================================================
+# 4. STORAGE CONFIGURATION
+# ============================================================================
+
+# LOCAL STORAGE (DEFAULT)
+LOCAL_DATA_PATH={DATA_DIR.absolute()}
+
+# REDIS STORAGE (if set, the local storage setting will be ignored)
+# Format: redis://[:password@]host[:port][/db][?option=value]
+# REDIS=
+
+# Password for Redis (optional, use if your Redis requires separate auth)
+# REDIS_PASSWORD=
+
+# File storage backend for uploaded files: local or telegram (default: telegram)
+FILE_STORAGE=telegram
+
+# AWS DYNAMODB STORAGE (if set, the local storage and redis setting will be ignored)
+AWS_REGION=
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+
+# DynamoDB table name for users
+DDB_USERS_TABLE=
+# DynamoDB table name for messages
+DDB_MESSAGES_TABLE=
+
+
+# ============================================================================
+# 4.1 INFINITE CONTEXT (ChromaDB)
+# ============================================================================
+
+# Enable infinite context via ChromaDB vector storage (default: false)
+ENABLE_INFINITE_CONTEXT=false
+
+# ChromaDB host (leave empty for embedded mode)
+CHROMA_HOST=
+
+# ChromaDB port (default: 8000)
+CHROMA_PORT=8000
+
+# ChromaDB history retention in days (default: 180)
+CHROMA_HISTORY_RETENTION_DAYS=180
+
+# Number of memories to retrieve per search (default: 5)
+MEMORY_SEARCH_LIMIT=5
+
+# Embedding function provider: LOCAL, OPENAI, GEMINI, MISTRALAI, or JINA (default: LOCAL)
+EMBEDDING_FUNCTION=LOCAL
+
+# Embedding model (optional, provider-specific)
+# EMBEDDING_MODEL=
+
+# Batch token limit for context retrieval (default: 30000)
+BATCH_TOKEN_LIMIT=30000
+
+
+# ============================================================================
+# 5. AGENT CAPABILITIES
+# ============================================================================
+
+# Allow AI agent to access the filesystem (default: false)
+FILESYSTEM_ACCESS=false
+
+# Allow AI agent to delegate tasks to sub-agents (default: true)
+ALLOW_DELEGATION=true
+
+# Timeout in seconds for delegated sub-agent tasks (default: None — no timeout)
+#DELEGATE_TASK_TIMEOUT=600
+
+# AI agent home directory (default: ~/chibi-bot/home)
+HOME_DIR={HOME_DIR.absolute()}
+
+# AI agent working directory (default: ~/chibi-bot/home)
+WORKING_DIR={HOME_DIR.absolute()}
+
+# Absolute path to directory with USER custom skills
+# (built-in skills ship inside the package and are loaded automatically;
+#  this directory is only for your own custom skill files)
+SKILLS_DIR={SKILLS_DIR.absolute()}
+
+
+# ============================================================================
+# 6. MCP CONFIGURATION (Model Context Protocol)
+# ============================================================================
+
+# Enable MCP SSE (Server-Sent Events) connections (default: true)
+ENABLE_MCP_SSE=true
+
+# Enable MCP stdio (standard input/output) connections (default: false)
+ENABLE_MCP_STDIO=false
+
+
+# ============================================================================
+# 7. WHITELISTS AND RESTRICTIONS
+# ============================================================================
+
+# Comma-separated list of allowed models
+# Example: "gpt-5.2,claude-sonnet-4-5-20250929,models/gemini-2.5-pro"
+MODELS_WHITELIST=
+
+# Comma-separated list of disallowed models (ignored if MODELS_WHITELIST is also set)
+# Example: "gpt-5.1,gpt-5.3"
+MODELS_BLACKLIST=
+
+# Comma-separated list of allowed tools
+# Example: "run_command_in_terminal,delegate_task,create_file"
+TOOLS_WHITELIST=
+
+# Comma-separated list of users allowed to generate images
+# Example: "123456789,987654321"
+IMAGE_GENERATIONS_WHITELIST=
+
+# Hide model options in UI (default: false)
+HIDE_MODELS=false
+
+# Hide imagine commands (default: false)
+HIDE_IMAGINE=false
+
+
+# ============================================================================
+# 8. BEHAVIOR SETTINGS
+# ============================================================================
+
+# Custom LLM role/persona text (injected into the master agent's prompt)
+# LLM_ROLE=
+
+# Default LLM model to use when not specified
+# Example: "gpt-5.2,claude-sonnet-4-5-20250929,models/gemini-2.5-pro"
+DEFAULT_MODEL=
+
+# Default LLM provider to use when not specified
+# Example: "DeepSeek"
+DEFAULT_PROVIDER=
+
+# Sampling temperature for LLM responses (0.0-2.0, default: 1.0)
+# Higher values increase randomness, lower values make responses more deterministic
+TEMPERATURE=1.0
+
+# Maximum number of tokens in LLM responses (default: 32000)
+MAX_TOKENS=32000
+
+# Penalty for token frequency in LLM responses (0.0-2.0, default: 0.0)
+# Higher values reduce repetition
+FREQUENCY_PENALTY=0.0
+
+# Penalty for token presence in LLM responses (0.0-2.0, default: 0.0)
+# Higher values encourage new topics
+PRESENCE_PENALTY=0.0
+
+# Backoff factor for API retry exponential backoff (default: 0.5)
+BACKOFF_FACTOR=0.5
+
+# Number of retry attempts for failed API calls (default: 3)
+RETRIES=3
+
+# Timeout in seconds for API calls (default: 180)
+TIMEOUT=180
+
+
+# ============================================================================
+# 9. IMAGE GENERATION SETTINGS
+# ============================================================================
+
+# Monthly image generation limit per user (0 = unlimited, default: 0)
+IMAGE_GENERATIONS_LIMIT=0
+
+# Number of image choices to generate (1-4, default: 1)
+IMAGE_N_CHOICES=1
+
+# Image quality: standard, hd, low, medium, high, or auto (default: auto)
+IMAGE_QUALITY=auto
+
+# Image aspect ratio for generation (default: 16:9)
+IMAGE_ASPECT_RATIO=16:9
+
+# Image size for OpenAI DALL-E provider (default: 1536x1024)
+IMAGE_SIZE_OPENAI=1536x1024
+
+# Image size for Nano Banana provider: 1K, 2K, or 4K (default: 2K)
+IMAGE_SIZE_NANO_BANANA=2K
+
+# Image size for Imagen provider: 1K or 2K (default: 2K)
+IMAGE_SIZE_IMAGEN=2K
+
+# Image size for Alibaba provider (default: 1664*928)
+IMAGE_SIZE_ALIBABA=1664*928
+
+
+# ============================================================================
+# 10. PROVIDER SELECTION
+# ============================================================================
+
+# Default speech-to-text provider. Please ensure that the provider you set is available
+# Example: "OpenAI"
+# STT_PROVIDER=
+
+# Default speech-to-text model
+# Example: whisper-1
+# STT_MODEL=
+
+# Default text-to-speech provider
+# Example: "elevenlabs"
+# TTS_PROVIDER=
+
+# Default text-to-speech model
+# Example: "eleven_multilingual_v2"
+# TTS_MODEL=
+
+# Default text-to-speech voice
+# TTS_VOICE=
+
+# Default vision provider
+# Example: "OpenAI"
+# VISION_PROVIDER=
+
+# Default vision model
+# Example: "gpt-5-mini"
+# VISION_MODEL=
+
+# Default OCR provider
+# Example: "Gemini"
+# OCR_PROVIDER=
+
+# Default content moderation provider
+# Example: "Gemini"
+# MODERATION_PROVIDER=
+
+# Default content moderation model
+# Example: "models/gemini-2.5-flash"
+# MODERATION_MODEL=
+
+
+# ============================================================================
+# 11. CONVERSATION SETTINGS
+# ============================================================================
+
+# Maximum age of conversation history in minutes before cleanup (default: 360)
+MAX_CONVERSATION_AGE_MINUTES=360
+
+# Automatically summarize and retry once when a provider reports context overflow.
+# This reactive safety net complements the proactive MAX_HISTORY_TOKENS threshold. (default: true)
+REACTIVE_CONTEXT_RECOVERY=true
+
+# Threshold (in tokens) of the real provider-reported prompt size at which the
+# conversation is auto-summarized. This value reflects the ENTIRE outgoing request
+# (system prompt + activated skills + tool schemas + tool-call arguments +
+# per-message structural overhead + conversation content), NOT the old
+# history-only estimate. The old default was 64000 and measured only conversation
+# content+role; the real figure is ~4.8x larger for an identical conversation, so
+# the default was re-based to 100000 to protect the smallest commonly-supported
+# context window (128k): the threshold sits below it (~78%) so summarization fires
+# before a 128k model overflows, while leaving ~50% headroom on a 200k window.
+# MIGRATION: if you previously set MAX_HISTORY_TOKENS explicitly, your old value
+# is now ~4.8x too small for the new (truthful) metric. Re-tune it upward by ~5x
+# (e.g. 64000 -> 100000) unless you intentionally want more aggressive summarization.
+MAX_HISTORY_TOKENS=100000
+
+
+# ============================================================================
+# 12. SEARCH CAPABILITIES
+# ============================================================================
+
+# Google Custom Search API key
+# Get from: https://developers.google.com/custom-search/v1/overview
+# GOOGLE_SEARCH_API_KEY=
+
+# Google Custom Search Engine ID
+# Get from: https://programmablesearchengine.google.com/
+# GOOGLE_SEARCH_CX=
+
+
+# ============================================================================
+# 13. TELEGRAM ADVANCED
+# ============================================================================
+
+# Base URL for Telegram Bot API (default: https://api.telegram.org/bot)
+TELEGRAM_BASE_URL=https://api.telegram.org/bot
+
+# Base URL for Telegram file downloads (default: https://api.telegram.org/file/bot)
+TELEGRAM_BASE_FILE_URL=https://api.telegram.org/file/bot
+
+# Allow other bots to interact with this bot (default: false)
+ALLOW_BOTS=false
+
+# Webapp URL for Telegram Mini App (optional)
+# WEBAPP_URL=
+
+# Only answer direct messages (not group messages) (default: true)
+ANSWER_DIRECT_MESSAGES_ONLY=true
+
+# Display name for the bot (default: Chibi)
+BOT_NAME=Chibi
+
+# Message shown to users not in whitelist (default: shown below)
+MESSAGE_FOR_DISALLOWED_USERS=You're not allowed to interact with me, sorry. Contact my owner first, please.
+
+
+# ============================================================================
+# 14. HEARTBEAT MONITORING
+# ============================================================================
+
+# Heartbeat check URL (for monitoring bot availability)
+# HEARTBEAT_URL=
+
+# Heartbeat frequency in seconds (minimum: 30, default: 60)
+HEARTBEAT_FREQUENCY_CALL=60
+
+# Heartbeat retry count (default: 3)
+HEARTBEAT_RETRY_CALLS=3
+
+# Heartbeat proxy URL
+# HEARTBEAT_PROXY=
+
+
+# ============================================================================
+# 15. INFLUXDB METRICS
+# ============================================================================
+
+# InfluxDB URL for metrics collection
+# INFLUXDB_URL=
+
+# InfluxDB token for authentication
+# INFLUXDB_TOKEN=
+
+# InfluxDB organization
+# INFLUXDB_ORG=
+
+# InfluxDB bucket for metrics
+# INFLUXDB_BUCKET=
+
+
+# ============================================================================
+# 16. LOGGING AND DEBUGGING
+# ============================================================================
+
+# Log prompt data (for debugging, default: false)
+LOG_PROMPT_DATA=false
+
+# Show LLM reasoning/thought process (default: false)
+SHOW_LLM_THOUGHTS=false
+
+
+# ============================================================================
+# 17. GENERAL SETTINGS
+# ============================================================================
+
+# General proxy URL for all API calls
+# PROXY=
+
+# Enable public mode (default: false)
+PUBLIC_MODE=false
+
+
+# ============================================================================
+# 18. SCHEDULER
+# ============================================================================
+
+# Enable the AI agent scheduling tool (creating and managing scheduled jobs)
+SCHEDULER_TOOL_ENABLED=true
+
+# Allow scheduled jobs to send static notify messages to you without waking
+# up the agent (default: false)
+SCHEDULER_NOTIFY_ENABLED=false
+
+# Allow shell commands to be executed by scheduled jobs (default: false)
+SCHEDULER_AGENT_COMMANDS_ENABLED=false
+
+# Upper limit for a per-job shell command timeout in seconds (default: 900)
+SCHEDULER_COMMAND_TIMEOUT_MAX=900
+
+# Default misfire grace time in seconds: a missed run is executed once if it is
+# at most this many seconds late (default: 3600)
+SCHEDULER_MISFIRE_GRACE_TIME=3600
+
+# Notify you when a scheduled job fails (default: true)
+SCHEDULER_FAILURE_NOTIFY=true
