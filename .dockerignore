@@ -8,3 +8,6 @@ target
 docs
 examples
 tests
+# src/backend_settings.rs includes this fixture via include_str!(), so it must
+# stay in the Docker build context even though the rest of tests/ is excluded.
+!tests/fixtures/backend_settings_template
