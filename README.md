@@ -142,7 +142,7 @@ modules (`keymap/tests.rs`, `mouse/tests.rs`, `app/tests/`, `ui/tests/`, and
 | `Ctrl+L` | Stop the running request of the current chat behind a confirmation popup (`Enter`/`y` confirm, `Esc`/`n` cancel; a no-op when idle; on backends without `/stop` support a toast explains instead) |
 | `Shift+Ctrl+L` | Reset the current thread behind a confirmation popup (same confirm/cancel keys): the thread's history is dropped and the local dialog cleared, both while running and when idle (on legacy terminals this degrades to `Ctrl+L` — type `/reset` at the prompt instead) |
 | `F1` | Toggle the keybindings help modal — a centered, scrollable popup listing every active chord |
-| `F2` | Open the backend configuration editor — a full-frame editor for `~/chibi-bot/settings`: grouped keys, secret values masked (`v` reveals only while editing), `Enter` edits / `Space` toggles booleans, `s` saves (atomic write with backup). After a save on a live session it offers a backend restart (`y`/`Enter` now, `d` when idle, `Esc`/`n` stay). `Esc`/`F2` closes (asks when there are unsaved changes) |
+| `F2` | Open the backend configuration editor: a full-frame editor for `~/chibi-bot/settings` with grouped keys, `Enter` to edit a value, `Space` to toggle booleans and `s` to save (atomic write with backup). Secret values are masked; `v` reveals them only while editing. After a save on a live session it offers a backend restart (`y`/`Enter` now, `d` when idle, `Esc`/`n` stay). `Esc`/`F2` closes and asks when there are unsaved changes |
 
 > **Keyboard layouts:** all `Ctrl`-chords work under the Russian (ЙЦУКЕН)
 > and Ukrainian keyboard layouts — the app normalizes the layout character
