@@ -4,14 +4,16 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] - 2026-10-04
+## [0.5.0] - 2026-10-09
 
 ### Added
 
-- Full missing-backend onboarding: when the backend binary is missing, the setup screen now probes for a usable Python (>=3.11,<4) and pipx **by execution** (never by binary name — stock macOS `/usr/bin/python3` is 3.9.6), offers a one-click install from an owner-approved ladder (pipx → TUI-owned venv under the platform data dir → `pip --user` only when the interpreter is not externally-managed → `--break-system-packages` as an explicitly warned last resort), streams installer output into a live tail pane with Esc-cancel and Ctrl+C quit-anyway, verifies the installed binary by running `stdio --help`, and then unconditionally opens the backend config screen before respawning.
-- Persisted backend binary path store (`<data>/chibi-tui/backend.json`): the spawn path resolves `CHIBI_BACKEND_BIN` → persisted install path → PATH, and the resolved bin dir is injected into the backend child's `PATH` (also across reconnects). A persisted path whose binary has vanished does not suppress the setup screen.
-- Backend settings editor driven by a lossless dotenv engine: parse/render is byte-exact (quoting, comments, CRLF, BOM, missing trailing newline all preserved), per-row validation mirrors the backend's import rules, and saves are atomic (temp + fsync + rename, `.bak` backup, chmod 600) with an external-change guard. Available as an F2 modal over a live session (with restart-now / restart-when-idle) and as a full-screen editor that opens right after onboarding; it also auto-opens on startup when no provider key is configured (skipped in mock mode and under `CHIBI_ENV=dev`). Secret values render masked and are only revealed explicitly during editing.
-- A hermetic PTY end-to-end harness (`tests/e2e_onboarding_harness.py`) driving the real binary through the whole onboarding flow offline (fake interpreter/pipx probes + the deterministic fake backend) and optionally live (real isolated `pipx install chibi-bot`).
+- Missing-backend onboarding: when the backend binary is absent, the setup screen probes for a usable Python (>=3.11,<4) and pipx by execution (stock macOS `/usr/bin/python3` is 3.9.6) and verifies the installed binary by running `stdio --help`.
+- Install ladder: pipx → TUI-owned venv under the platform data dir → `pip --user` (only when the interpreter is not externally-managed) → `--break-system-packages` as a last resort. Installer output streams into a live tail pane; `Esc` cancels the install and `Ctrl+C` quits anyway. The backend config screen opens before respawning.
+- Persisted backend binary path store (`<data>/chibi-tui/backend.json`): the spawn path resolves `CHIBI_BACKEND_BIN` → persisted install path → PATH, and the resolved bin dir is injected into the backend child's `PATH`, including across reconnects. A persisted path whose binary has vanished does not suppress the setup screen.
+- Backend settings editor driven by a lossless dotenv engine: parse/render is byte-exact (quoting, comments, CRLF, BOM and missing trailing newline are preserved), per-row validation mirrors the backend's import rules, and saves are atomic (temp + fsync + rename, `.bak` backup, chmod 600) with an external-change guard.
+- Two editor shells: an F2 modal over a live session (after a save it offers a backend restart now or when idle) and a full-screen editor that opens right after onboarding. The editor also opens on startup when no provider key is configured (skipped in mock mode and under `CHIBI_ENV=dev`). Secret values render masked and are only revealed explicitly during editing.
+- PTY end-to-end harness (`tests/e2e_onboarding_harness.py`) driving the real binary through the onboarding flow offline (fake interpreter/pipx probes plus the deterministic fake backend) and optionally live (real isolated `pipx install chibi-bot`).
 
 ### Fixed
 
