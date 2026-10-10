@@ -28,10 +28,17 @@ fn open_editor(app: &mut chibi_tui::app::App, path: PathBuf) {
     ));
 }
 
-/// FILESYSTEM_ACCESS is the FIRST row of the Core behaviour group (registry
-/// order), so ←→×3 + one Enter toggles it without any row hunting.
+/// FILESYSTEM_ACCESS is the FIRST row of the Core behaviour group. The group
+/// is reached by navigating RELATIVE to its position in `Group::ALL` (not a
+/// hardcoded arrow count), so registry re-orderings — like the 2231ad1
+/// Integrations insertion — cannot silently land the selection on the wrong
+/// group and leave the target key untogglable.
 fn stage_a_bool_toggle(app: &mut chibi_tui::app::App) {
-    for _ in 0..3 {
+    let steps = chibi_tui::backend_settings::Group::ALL
+        .iter()
+        .position(|g| *g == chibi_tui::backend_settings::Group::CoreBehaviour)
+        .expect("CoreBehaviour is listed in Group::ALL");
+    for _ in 0..steps {
         press(app, KeyCode::Right, KeyModifiers::NONE);
     }
     press(app, KeyCode::Enter, KeyModifiers::NONE);
