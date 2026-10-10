@@ -699,6 +699,23 @@ pub struct ChatGeometry {
     pub rows: Vec<ChatRowMeta>,
 }
 
+/// Render-fed geometry seam for sidebar clicks (same pattern as
+/// [`ChatGeometry`]): the inner rect of the sidebar's list block — its
+/// border rows and side columns are NOT list rows — plus the
+/// [`ratatui::widgets::ListState`] offset read AFTER
+/// `render_stateful_widget`, because ratatui scrolls the list internally
+/// when threads overflow and the offset must come from the state object,
+/// never be recomputed from the active index. Refreshed on every
+/// `render_sidebar`; like [`App::chat_geometry`] it is session-only view
+/// state with no explicit reset path — a fresh frame simply overwrites it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarGeometry {
+    /// Inner rect of the sidebar list block (borders excluded).
+    pub inner: Rect,
+    /// First visible thread row at snapshot time (post-render list offset).
+    pub offset: usize,
+}
+
 impl ChatGeometry {
     /// Map a terminal position onto a document [`SelectionPoint`].
     /// `None` outside the chat pane's inner rect or with no rows (the
@@ -941,6 +958,11 @@ pub struct App {
     /// rejected by consumers when its `chat_id` no longer matches the
     /// active thread.
     pub chat_geometry: Option<ChatGeometry>,
+    /// Render-fed sidebar geometry for click-to-select-a-thread
+    /// ([`SidebarGeometry`]), the same session-only view-state pattern as
+    /// [`App::chat_geometry`]: written by `ui::render_sidebar` each frame,
+    /// read by the mouse router, never persisted.
+    pub sidebar_geometry: Option<SidebarGeometry>,
     /// Content-keyed cache of rendered markdown lines
     /// ([`MarkdownCache`], plan D1): a finalized message renders exactly
     /// once per `(content, theme)` pair instead of being re-parsed and
@@ -1106,6 +1128,7 @@ impl App {
             thoughts_visible: true,
             selection: None,
             chat_geometry: None,
+            sidebar_geometry: None,
             config_restart_when_idle: false,
             config_apply_pending: false,
             mock_session: false,
@@ -1137,7 +1160,9 @@ impl App {
     /// the entered chat's own [`Chat::last_thoughts`], so the view follows
     /// the thread by construction. Every selection mutation (arrows, ^N,
     /// search jump, delete/clone ack, restore activation) goes through here.
-    fn select_chat(&mut self, index: usize) {
+    /// Public because the mouse router (compiled into the bin crate too)
+    /// uses it as the click-to-select live-switching parity path.
+    pub fn select_chat(&mut self, index: usize) {
         self.active = index.min(self.chats.len().saturating_sub(1));
         if let Some(chat) = self.chats.get_mut(self.active) {
             chat.unread = false;

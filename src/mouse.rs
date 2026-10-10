@@ -7,7 +7,7 @@
 //! keeps the keyboard/mode dispatch in the same shape.
 
 use crossterm::event::{MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use chibi_tui::app::{Focus, Mode};
 use chibi_tui::ui;
@@ -54,6 +54,16 @@ pub enum WheelSurface {
 ///   selection too, and a release is finalized anywhere in the base
 ///   surface — the cursor commonly leaves the pane before the button
 ///   comes up;
+/// - a left PRESS in the sidebar (same Normal-mode, popup-free gate) is
+///   click-to-select: the render-fed `App::sidebar_geometry` seam maps
+///   the row to a thread (`offset + (y - inner.y)`) and switches to it
+///   live, like the sidebar's arrow keys, and focus moves to the
+///   sidebar; below the last thread only the focus moves; a click on the
+///   block's border/divider rows changes nothing. A sidebar press is
+///   never the start of a drag selection;
+/// - a left PRESS anywhere else on the base surface (input block,
+///   spinner, hints) keeps the plain-click selection semantics and moves
+///   focus to the chat, so typing goes to the prompt;
 /// - the F2 config-editor modal (`Mode::ConfigEditor`) routes wheel AND
 ///   left clicks to the shared lib entry point
 ///   `ConfigState::handle_mouse`, which hit-tests the pane under the
@@ -145,10 +155,12 @@ pub fn handle_mouse_with_copy(
         }
         WheelSurface::Panels => {
             let rects = ui::layout_rects(area, app.input_lines_height());
-            // Selection presses/drags/releases are Normal-mode-only and
-            // popup-free: popups (confirm dialogs, rename, search) and the
-            // error popup own the whole screen — the pointer must not draw
-            // a selection under them, and events under them are swallowed
+            // Selection presses/drags/releases AND the click targets
+            // (sidebar thread clicks, click-to-focus chat/input) are
+            // Normal-mode-only and popup-free: popups (confirm dialogs,
+            // rename, search) and the error popup own the whole screen —
+            // the pointer must not draw a selection, switch threads, nor
+            // move focus under them, and events under them are swallowed
             // (same isolation as the keyboard). A selection started before
             // a popup opened stays held underneath; a stale live drag is
             // harmless — the next Normal-mode click or Esc clears it.
@@ -185,19 +197,58 @@ pub fn handle_mouse_with_copy(
                     }
                 }
                 MouseEventKind::Down(crossterm::event::MouseButton::Left) if selectable => {
-                    let in_chat =
-                        ui::panel_region(&rects, mouse.column, mouse.row) == ui::PanelRegion::Chat;
-                    let point = in_chat.then(|| {
-                        app.chat_geometry
-                            .as_ref()
-                            .and_then(|g| g.position_at(mouse.column, mouse.row))
-                    });
-                    match point.flatten() {
-                        Some(point) => app.begin_selection(point),
-                        // A press outside the chat pane is a plain click:
-                        // it clears the selection (the release completes
-                        // the click; nothing live to release).
-                        None => app.clear_selection(),
+                    match ui::panel_region(&rects, mouse.column, mouse.row) {
+                        ui::PanelRegion::Sidebar => {
+                            // Click-to-select a thread through the
+                            // render-fed `App::sidebar_geometry` seam —
+                            // the same live switching as the sidebar's
+                            // arrow keys, but without requiring focus.
+                            // Border/divider rows are not list rows: a
+                            // click there changes nothing at all.
+                            let hit = app.sidebar_geometry.as_ref().and_then(|geo| {
+                                geo.inner
+                                    .contains(Position {
+                                        x: mouse.column,
+                                        y: mouse.row,
+                                    })
+                                    .then(|| geo.offset + (mouse.row - geo.inner.y) as usize)
+                            });
+                            if let Some(idx) = hit {
+                                if idx < app.chats.len() {
+                                    app.select_chat(idx);
+                                }
+                                // Below the last thread the click only
+                                // moves focus (no selection change); on a
+                                // thread row it also switches threads.
+                                app.focus = Focus::Sidebar;
+                                // A sidebar press is a click, never the
+                                // start of a drag selection — and like
+                                // every press outside the chat pane it
+                                // clears any held selection.
+                                app.clear_selection();
+                            }
+                        }
+                        // Chat pane and everything else (input block,
+                        // spinner, hints): the press keeps its existing
+                        // selection semantics and additionally moves
+                        // focus to the chat — typing goes to the prompt.
+                        _ => {
+                            app.focus = Focus::Chat;
+                            let in_chat = ui::panel_region(&rects, mouse.column, mouse.row)
+                                == ui::PanelRegion::Chat;
+                            let point = in_chat.then(|| {
+                                app.chat_geometry
+                                    .as_ref()
+                                    .and_then(|g| g.position_at(mouse.column, mouse.row))
+                            });
+                            match point.flatten() {
+                                Some(point) => app.begin_selection(point),
+                                // A press outside the chat pane is a plain click:
+                                // it clears the selection (the release completes
+                                // the click; nothing live to release).
+                                None => app.clear_selection(),
+                            }
+                        }
                     }
                 }
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left) if selectable => {

@@ -1231,3 +1231,329 @@ fn config_mode_mouse_never_touches_selection_or_copy() {
         "the editor stays open"
     );
 }
+
+// ---- base-surface clicks: sidebar thread select + click-to-focus --------
+
+use chibi_tui::app::Focus;
+use chibi_tui::popup::ErrorPopup;
+
+/// Render one frame of the base surface and return the buffer as a grid
+/// of lines, one per terminal row. Same dynamic locate-panes technique as
+/// the config-screen tests: positions are found in the rendered buffer
+/// because the dev banner (`CHIBI_ENV=dev` leaking between parallel
+/// tests) shifts every pane down by one row.
+fn render_base_grid(app: &mut chibi_tui::app::App) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(WHEEL_AREA.width, WHEEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| chibi_tui::ui::draw(f, app, &chibi_tui::theme::Theme::tokyo_night()))
+        .unwrap();
+    let cells: Vec<String> = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_owned())
+        .collect();
+    cells
+        .chunks(WHEEL_AREA.width as usize)
+        .map(|row| row.concat())
+        .collect()
+}
+
+/// Clicking a thread row in the sidebar switches to that thread live
+/// (unread cleared, scroll reset to follow-bottom, text selection
+/// cleared — the exact `select_chat` side effects the arrow keys have)
+/// and moves focus to the sidebar, without the sidebar holding focus
+/// beforehand.
+#[test]
+fn sidebar_click_selects_the_thread_and_focuses_the_sidebar() {
+    let mut app = app_with_chats(3);
+    app.chats[2].unread = true;
+    app.scroll_up(6);
+    let grid = render_base_grid(&mut app);
+    let y = grid_row(&grid, "chat-2");
+    let x = grid[y].find("chat-2").unwrap() as u16;
+
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            x,
+            y as u16,
+        ),
+        WHEEL_AREA,
+    );
+
+    assert_eq!(app.active, 2, "the click switched to the clicked thread");
+    assert_eq!(app.focus, Focus::Sidebar, "the click focused the sidebar");
+    assert!(
+        !app.chats[2].unread,
+        "select_chat cleared the unread marker"
+    );
+    assert_eq!(
+        app.scroll, 0,
+        "live switching reset the scroll to follow-bottom"
+    );
+    assert!(
+        app.selection.is_none(),
+        "no text selection from a sidebar click"
+    );
+}
+
+/// A click below the last thread (still inside the list block) moves
+/// focus to the sidebar but changes no thread selection.
+#[test]
+fn sidebar_click_below_the_last_thread_only_moves_focus() {
+    let mut app = app_with_chats(3);
+    let grid = render_base_grid(&mut app);
+    let last = grid_row(&grid, "chat-2") as u16;
+
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            last + 5,
+        ),
+        WHEEL_AREA,
+    );
+
+    assert_eq!(app.active, 0, "below the last thread: no selection change");
+    assert_eq!(app.focus, Focus::Sidebar, "focus still moves");
+    assert!(app.selection.is_none());
+}
+
+/// Clicks on the list block's border rows or side columns are not list
+/// rows: nothing changes at all — no selection, no focus move.
+#[test]
+fn sidebar_click_on_a_border_or_divider_changes_nothing() {
+    let mut app = app_with_chats(3);
+    let grid = render_base_grid(&mut app);
+    // The ` Chats ` title rides the block's TOP border row; the item row
+    // gives us a row to hit the LEFT border column on.
+    let top_border = grid_row(&grid, "Chats") as u16;
+    let item_row = grid_row(&grid, "chat-1") as u16;
+
+    // Top border row of the block (past the title text).
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            top_border,
+        ),
+        WHEEL_AREA,
+    );
+    // Left border column on a thread row.
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            0,
+            item_row,
+        ),
+        WHEEL_AREA,
+    );
+
+    assert_eq!(app.active, 0, "border clicks never switch threads");
+    assert_eq!(app.focus, Focus::Chat, "border clicks never move focus");
+    assert!(app.selection.is_none());
+}
+
+/// With more threads than fit the sidebar, ratatui scrolls the list
+/// internally; the click must map through the render-fed offset, so the
+/// row visually above the selected thread is that thread's neighbour —
+/// without the seam offset this click would hit a wrong chat.
+#[test]
+fn sidebar_click_uses_the_render_fed_offset_when_the_list_scrolls() {
+    let mut app = app_with_chats(40);
+    app.active = 38; // force the list's internal scroll
+    let grid = render_base_grid(&mut app);
+    // The chat pane's title line (`#39/40 · chat-38`) also mentions the
+    // thread name; the SIDEBAR row is the last occurrence.
+    let y38 = grid
+        .iter()
+        .rposition(|line| line.contains("chat-38"))
+        .expect("chat-38 row on screen") as u16;
+    assert!(
+        y38 >= 2,
+        "precondition: found the sidebar row, not the title"
+    );
+
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            y38 - 1,
+        ),
+        WHEEL_AREA,
+    );
+
+    assert_eq!(
+        app.active, 37,
+        "the visually adjacent row maps to chat-37 via the seam offset"
+    );
+    assert_eq!(app.focus, Focus::Sidebar);
+}
+
+/// A press in the chat pane moves focus to the chat (click-to-focus) and
+/// the drag-selection pipeline flows exactly as before.
+#[test]
+fn chat_pane_press_moves_focus_to_chat_and_selection_still_works() {
+    let mut app = app_with_chats(1);
+    app.chats[0]
+        .messages
+        .push(Message::assistant("hello world from selection"));
+    app.focus = Focus::Sidebar;
+    render_for_geometry(&mut app);
+
+    let copied = std::cell::RefCell::new(Vec::<String>::new());
+    {
+        let sink = &copied;
+        let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                27,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        assert_eq!(app.focus, Focus::Chat, "the press focused the chat");
+        assert!(
+            app.selection.as_ref().is_some_and(|s| s.dragging),
+            "the press still starts the live drag"
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                38,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                40,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+    }
+    assert_eq!(
+        copied.borrow().as_slice(),
+        ["hello world"],
+        "the release copied the selected plain text as before"
+    );
+}
+
+/// A press on the input region (input editor block / status lines) moves
+/// focus to the chat — typing goes to the prompt — and never starts a
+/// selection.
+#[test]
+fn input_region_click_moves_focus_to_chat() {
+    let mut app = app_with_chats(1);
+    app.focus = Focus::Sidebar;
+    render_for_geometry(&mut app);
+
+    // Input editor block row (chrome rows 37..39 of the 120x40 frame).
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            60,
+            38,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(
+        app.focus,
+        Focus::Chat,
+        "clicking the input block focuses the chat"
+    );
+    assert!(app.selection.is_none());
+}
+
+/// Under the quit-confirm popup and in non-Normal modes, clicks change
+/// nothing: no thread switch, no focus move — the same `selectable` gate
+/// that swallows selection presses swallows the new click targets too.
+#[test]
+fn base_surface_clicks_are_swallowed_under_popups_and_non_normal_modes() {
+    let mut app = app_with_chats(3);
+    let grid = render_base_grid(&mut app);
+    let y = grid_row(&grid, "chat-2") as u16;
+
+    // Quit-confirm popup (a flag, not a Mode).
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(app.quit_confirm, "precondition: popup open");
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            y,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(app.active, 0, "sidebar click swallowed under the popup");
+    assert_eq!(app.focus, Focus::Chat, "focus unchanged under the popup");
+    assert!(app.quit_confirm, "the click must not disturb the popup");
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.quit_confirm, "popup dismissed for the next phase");
+
+    // Non-Normal mode: the delete-confirm popup owns the screen.
+    press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(app.mode, Mode::ConfirmDelete, "precondition: modal open");
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            y,
+        ),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            60,
+            10,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(app.active, 0, "no thread switch under the modal");
+    assert_eq!(app.mode, Mode::ConfirmDelete, "the modal stays open");
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    // Error popup up: clicks are swallowed here too.
+    app.error_popup = Some(ErrorPopup::new("boom"));
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            y,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(app.active, 0, "no thread switch under the error popup");
+    assert_eq!(
+        app.focus,
+        Focus::Chat,
+        "focus unchanged under the error popup"
+    );
+    assert!(
+        app.error_popup.is_some(),
+        "the click must not dismiss the popup"
+    );
+}

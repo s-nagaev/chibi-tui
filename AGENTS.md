@@ -51,7 +51,7 @@ src/
 ├── main.rs             bin-level controller: tokio event loop, submit/queue, persistence + last-thread tracking, CLI
 ├── keymap.rs           keyboard dispatch (bin): key events → app actions, Cyrillic Ctrl-chord normalization
 ├── keymap/tests.rs     keyboard-dispatch tests (topic submodules incl. Cyrillic chords)
-├── mouse.rs            mouse handling (bin): wheel scrolling across surfaces, chat-pane text selection, config-editor wheel/click routing
+├── mouse.rs            mouse handling (bin): wheel scrolling across surfaces, chat-pane text selection, sidebar thread clicks + click-to-focus on the base panels, config-editor wheel/click routing
 ├── mouse/tests.rs      mouse-handling tests
 ├── tests.rs + tests/   main.rs's bin-level tests: bootstrap, send_submitted, terminal_restore (+ support helpers)
 ├── lib.rs              library root; module tree + public re-exports

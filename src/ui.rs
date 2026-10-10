@@ -285,7 +285,7 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// corners) rendered inside the existing sidebar rect — the former divider
 /// column is the right border, the frame edge column hosts the left one —
 /// so the outer frame dimensions and the hit-test rects are unchanged.
-fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let sidebar_focused = app.focus == Focus::Sidebar;
     let items: Vec<ListItem> = app
         .chats
@@ -342,35 +342,49 @@ fn render_sidebar(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         })
         .collect();
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(if sidebar_focused {
-                    // Emphasis: the focused sidebar's outline lifts to blue.
-                    theme.blue
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if sidebar_focused {
+            // Emphasis: the focused sidebar's outline lifts to blue.
+            theme.blue
+        } else {
+            theme.selection
+        }))
+        .title(Span::styled(
+            " Chats ",
+            Style::new()
+                .fg(if sidebar_focused {
+                    // Emphasis: title switches from blue to cyan.
+                    theme.cyan
                 } else {
-                    theme.selection
-                }))
-                .title(Span::styled(
-                    " Chats ",
-                    Style::new()
-                        .fg(if sidebar_focused {
-                            // Emphasis: title switches from blue to cyan.
-                            theme.cyan
-                        } else {
-                            theme.blue
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .style(Style::new().bg(theme.panel)),
-        )
+                    theme.blue
+                })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(theme.panel));
+    // The hit-test inner rect: the block's top border row and side
+    // columns are NOT list rows, so clicks there must not select.
+    let inner = block.inner(area);
+
+    let list = List::new(items)
+        .block(block)
         .highlight_style(Style::new().bg(theme.selection))
         .style(Style::new().bg(theme.panel));
 
     let mut state = ListState::default().with_selected(Some(app.active));
     f.render_stateful_widget(list, area, &mut state);
+
+    // Render-fed geometry seam for the mouse router (same pattern as
+    // chat_geometry): the list's inner rect plus the ListState offset
+    // AFTER the render — ratatui scrolls the list internally when threads
+    // overflow, so the offset is read from the state object, not
+    // recomputed from app.active. Refreshed every frame like
+    // chat_geometry; no explicit reset path anywhere.
+    app.sidebar_geometry = Some(crate::app::SidebarGeometry {
+        inner,
+        offset: state.offset(),
+    });
 
     // Extend the sidebar's right rounded border down through EVERY bottom
     // row: spinner + the grown editor block (1..=20 rows) + hotkey hints,
