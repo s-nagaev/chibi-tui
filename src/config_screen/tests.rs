@@ -622,3 +622,181 @@ fn discard_confirm_s_is_a_save_alias() {
     assert_eq!(state.confirm(), Confirm::None);
     assert!(state.dirty(), "save action leaves the staged change intact");
 }
+
+//------------------------------------------------------------------------
+// mouse seam: render-fed geometry
+
+/// Render one frame on a TestBackend of the given size (geometry tests).
+fn render_once_sized(state: &mut ConfigState, width: u16, height: u16) {
+    let theme = Theme::tokyo_night();
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal
+        .draw(|f| render(f, state, &theme, f.area()))
+        .expect("draw");
+}
+
+#[test]
+fn render_populates_the_geometry_snapshot() {
+    let mut state = state_at("geom", "DEFAULT_MODEL=glm-5\nFILESYSTEM_ACCESS=false\n");
+    assert!(
+        state.geometry.is_none(),
+        "no geometry before the first render"
+    );
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("geometry after the first render");
+    assert_eq!(geo.groups.x, 1, "left pane inside the outer border");
+    assert_eq!(
+        geo.groups.width, 26,
+        "left pane keeps its 26-col constraint"
+    );
+    assert_eq!(
+        geo.keys_inner.x,
+        geo.groups.x + geo.groups.width + 1,
+        "inner rows rect skips the Borders::LEFT divider column"
+    );
+    assert_eq!(geo.keys_inner.y, geo.groups.y, "panes share the top");
+    assert_eq!(
+        geo.keys_inner.height, geo.groups.height,
+        "panes share the height"
+    );
+    assert_eq!(
+        geo.visible, geo.keys_inner.height as usize,
+        "visible = pane height"
+    );
+    assert_eq!(geo.row_offset, state.row_offset, "snapshot of the offset");
+}
+
+#[test]
+fn pane_at_distinguishes_panes_divider_and_outside() {
+    let mut state = state_at("panehit", "DEFAULT_MODEL=x\n");
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("rendered");
+    assert_eq!(
+        state.pane_at(geo.groups.x, geo.groups.y),
+        Some(ConfigPane::Groups),
+        "top-left of the groups pane"
+    );
+    assert_eq!(
+        state.pane_at(geo.keys_inner.x, geo.keys_inner.y),
+        Some(ConfigPane::Rows),
+        "top-left of the rows pane"
+    );
+    assert_eq!(
+        state.pane_at(geo.keys_inner.x - 1, geo.keys_inner.y),
+        None,
+        "the Borders::LEFT divider column is neither pane"
+    );
+    assert_eq!(state.pane_at(0, 0), None, "outer border / outside");
+    assert_eq!(
+        state.pane_at(geo.groups.x, geo.groups.y + geo.groups.height),
+        None,
+        "one row below the panes"
+    );
+}
+
+#[test]
+fn mouse_selections_map_and_keep_the_offset_snapshot_consistent() {
+    let mut state = state_at("geomclick", "DEFAULT_MODEL=x\n");
+    // 12-row terminal: the routing group (12 rows) does NOT fit the ~8
+    // visible rows, so clicks must scroll the window via clamp_offset.
+    render_once_sized(&mut state, 60, 12);
+    let geo = state.geometry.expect("rendered");
+    let routing = Group::ALL
+        .iter()
+        .position(|g| *g == Group::ModelRouting)
+        .expect("Model Routing group");
+    assert!(
+        state.row_count() > geo.visible,
+        "the group overflows the pane so scrolling is exercised"
+    );
+    // Click the group row in the LEFT pane (no scroll offset there).
+    state.select_group_at(geo.groups.y + routing as u16);
+    assert_eq!(state.group_index(), routing);
+    assert_eq!(state.row, 0, "group switch resets the row");
+    assert_eq!(state.geometry.unwrap().row_offset, 0);
+    // Click 10 rows down: idx 10 selects and scrolls the window.
+    let geo = state.geometry.unwrap();
+    state.select_row_at(geo.keys_inner.y + 10);
+    assert_eq!(state.row, 10);
+    let expected_offset = 10 + 1 - geo.visible;
+    assert_eq!(
+        state.geometry.unwrap().row_offset,
+        expected_offset,
+        "snapshot follows clamp_offset"
+    );
+    // A SECOND click without a re-render maps through the refreshed
+    // snapshot: the pane top is now row `expected_offset`, not row 0.
+    let geo = state.geometry.unwrap();
+    state.select_row_at(geo.keys_inner.y);
+    assert_eq!(state.row, expected_offset);
+    assert_eq!(state.geometry.unwrap().row_offset, expected_offset);
+}
+
+#[test]
+fn select_row_at_ignores_clicks_past_the_last_row() {
+    let mut state = state_at("geombelow", "DEFAULT_MODEL=x\n");
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("rendered");
+    let last = state.row_count().saturating_sub(1);
+    state.row = last;
+    // idx == len (one past the final row) → ignored.
+    state.select_row_at(geo.keys_inner.y + state.row_count() as u16);
+    assert_eq!(state.row, last, "click one past the last row ignored");
+    // Far below the pane → ignored too.
+    state.select_row_at(geo.keys_inner.y + geo.keys_inner.height + 5);
+    assert_eq!(state.row, last, "click far below the pane ignored");
+    // Empty-group branch: with an out-of-window snapshot the mapped index
+    // is always past the last row (the same `idx >= row_count` comparison
+    // an empty group hits) → ignored.
+    state.row_offset = 1_000;
+    if let Some(geo) = &mut state.geometry {
+        geo.row_offset = 1_000;
+    }
+    state.select_row_at(geo.keys_inner.y);
+    assert_eq!(state.row, last, "unmappable index ignored");
+}
+
+#[test]
+fn select_group_at_ignores_out_of_range_and_routes_in_range() {
+    let mut state = state_at("geomgroup", "DEFAULT_MODEL=x\n");
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("rendered");
+    let n = Group::ALL.len();
+    state.select_group_at(geo.groups.y);
+    assert_eq!(state.group_index(), 0, "first group row selects group 0");
+    // Out of range (delta-based switch_group would wrap!) → ignored ENTIRELY.
+    state.select_group_at(geo.groups.y + n as u16 + 2);
+    assert_eq!(state.group_index(), 0, "below the last group ignored");
+    assert_eq!(state.row, 0);
+    state.select_group_at(geo.groups.y.saturating_sub(1));
+    assert_eq!(state.group_index(), 0, "above the pane ignored");
+    // In range → routed through switch_group.
+    let target = 2;
+    state.select_group_at(geo.groups.y + target as u16);
+    assert_eq!(state.group_index(), target);
+    assert_eq!(state.row, 0, "group switch resets the row");
+}
+
+#[test]
+fn mouse_seam_is_a_no_op_before_the_first_render() {
+    let mut state = state_at("geomnoop", "DEFAULT_MODEL=x\n");
+    assert!(state.geometry.is_none());
+    state.select_row_at(5);
+    state.select_group_at(1);
+    assert_eq!(state.pane_at(0, 0), None, "no geometry → no hit");
+    assert_eq!(state.row, 0);
+    assert_eq!(state.group_index(), 0);
+}
+
+#[test]
+fn geometry_is_cloned_but_excluded_from_equality() {
+    let mut a = state_at("geomeq", "DEFAULT_MODEL=x\n");
+    render_once_sized(&mut a, 110, 30);
+    let b = a.clone();
+    assert!(b.geometry.is_some(), "Clone copies the geometry");
+    assert_eq!(a, b, "equal states compare equal with geometry present");
+    let mut c = a.clone();
+    c.geometry = None;
+    assert_eq!(a, c, "geometry divergence does not affect PartialEq");
+}
+
