@@ -42,7 +42,8 @@ use std::io;
 use std::path::PathBuf;
 
 use crossterm::event::{
-    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -862,6 +863,64 @@ impl ConfigState {
         self.refresh_geometry_offset();
     }
 
+    /// Route one mouse event (the ONE entry point both shells share —
+    /// Shell B's [`crate::mouse`] arm and Shell A's `run` loop both
+    /// delegate here). Pure state mutation, like [`ConfigState::handle_key`].
+    ///
+    /// Routing:
+    /// - a screen-owned modal (the value-edit input or any
+    ///   [`Confirm`] variant) swallows EVERY mouse event, mirroring how
+    ///   modal surfaces consume the wheel/clicks everywhere else;
+    /// - WHEEL is routed by the pane under the cursor: over the rows pane
+    ///   the SELECTION moves by [`WHEEL_STEP`] through `row_up`/`row_down`
+    ///   (moving only `row_offset` would let the highlight scroll out of
+    ///   the visible window), over the groups pane the group selection
+    ///   moves one step per notch through the same guarded path as
+    ///   `select_group_at` (range-checked — no `rem_euclid` wraparound;
+    ///   `switch_group`'s row/row_offset reset is intended, it mirrors
+    ///   ←/→); outside both panes: no-op. The stored geometry snapshot is
+    ///   refreshed after every move so hit-tests stay consistent between
+    ///   renders;
+    /// - LEFT-BUTTON-UP clicks only SELECT (`select_row_at` /
+    ///   `select_group_at`) — no toggle-on-click, no editing, no secret
+    ///   reveal (keyboard parity);
+    /// - other buttons and press/drag/motion states are ignored (no
+    ///   drag-selection in the config screen).
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.edit.is_some() || self.confirm != Confirm::None {
+            return; // a modal owns the screen
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = mouse.kind == MouseEventKind::ScrollDown;
+                match self.pane_at(mouse.column, mouse.row) {
+                    Some(ConfigPane::Rows) => {
+                        if down {
+                            self.row_down(usize::from(WHEEL_STEP));
+                        } else {
+                            self.row_up(usize::from(WHEEL_STEP));
+                        }
+                        self.refresh_geometry_offset();
+                    }
+                    Some(ConfigPane::Groups) => {
+                        let target = self.group as isize + if down { 1 } else { -1 };
+                        if target >= 0 && (target as usize) < Group::ALL.len() {
+                            self.switch_group(if down { 1 } else { -1 });
+                            self.refresh_geometry_offset();
+                        }
+                    }
+                    None => {}
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => match self.pane_at(mouse.column, mouse.row) {
+                Some(ConfigPane::Rows) => self.select_row_at(mouse.row),
+                Some(ConfigPane::Groups) => self.select_group_at(mouse.row),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
     /// Keep the stored `row_offset` snapshot in sync after a mutation that
     /// ran [`ConfigState::clamp_offset`] (no-op while geometry is `None`).
     fn refresh_geometry_offset(&mut self) {
@@ -1307,6 +1366,18 @@ pub async fn run(terminal: &mut Tui, reader: &mut EventStream, theme: &Theme) ->
                     // restart offer is ever staged with restart_available=false).
                     _ => {}
                 }
+            }
+            Some(Ok(CtEvent::Mouse(mouse))) => {
+                // Shell A's local quit-confirmation: same parity as Shell B's
+                // app-level gate — clicks are swallowed while the popup is
+                // up, the WHEEL stays live (scrolling behind the popup is
+                // harmless, the documented Panels convention). Everything
+                // else delegates to the shared lib entry point.
+                let click = matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left));
+                if quit_confirm && click {
+                    continue;
+                }
+                state.handle_mouse(mouse);
             }
             Some(Ok(_)) => {}
             Some(Err(e)) => return Err(io::Error::other(e)),

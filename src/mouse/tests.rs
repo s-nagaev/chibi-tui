@@ -771,3 +771,463 @@ fn selection_under_quit_confirm_is_swallowed() {
     );
     assert!(app.quit_confirm, "the wheel must not disturb the popup");
 }
+
+// ---- config editor surface (Mode::ConfigEditor → WheelSurface::Config) --
+
+use chibi_tui::app::Mode;
+use chibi_tui::config_screen::ConfigState;
+
+/// An app with the F2 config editor open over a temp settings file (never
+/// the real `~/chibi-bot/settings`). Returns the app and the file path.
+fn config_app(tag: &str) -> (chibi_tui::app::App, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "chibi-tui-mouse-config-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("settings");
+    std::fs::write(&path, "DEFAULT_MODEL=glm-5\n").expect("write fixture");
+    let mut app = app_with_chats(1);
+    app.mode = Mode::ConfigEditor {
+        state: ConfigState::load_at(path.clone(), true),
+    };
+    (app, path)
+}
+
+fn config_state(app: &mut chibi_tui::app::App) -> &mut ConfigState {
+    match &mut app.mode {
+        Mode::ConfigEditor { state } => state,
+        _ => panic!("config editor must stay open"),
+    }
+}
+
+/// Render one full frame (the config editor owns it) and return the buffer
+/// as a grid of lines, one per terminal row. Positions are located
+/// dynamically because the component's `row` and its geometry fields are
+/// private AND the frame may carry the dev banner (`CHIBI_ENV=dev` leaks
+/// between parallel tests), which shifts every pane down by one row.
+fn render_config_grid(app: &mut chibi_tui::app::App) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(WHEEL_AREA.width, WHEEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| chibi_tui::ui::draw(f, app, &chibi_tui::theme::Theme::tokyo_night()))
+        .unwrap();
+    let cells: Vec<String> = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_owned())
+        .collect();
+    cells
+        .chunks(WHEEL_AREA.width as usize)
+        .map(|row| row.concat())
+        .collect()
+}
+
+/// Index of the grid row containing `needle` (the pane positions in tests).
+fn grid_row(grid: &[String], needle: &str) -> usize {
+    grid.iter()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("`{needle}` not on screen"))
+}
+
+#[test]
+fn config_mode_wheel_routes_to_the_config_editor_by_pane() {
+    let (mut app, _path) = config_app("cfgwheel");
+    let grid = render_config_grid(&mut app);
+    // Cursor inside the LEFT groups pane, on the selected group's row.
+    let gy = grid_row(&grid, "LLM Providers");
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 5, gy as u16),
+        WHEEL_AREA,
+    );
+    assert_eq!(
+        config_state(&mut app).group_index(),
+        1,
+        "one notch = one group"
+    );
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollUp, 5, gy as u16),
+        WHEEL_AREA,
+    );
+    assert_eq!(config_state(&mut app).group_index(), 0);
+    // The top edge clamps — no rem_euclid wraparound to the last group.
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollUp, 5, gy as u16),
+        WHEEL_AREA,
+    );
+    assert_eq!(config_state(&mut app).group_index(), 0);
+}
+
+#[test]
+fn config_mode_wheel_over_the_rows_pane_moves_the_selection() {
+    let (mut app, _path) = config_app("cfgrows");
+    let grid = render_config_grid(&mut app);
+    assert!(
+        grid.iter().any(|l| l.contains("▸ OPENAI_API_KEY")),
+        "row 0 starts selected"
+    );
+    // Cursor over the RIGHT rows pane, on the currently selected row:
+    // ONE notch walks the selection WHEEL_STEP = 3 rows down (OPENAI →
+    // row 3, GROK).
+    let kr = grid_row(&grid, "OPENAI_API_KEY");
+    let kc = grid[kr].find("OPENAI_API_KEY").unwrap() as u16;
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, kc, kr as u16),
+        WHEEL_AREA,
+    );
+    let after = render_config_grid(&mut app);
+    assert!(
+        after.iter().any(|l| l.contains("▸ GROK_API_KEY")),
+        "the selection moved 3 rows"
+    );
+    assert!(
+        !after.iter().any(|l| l.contains("▸ OPENAI_API_KEY")),
+        "row 0 is deselected"
+    );
+}
+
+#[test]
+fn config_mode_click_selects_the_group_under_the_cursor() {
+    let (mut app, _path) = config_app("cfgclick");
+    let grid = render_config_grid(&mut app); // populates the geometry
+                                             // Click the "Integrations" group row (group 2) in the LEFT pane.
+    let iy = grid_row(&grid, "Integrations") as u16;
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            5,
+            iy,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(config_state(&mut app).group_index(), 2);
+    // Click on the divider column between the panes → no-op.
+    let kr = grid_row(&grid, "OPENAI_API_KEY");
+    let divider = grid[kr].find("OPENAI_API_KEY").unwrap() as u16 - 3;
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            divider,
+            kr as u16,
+        ),
+        WHEEL_AREA,
+    );
+    // Click outside both panes (the outer border) → no-op.
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            0,
+            0,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(config_state(&mut app).group_index(), 2, "no-op clicks");
+}
+
+#[test]
+fn config_mode_clicks_are_swallowed_under_quit_confirm_wheel_stays_live() {
+    let (mut app, _path) = config_app("cfgquit");
+    let grid = render_config_grid(&mut app);
+    let gy = grid_row(&grid, "LLM Providers") as u16;
+    let my = grid_row(&grid, "Model Routing") as u16;
+    // Ctrl+C from the config editor opens the quit confirm (a flag, not a
+    // Mode — it renders TOPMOST over the editor).
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(app.quit_confirm, "precondition: popup open");
+
+    // A click that would select group 3 ("Model Routing") is NOT forwarded.
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            5,
+            my,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(config_state(&mut app).group_index(), 0, "click swallowed");
+    assert!(app.quit_confirm, "the click must not disturb the popup");
+
+    // The wheel stays live (the Panels convention).
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 5, gy),
+        WHEEL_AREA,
+    );
+    assert_eq!(config_state(&mut app).group_index(), 1, "wheel forwarded");
+    assert!(app.quit_confirm);
+}
+
+#[test]
+fn config_mode_mouse_is_swallowed_while_a_confirm_modal_is_open() {
+    let (mut app, path) = config_app("cfgdiscard");
+    let grid = render_config_grid(&mut app);
+    let gy = grid_row(&grid, "LLM Providers") as u16;
+    let my = grid_row(&grid, "Model Routing") as u16;
+    let kr = grid_row(&grid, "OPENAI_API_KEY") as u16;
+    // Discard: stage an edit, Esc on the dirty screen.
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    type_in(&mut app, "x");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // stage
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE); // dirty → confirm
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::Discard,
+        "precondition"
+    );
+    // Wheel and clicks anywhere (both panes) are swallowed.
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 5, gy),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            5,
+            my,
+        ),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 40, kr),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            40,
+            kr,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::Discard,
+        "modal owns the screen"
+    );
+    assert_eq!(config_state(&mut app).group_index(), 0, "groups untouched");
+    assert!(
+        config_state(&mut app).dirty(),
+        "mouse never dismissed nor saved"
+    );
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE); // stay
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::None
+    );
+
+    // Restart: a clean save stages the restart offer (idle variant).
+    {
+        let state = config_state(&mut app);
+        assert_eq!(
+            state.perform_save(false),
+            chibi_tui::config_screen::SaveOutcome::Saved
+        );
+        state.after_save(false);
+    }
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::Restart,
+        "precondition"
+    );
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 5, gy),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            5,
+            my,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::Restart
+    );
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE); // stay
+
+    // RestartBusy: the same offer with a request in flight.
+    config_state(&mut app).after_save(true);
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::RestartBusy
+    );
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 5, gy),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            5,
+            my,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::RestartBusy
+    );
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    // FileChanged: the file changes on disk between load and save — the
+    // write guard opens the reload/overwrite modal.
+    std::fs::write(&path, "DEFAULT_MODEL=external\n").expect("external edit");
+    assert_eq!(
+        config_state(&mut app).perform_save(false),
+        chibi_tui::config_screen::SaveOutcome::ChangedOnDisk,
+        "precondition"
+    );
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 5, gy),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            5,
+            my,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(
+        config_state(&mut app).confirm(),
+        chibi_tui::config_screen::Confirm::FileChanged,
+        "mouse events are swallowed under every confirm variant"
+    );
+    assert_eq!(config_state(&mut app).group_index(), 0);
+}
+
+#[test]
+fn config_mode_mouse_is_swallowed_while_the_edit_input_is_open() {
+    let (mut app, _path) = config_app("cfgedit");
+    let grid = render_config_grid(&mut app);
+    let kr = grid_row(&grid, "OPENAI_API_KEY") as u16;
+    let kc = grid[kr as usize].find("OPENAI_API_KEY").unwrap() as u16;
+    // Enter on the selected OPENAI_API_KEY row (a secret) opens the editor;
+    // the footer then advertises the edit hints.
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        render_config_grid(&mut app)
+            .iter()
+            .any(|l| l.contains("v to reveal")),
+        "editor open"
+    );
+
+    // Wheel and clicks anywhere — including a group row that would switch
+    // the group — change nothing while the editor owns the screen.
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, 5, kr),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            5,
+            kr,
+        ),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        wheel(MouseEventKind::ScrollDown, kc, kr),
+        WHEEL_AREA,
+    );
+    handle_mouse(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            kc,
+            kr,
+        ),
+        WHEEL_AREA,
+    );
+    assert_eq!(config_state(&mut app).group_index(), 0, "groups untouched");
+    assert!(
+        !config_state(&mut app).dirty(),
+        "the mouse never staged anything"
+    );
+    assert!(
+        render_config_grid(&mut app)
+            .iter()
+            .any(|l| l.contains("v to reveal")),
+        "editor stays open"
+    );
+}
+
+#[test]
+fn config_mode_mouse_never_touches_selection_or_copy() {
+    let (mut app, _path) = config_app("cfgnocopy");
+    let _ = render_config_grid(&mut app);
+    let copied = std::cell::RefCell::new(Vec::<String>::new());
+    {
+        let sink = &copied;
+        let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
+        // A full press/drag/release over the (base-surface) chat pane:
+        // config mode routes to WheelSurface::Config, which only ever
+        // SELECTS rows/groups — no drag head, no release copy.
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                30,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                40,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+        handle_mouse_with_copy(
+            &mut app,
+            button(
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                42,
+                2,
+            ),
+            WHEEL_AREA,
+            &copy,
+        );
+    }
+    assert!(app.selection.is_none(), "no selection state in config mode");
+    assert!(copied.borrow().is_empty(), "nothing copied in config mode");
+    assert!(
+        matches!(app.mode, Mode::ConfigEditor { .. }),
+        "the editor stays open"
+    );
+}

@@ -800,3 +800,277 @@ fn geometry_is_cloned_but_excluded_from_equality() {
     assert_eq!(a, c, "geometry divergence does not affect PartialEq");
 }
 
+//------------------------------------------------------------------------
+// mouse handling: wheel + click routing (the shared lib entry point)
+
+/// Hand-built mouse event at a terminal position, as crossterm delivers it.
+fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn wheel_over_the_rows_pane_moves_the_selection_with_clamping() {
+    let mut state = state_at("mouserows", "DEFAULT_MODEL=x\n");
+    // 60x12: the pane shows ~8 of the 31 provider rows, so both the
+    // selection movement and the window scrolling are exercised.
+    render_once_sized(&mut state, 60, 12);
+    let geo = state.geometry.expect("rendered");
+    let visible = geo.keys_inner.height.max(1) as usize;
+    assert!(state.row_count() > visible, "the group overflows the pane");
+    let cx = geo.keys_inner.x + geo.keys_inner.width / 2;
+    let cy = geo.keys_inner.y + 1;
+
+    // One down-notch moves the SELECTION by WHEEL_STEP (not the window).
+    state.handle_mouse(mouse_at(MouseEventKind::ScrollDown, cx, cy));
+    assert_eq!(state.row, 3, "wheel down = +WHEEL_STEP rows");
+    assert_eq!(
+        state.geometry.unwrap().row_offset,
+        0,
+        "window untouched yet"
+    );
+
+    // Six more notches: row 21, the window follows via clamp_offset and the
+    // stored snapshot is refreshed WITHOUT a re-render.
+    for _ in 0..6 {
+        state.handle_mouse(mouse_at(MouseEventKind::ScrollDown, cx, cy));
+    }
+    assert_eq!(state.row, 21);
+    let expected_offset = 21 + 1 - visible;
+    assert_eq!(
+        state.geometry.unwrap().row_offset,
+        expected_offset,
+        "snapshot follows clamp_offset between renders"
+    );
+
+    // Wheel up past the top clamps the selection at row 0 (no underflow).
+    for _ in 0..10 {
+        state.handle_mouse(mouse_at(MouseEventKind::ScrollUp, cx, cy));
+    }
+    assert_eq!(state.row, 0, "top edge clamps");
+    assert_eq!(state.geometry.unwrap().row_offset, 0);
+
+    // ...and wheel down past the bottom clamps at the last row.
+    for _ in 0..20 {
+        state.handle_mouse(mouse_at(MouseEventKind::ScrollDown, cx, cy));
+    }
+    assert_eq!(state.row, state.row_count() - 1, "bottom edge clamps");
+    let expected_offset = state.row_count() - visible;
+    assert_eq!(state.geometry.unwrap().row_offset, expected_offset);
+}
+
+#[test]
+fn wheel_over_the_groups_pane_moves_the_group_selection() {
+    let mut state = state_at("mousegroups", "DEFAULT_MODEL=x\n");
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("rendered");
+    let cx = geo.groups.x;
+    let cy = geo.groups.y;
+
+    // Park the selection mid-group first: the group switch must reset it.
+    press(&mut state, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut state, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut state, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(state.row, 3);
+
+    state.handle_mouse(mouse_at(MouseEventKind::ScrollDown, cx, cy));
+    assert_eq!(state.group_index(), 1, "one notch = one group");
+    assert_eq!(state.row, 0, "group switch resets the row (mirrors →)");
+    assert_eq!(state.row_offset, 0, "and the window offset too");
+
+    state.handle_mouse(mouse_at(MouseEventKind::ScrollDown, cx, cy));
+    assert_eq!(state.group_index(), 2);
+    // Wheel up twice lands on group 0 and CLAMPS there — no rem_euclid
+    // wraparound to the last group.
+    state.handle_mouse(mouse_at(MouseEventKind::ScrollUp, cx, cy));
+    state.handle_mouse(mouse_at(MouseEventKind::ScrollUp, cx, cy));
+    assert_eq!(state.group_index(), 0);
+    state.handle_mouse(mouse_at(MouseEventKind::ScrollUp, cx, cy));
+    assert_eq!(state.group_index(), 0, "top edge clamps, no wrap");
+}
+
+#[test]
+fn click_selects_rows_and_groups_through_handle_mouse() {
+    let mut state = state_at("mouseclick", "DEFAULT_MODEL=x\n");
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("rendered");
+
+    // Click the 4th group row in the LEFT pane.
+    state.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        geo.groups.x,
+        geo.groups.y + 3,
+    ));
+    assert_eq!(state.group_index(), 3);
+
+    // Click the 3rd visible row in the RIGHT pane.
+    state.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        geo.keys_inner.x,
+        geo.keys_inner.y + 2,
+    ));
+    assert_eq!(state.row, 2);
+
+    // The Borders::LEFT divider column is neither pane → no-op.
+    state.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        geo.keys_inner.x - 1,
+        geo.keys_inner.y,
+    ));
+    assert_eq!(state.row, 2);
+
+    // Outside both panes (the outer border) → no-op.
+    state.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 0, 0));
+    assert_eq!(state.row, 2);
+
+    // One past the last row → ignored (out-of-range rule, not clamped).
+    state.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        geo.keys_inner.x,
+        geo.keys_inner.y + state.row_count() as u16,
+    ));
+    assert_eq!(state.row, 2);
+
+    // A stale snapshot that cannot map to a row (the empty-group branch of
+    // the out-of-range rule) → ignored too.
+    state.row_offset = 1_000;
+    if let Some(geo) = &mut state.geometry {
+        geo.row_offset = 1_000;
+    }
+    state.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        geo.keys_inner.x,
+        geo.keys_inner.y,
+    ));
+    assert_eq!(state.row, 2);
+}
+
+#[test]
+fn mouse_events_are_noops_before_the_first_render() {
+    let mut state = state_at("mousenogeom", "DEFAULT_MODEL=x\n");
+    assert!(state.geometry.is_none());
+    state.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 10, 5));
+    state.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 10, 5));
+    assert_eq!(state.row, 0);
+    assert_eq!(state.group_index(), 0);
+}
+
+#[test]
+fn mouse_events_are_swallowed_while_the_edit_input_is_open() {
+    let mut state = state_at("mouseedit", "DEFAULT_MODEL=x\n");
+    select_row(&mut state, "DEFAULT_MODEL");
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("rendered");
+    press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(state.edit.is_some(), "precondition: editor open");
+
+    // Wheel and clicks anywhere — even on a group row — change nothing.
+    state.handle_mouse(mouse_at(
+        MouseEventKind::ScrollDown,
+        geo.groups.x,
+        geo.groups.y,
+    ));
+    state.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        geo.groups.x,
+        geo.groups.y + 4,
+    ));
+    state.handle_mouse(mouse_at(
+        MouseEventKind::ScrollUp,
+        geo.keys_inner.x,
+        geo.keys_inner.y,
+    ));
+    state.handle_mouse(mouse_at(
+        MouseEventKind::Up(MouseButton::Left),
+        geo.keys_inner.x,
+        geo.keys_inner.y,
+    ));
+    assert_eq!(
+        state.group_index(),
+        Group::ALL
+            .iter()
+            .position(|g| *g == Group::ModelRouting)
+            .unwrap()
+    );
+    assert_eq!(
+        state.row,
+        state
+            .rows()
+            .iter()
+            .position(|d| d.key == "DEFAULT_MODEL")
+            .unwrap()
+    );
+    assert!(state.edit.is_some(), "editor stays open");
+    assert!(!state.dirty(), "the click never staged anything");
+    assert_eq!(
+        state.doc.render(),
+        SettingsDoc::parse("DEFAULT_MODEL=x\n").render(),
+        "the document is untouched"
+    );
+}
+
+#[test]
+fn mouse_events_are_swallowed_while_each_confirm_is_open() {
+    let variants = [
+        Confirm::Discard,
+        Confirm::Restart,
+        Confirm::RestartBusy,
+        Confirm::FileChanged,
+    ];
+    for variant in variants {
+        let mut state = state_at("mouseconfirm", "DEFAULT_MODEL=x\n");
+        render_once_sized(&mut state, 110, 30);
+        let geo = state.geometry.expect("rendered");
+        state.confirm = variant;
+        state.handle_mouse(mouse_at(
+            MouseEventKind::ScrollDown,
+            geo.groups.x,
+            geo.groups.y,
+        ));
+        state.handle_mouse(mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            geo.groups.x,
+            geo.groups.y + 4,
+        ));
+        state.handle_mouse(mouse_at(
+            MouseEventKind::ScrollDown,
+            geo.keys_inner.x,
+            geo.keys_inner.y,
+        ));
+        state.handle_mouse(mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            geo.keys_inner.x,
+            geo.keys_inner.y,
+        ));
+        assert_eq!(state.confirm(), variant, "{variant:?}: modal stays open");
+        assert_eq!(state.group_index(), 0, "{variant:?}: groups untouched");
+        assert_eq!(state.row, 0, "{variant:?}: rows untouched");
+        assert!(!state.dirty(), "{variant:?}: nothing staged");
+    }
+}
+
+#[test]
+fn handle_mouse_ignores_other_buttons_and_press_states() {
+    let mut state = state_at("mouseignore", "DEFAULT_MODEL=x\n");
+    render_once_sized(&mut state, 110, 30);
+    let geo = state.geometry.expect("rendered");
+    let cx = geo.keys_inner.x;
+    let cy = geo.keys_inner.y;
+    let kinds = [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Right),
+        MouseEventKind::Up(MouseButton::Right),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Moved,
+    ];
+    for kind in kinds {
+        state.handle_mouse(mouse_at(kind, cx, cy));
+    }
+    assert_eq!(state.row, 0, "press/drag/motion never select");
+    assert_eq!(state.group_index(), 0);
+    assert!(!state.dirty());
+}
