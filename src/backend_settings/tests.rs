@@ -431,11 +431,13 @@ fn serialization_leaves_safe_values_unquoted() {
 fn registry_row_counts_match_the_approved_slice() {
     assert_eq!(Group::ProviderKeys.keys().count(), 31);
     assert_eq!(Group::MediaProviders.keys().count(), 2);
+    assert_eq!(Group::Integrations.keys().count(), 3);
     assert_eq!(Group::ModelRouting.keys().count(), 12);
-    assert_eq!(Group::CoreBehaviour.keys().count(), 12);
-    assert_eq!(Group::Restrictions.keys().count(), 4);
+    assert_eq!(Group::CoreBehaviour.keys().count(), 18);
+    assert_eq!(Group::Restrictions.keys().count(), 3);
     assert_eq!(Group::AgentPaths.keys().count(), 3);
-    assert_eq!(REGISTRY.len(), 64);
+    assert_eq!(Group::Service.keys().count(), 5);
+    assert_eq!(REGISTRY.len(), 77);
 }
 
 #[test]
@@ -479,6 +481,28 @@ fn registry_secrets_and_commented_flags_are_correct() {
     }
     let proxy = registry_get("PROXY").unwrap();
     assert!(proxy.commented);
+    for def in Group::Integrations.keys() {
+        assert_eq!(def.section, S12, "{} section", def.key);
+    }
+    let jina = registry_get("JINA_API_KEY").unwrap();
+    assert!(jina.secret && !jina.commented);
+    let google_key = registry_get("GOOGLE_SEARCH_API_KEY").unwrap();
+    assert!(google_key.secret && google_key.commented);
+    let google_cx = registry_get("GOOGLE_SEARCH_CX").unwrap();
+    assert!(!google_cx.secret && google_cx.commented);
+    for def in Group::Service.keys() {
+        assert!(def.commented, "{} ships commented", def.key);
+    }
+    let redis = registry_get("REDIS").unwrap();
+    assert!(redis.secret);
+    let influx_token = registry_get("INFLUXDB_TOKEN").unwrap();
+    assert!(influx_token.secret && influx_token.commented);
+    let llm_role = Group::CoreBehaviour
+        .keys()
+        .last()
+        .expect("CoreBehaviour rows");
+    assert_eq!(llm_role.key, "LLM_ROLE", "LLM_ROLE must end the group");
+    assert!(llm_role.commented && !llm_role.secret);
 }
 
 #[test]
@@ -495,6 +519,11 @@ fn registry_defaults_match_the_template() {
         ("SHOW_LLM_THOUGHTS", "false"),
         ("LOG_PROMPT_DATA", "false"),
         ("PUBLIC_MODE", "false"),
+        ("ENABLE_INFINITE_CONTEXT", "true"),
+        ("SCHEDULER_NOTIFY_ENABLED", "false"),
+        ("MAX_CONVERSATION_AGE_MINUTES", "360"),
+        ("BOT_NAME", "Chibi"),
+        ("SHOW_USAGE", "false"),
     ];
     for (key, default) in expected {
         assert_eq!(
@@ -512,10 +541,6 @@ fn registry_defaults_match_the_template() {
         registry_get("CLIENT").is_none(),
         "CLIENT must not be exposed"
     );
-    assert!(
-        registry_get("REDIS").is_none(),
-        "storage group is out of scope"
-    );
 }
 
 #[test]
@@ -529,7 +554,9 @@ fn registry_environment_names_match_the_backend_configs() {
         "CLOUDFLARE_ACCOUNT_ID",
         "SUNO_API_ORG_API_KEY",
         "ELEVEN_LABS_API_KEY",
-        "IMAGE_GENERATIONS_WHITELIST",
+        "JINA_API_KEY",
+        "GOOGLE_SEARCH_API_KEY",
+        "GOOGLE_SEARCH_CX",
     ] {
         assert!(registry_get(key).is_some(), "{} missing from registry", key);
     }

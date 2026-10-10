@@ -858,34 +858,42 @@ pub enum Group {
     ProviderKeys,
     /// Template §3 — Suno / ElevenLabs.
     MediaProviders,
+    /// Template §12 — web/search integration keys (Jina, Google Custom Search).
+    Integrations,
     /// Template §10 (+ DEFAULT_* from §8) — model & role routing.
     ModelRouting,
-    /// Core behaviour toggles & limits (§5/§6/§8/§16/§17).
+    /// Core behaviour toggles & limits (§5/§6/§8/§11/§13/§16/§17/§18/§4.1).
     CoreBehaviour,
     /// Template §7 — model/tool restriction lists.
     Restrictions,
     /// Template §5 — agent filesystem paths.
     AgentPaths,
+    /// Storage & metrics services (§4/§15) — Redis, InfluxDB.
+    Service,
 }
 
 impl Group {
-    pub const ALL: [Group; 6] = [
+    pub const ALL: [Group; 8] = [
         Group::ProviderKeys,
         Group::MediaProviders,
+        Group::Integrations,
         Group::ModelRouting,
-        Group::CoreBehaviour,
         Group::Restrictions,
+        Group::CoreBehaviour,
         Group::AgentPaths,
+        Group::Service,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Group::ProviderKeys => "Providers · API keys",
+            Group::ProviderKeys => "LLM Providers",
             Group::MediaProviders => "Media providers",
-            Group::ModelRouting => "Model & role routing",
+            Group::Integrations => "Integrations",
+            Group::ModelRouting => "Model Routing",
             Group::CoreBehaviour => "Core behaviour",
-            Group::Restrictions => "Restrictions",
+            Group::Restrictions => "Model Restrictions",
             Group::AgentPaths => "Agent paths",
+            Group::Service => "Service",
         }
     }
 
@@ -915,20 +923,28 @@ pub struct KeyDef {
 
 const S2: &str = "2. LLM PROVIDERS";
 const S3: &str = "3. MEDIA PROVIDERS";
+const S4: &str = "4. STORAGE CONFIGURATION";
 const S5: &str = "5. AGENT CAPABILITIES";
 const S6: &str = "6. MCP CONFIGURATION";
 const S7: &str = "7. WHITELISTS AND RESTRICTIONS";
 const S8: &str = "8. BEHAVIOR SETTINGS";
 const S10: &str = "10. PROVIDER SELECTION";
+const S11: &str = "11. CONVERSATION SETTINGS";
+const S12: &str = "12. SEARCH CAPABILITIES";
+const S13: &str = "13. TELEGRAM ADVANCED";
+const S15: &str = "15. INFLUXDB METRICS";
 const S16: &str = "16. LOGGING AND DEBUGGING";
 const S17: &str = "17. GENERAL SETTINGS";
+const S18: &str = "18. SCHEDULER";
+const S41: &str = "4.1 INFINITE CONTEXT (ChromaDB)";
 
-/// The static key registry (owner-approved stripped slice, plan.md v2).
-/// Explicitly excluded: `CLIENT` (force-set by the backend CLI — inert in the
-/// file), telegram keys and telegram-access whitelists, storage/memory group,
-/// heartbeat/influx. Unknown file keys are tolerated and never rewritten.
+/// The static key registry (owner-approved stripped slice, plan.md v2;
+/// reworked 2026-10-10 with the Integrations and Service groups). Explicitly
+/// excluded: `CLIENT` (force-set by the backend CLI — inert in the file),
+/// telegram keys and telegram-access whitelists, memory group, heartbeat.
+/// Unknown file keys are tolerated and never rewritten.
 pub const REGISTRY: &[KeyDef] = &[
-    // ---- Group 1: Providers · API keys (31 rows) ----
+    // ---- Group 1: LLM Providers (31 rows) ----
     secret(
         "OPENAI_API_KEY",
         Group::ProviderKeys,
@@ -1127,7 +1143,30 @@ pub const REGISTRY: &[KeyDef] = &[
         S3,
         "ElevenLabs API key (text-to-speech)",
     ),
-    // ---- Group 3: Model & role routing (12 rows) ----
+    // ---- Group 3: Integrations (3 rows) ----
+    secret(
+        "JINA_API_KEY",
+        Group::Integrations,
+        S12,
+        "Jina AI API key (web reading and search)",
+    ),
+    secret_commented(
+        "GOOGLE_SEARCH_API_KEY",
+        Group::Integrations,
+        S12,
+        "Google Custom Search API key",
+    ),
+    KeyDef {
+        key: "GOOGLE_SEARCH_CX",
+        group: Group::Integrations,
+        kind: Kind::PlainStr,
+        default: "",
+        description: "Google Custom Search Engine ID",
+        secret: false,
+        commented: true,
+        section: S12,
+    },
+    // ---- Group 4: Model Routing (12 rows) ----
     KeyDef {
         key: "DEFAULT_PROVIDER",
         group: Group::ModelRouting,
@@ -1162,7 +1201,7 @@ pub const REGISTRY: &[KeyDef] = &[
         "Default content moderation provider",
     ),
     plain_commented("MODERATION_MODEL", S10, "Default content moderation model"),
-    // ---- Group 4: Core behaviour (12 rows) ----
+    // ---- Group 4: Core behaviour (18 rows) ----
     KeyDef {
         key: "FILESYSTEM_ACCESS",
         group: Group::CoreBehaviour,
@@ -1289,26 +1328,134 @@ pub const REGISTRY: &[KeyDef] = &[
         commented: true,
         section: S17,
     },
-    // ---- Group 4b: Restrictions (4 rows, owner 2026-10-03) ----
+    KeyDef {
+        key: "ENABLE_INFINITE_CONTEXT",
+        group: Group::CoreBehaviour,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Enable infinite context via ChromaDB vector storage",
+        secret: false,
+        commented: false,
+        section: S41,
+    },
+    KeyDef {
+        key: "SCHEDULER_NOTIFY_ENABLED",
+        group: Group::CoreBehaviour,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Allow scheduled jobs to send static notify messages without waking the agent",
+        secret: false,
+        commented: false,
+        section: S18,
+    },
+    KeyDef {
+        key: "MAX_CONVERSATION_AGE_MINUTES",
+        group: Group::CoreBehaviour,
+        kind: Kind::Int {
+            min: 1,
+            max: 525_600,
+        },
+        default: "360",
+        description: "Conversation age in minutes before it is cleaned up",
+        secret: false,
+        commented: false,
+        section: S11,
+    },
+    KeyDef {
+        key: "BOT_NAME",
+        group: Group::CoreBehaviour,
+        kind: Kind::PlainStr,
+        default: "Chibi",
+        description: "Display name for the bot",
+        secret: false,
+        commented: false,
+        section: S13,
+    },
+    KeyDef {
+        key: "SHOW_USAGE",
+        group: Group::CoreBehaviour,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Show token usage under responses",
+        secret: false,
+        commented: false,
+        section: S17,
+    },
+    KeyDef {
+        key: "LLM_ROLE",
+        group: Group::CoreBehaviour,
+        kind: Kind::PlainStr,
+        default: "",
+        description: "Custom LLM role/persona text injected into the agent prompt",
+        secret: false,
+        commented: true,
+        section: S8,
+    },
+    // ---- Group 5: Model Restrictions (3 rows, owner 2026-10-03) ----
     csv("MODELS_WHITELIST", "Comma-separated list of allowed models"),
     csv(
         "MODELS_BLACKLIST",
         "Comma-separated list of disallowed models",
     ),
     csv("TOOLS_WHITELIST", "Comma-separated list of allowed tools"),
-    csv(
-        "IMAGE_GENERATIONS_WHITELIST",
-        "Comma-separated user IDs allowed to generate images",
-    ),
-    // ---- Group 5: Agent paths (3 rows) ----
+    // ---- Group 6: Agent paths (3 rows) ----
     path("HOME_DIR", "Agent home directory"),
     path("WORKING_DIR", "Agent working directory"),
     path("SKILLS_DIR", "Directory with user custom skills"),
+    // ---- Group 7: Service (5 rows, storage & metrics) ----
+    KeyDef {
+        key: "REDIS",
+        group: Group::Service,
+        kind: Kind::Secret,
+        default: "",
+        description: "Redis connection URL (overrides local storage)",
+        secret: true,
+        commented: true,
+        section: S4,
+    },
+    KeyDef {
+        key: "INFLUXDB_URL",
+        group: Group::Service,
+        kind: Kind::PlainStr,
+        default: "",
+        description: "InfluxDB URL for metrics collection",
+        secret: false,
+        commented: true,
+        section: S15,
+    },
+    secret_commented(
+        "INFLUXDB_TOKEN",
+        Group::Service,
+        S15,
+        "InfluxDB token for authentication",
+    ),
+    KeyDef {
+        key: "INFLUXDB_ORG",
+        group: Group::Service,
+        kind: Kind::PlainStr,
+        default: "",
+        description: "InfluxDB organization",
+        secret: false,
+        commented: true,
+        section: S15,
+    },
+    KeyDef {
+        key: "INFLUXDB_BUCKET",
+        group: Group::Service,
+        kind: Kind::PlainStr,
+        default: "",
+        description: "InfluxDB bucket for metrics",
+        secret: false,
+        commented: true,
+        section: S15,
+    },
 ];
 
-/// Keys that are NOT in the v1 UI registry but MUST be written `true` by the
-/// generated template (owner decision 2026-10-03). Template-only: the backend
-/// reads them from the file even though the config screen does not list them.
+/// Keys that the generated template MUST ship with a forced `true` value
+/// (owner decision 2026-10-03), regardless of what the vendored template
+/// carries. This list is only about template generation: the keys here may
+/// (and do) also appear as registered UI rows in [`REGISTRY`] — being listed
+/// here does not make them hidden from the config screen.
 pub const TEMPLATE_ONLY_FORCED_DEFAULTS: &[(&str, &str)] = &[("ENABLE_INFINITE_CONTEXT", "true")];
 
 const fn secret(
@@ -1325,6 +1472,24 @@ const fn secret(
         description,
         secret: true,
         commented: false,
+        section,
+    }
+}
+
+const fn secret_commented(
+    key: &'static str,
+    group: Group,
+    section: &'static str,
+    description: &'static str,
+) -> KeyDef {
+    KeyDef {
+        key,
+        group,
+        kind: Kind::Secret,
+        default: "",
+        description,
+        secret: true,
+        commented: true,
         section,
     }
 }
