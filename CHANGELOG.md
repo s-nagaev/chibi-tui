@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Mouse support in the backend settings editor: the wheel moves the group or row selection by the pane under the cursor, and a left click selects a group or row; mouse events are swallowed while the value editor or a confirmation prompt is open. Available in both editor shells (the F2 in-app modal and the post-onboarding screen).
+- Base-surface mouse clicks: a left click on a thread in the sidebar switches to that thread (same live switching as the arrow keys) and focuses the sidebar; clicking below the last thread only moves focus, and clicks on the sidebar borders change nothing. A left click in the chat pane or the input area moves focus to the chat, alongside the existing drag-to-select text behavior.
+
+## [0.5.0] - 2026-10-09
+
+### Added
+
+- Missing-backend onboarding: when the backend binary is absent, the setup screen probes for a usable Python (>=3.11,<4) and pipx by execution (stock macOS `/usr/bin/python3` is 3.9.6) and verifies the installed binary by running `stdio --help`.
+- Install ladder: pipx → TUI-owned venv under the platform data dir → `pip --user` (only when the interpreter is not externally-managed) → `--break-system-packages` as a loudly warned last resort. Installer output streams into a live tail pane; `Esc` cancels the install and `Ctrl+C` quits anyway. The backend config screen always opens before respawning.
+- Persisted backend binary path store (`<data>/chibi-tui/backend.json`): the spawn path resolves `CHIBI_BACKEND_BIN` → persisted install path → PATH, and the resolved bin dir is injected into the backend child's `PATH` for the pipeline's automatic reconnects. A persisted path whose binary has vanished does not suppress the setup screen.
+- Backend settings editor driven by a lossless dotenv engine: parse/render is byte-exact (quoting, comments, CRLF, BOM and missing trailing newline are preserved), per-row validation mirrors the backend's import rules, and saves are atomic (temp + fsync + rename, `.bak` backup, chmod 600) with an external-change guard.
+- Two editor shells: an F2 modal over a live session (after a save it offers a backend restart now or when idle) and a full-screen editor that opens right after onboarding. The editor also opens on startup when no provider key is configured (skipped in mock mode and under `CHIBI_ENV=dev`). Secret values render masked and are only revealed explicitly during editing.
+- PTY end-to-end harness (`tests/e2e_onboarding_harness.py`) driving the real binary through the onboarding flow offline (fake interpreter/pipx probes plus the deterministic fake backend) and optionally live (real isolated `pipx install chibi-bot`).
+
+### Fixed
+
+- The setup screen's pipx hint installed the wrong package (`pipx install chibi`); it now reads `pipx install chibi-bot`.
+
 ## [0.4.0] - 2026-09-28
 
 ### Changed

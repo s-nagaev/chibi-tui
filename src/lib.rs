@@ -12,7 +12,11 @@
 pub mod app;
 pub mod backend;
 pub mod backend_client;
+pub mod backend_install;
+pub mod backend_settings;
+pub mod backend_store;
 pub mod clipboard;
+pub mod config_screen;
 pub mod diag;
 pub mod history;
 pub mod input;
@@ -48,3 +52,20 @@ pub use crate::request_pipeline::{
 // Public re-exports: application-state surface bridging backend → UI.
 pub use crate::app::{App, Chat, Connection, Submitted};
 pub use crate::live::LiveBackend;
+
+// Public re-exports: backend settings engine (config screen core).
+pub use crate::backend_settings::{
+    ensure_chibi_bot_dirs, generate_settings_text, load_settings, registry_get, save_settings,
+    settings_base_dir, settings_path, stat_settings, validate_doc, validate_value,
+    write_generated_settings, FileMeta, Group, KeyDef, Kind, Line, SettingsDoc, SettingsError,
+    ValueState, REGISTRY, VENDORED_TEMPLATE,
+};
+
+// Public re-exports: persisted backend binary path (installer handoff).
+pub use crate::backend_store::{load_backend_path, resolve_root, save_backend_path};
+
+// Public re-exports: config-screen component surface (both shells).
+pub use crate::config_screen::{
+    provider_key_configured, resolve_settings_path, ConfigAction, ConfigState, Confirm, Flow,
+    SaveOutcome,
+};
