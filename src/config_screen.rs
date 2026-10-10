@@ -23,6 +23,12 @@
 //! exists. `ConfigState`'s manual `Debug` omits the document and the edit
 //! buffer entirely.
 //!
+//! # Mouse seam
+//!
+//! `render` snapshots the rendered pane geometry into
+//! [`ConfigState::geometry`] so mouse handlers (task 2) can map cursor
+//! positions to group/row selections without duplicating layout math.
+//!
 //! # Path resolution
 //!
 //! `CHIBI_TUI_SETTINGS_PATH` overrides the settings file location (test/CI
@@ -140,6 +146,46 @@ pub enum Confirm {
     FileChanged,
 }
 
+/// Wheel step for the mouse seam (lib-side): rows advanced per wheel tick.
+/// The bin-side `mouse.rs` keeps its own constant.
+pub const WHEEL_STEP: u16 = 3;
+
+/// Render-fed geometry of the config screen's two panes, snapshotted by
+/// [`render`] AFTER the row-window normalization so mouse handlers can map
+/// cursor positions onto group/row selections (see the module's
+/// "Mouse seam" section). Fields are private: query via
+/// [`ConfigState::pane_at`] / [`ConfigState::select_row_at`] /
+/// [`ConfigState::select_group_at`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigGeometry {
+    /// The LEFT groups list rect as rendered (no scroll offset there).
+    groups: Rect,
+    /// The INNER right-pane rect: the `Borders::LEFT` divider column is a
+    /// border, not a row.
+    keys_inner: Rect,
+    /// First visible row of the right pane's window at snapshot time.
+    row_offset: usize,
+    /// Visible row count (`keys_inner.height`, normalized to >= 1).
+    visible: usize,
+}
+
+/// Which pane a mouse point landed in ([`ConfigState::pane_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigPane {
+    /// The left groups list.
+    Groups,
+    /// The right key rows list (inner area, divider excluded).
+    Rows,
+}
+
+/// Inclusive-exclusive point-in-rect test (`Rect` may be empty).
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
 /// The open single-line value editor (the `Renaming` pattern, scoped to one
 /// row). The `Debug` impl is manual and redacts `buf` — it may hold a secret
 /// between keystrokes.
@@ -192,6 +238,11 @@ pub struct ConfigState {
     row_offset: usize,
     /// Render-fed visible row count (same seam as `picker_visible_rows`).
     rows_visible: usize,
+    /// Render-fed pane geometry for the mouse seam (the "Mouse seam" module
+    /// section): `None` until the first config render — mouse events that
+    /// precede it are no-ops. Excluded from `PartialEq` (like
+    /// `rows_visible`): pure render output, not user-visible state.
+    pub geometry: Option<ConfigGeometry>,
     edit: Option<EditState>,
     /// Staged (in-memory) edits not yet written.
     dirty: bool,
@@ -219,6 +270,7 @@ impl Clone for ConfigState {
             row: self.row,
             row_offset: self.row_offset,
             rows_visible: self.rows_visible,
+            geometry: self.geometry,
             edit: self.edit.clone(),
             dirty: self.dirty,
             confirm: self.confirm,
@@ -240,6 +292,7 @@ impl fmt::Debug for ConfigState {
             .field("row", &self.row)
             .field("dirty", &self.dirty)
             .field("edit_open", &self.edit.is_some())
+            .field("geometry", &self.geometry)
             .field("confirm", &self.confirm)
             .field("errors", &self.errors.len())
             .field("restart_available", &self.restart_available)
@@ -289,6 +342,7 @@ impl ConfigState {
             row: 0,
             row_offset: 0,
             rows_visible: 10,
+            geometry: None,
             edit: None,
             dirty: false,
             confirm: Confirm::None,
@@ -748,6 +802,73 @@ impl ConfigState {
     pub fn group_index(&self) -> usize {
         self.group
     }
+
+    /// Hit-test a cursor position against the stored pane geometry.
+    /// `None` when no render has populated the geometry yet or the point is
+    /// in neither rect (the divider column and borders included).
+    pub fn pane_at(&self, col: u16, row: u16) -> Option<ConfigPane> {
+        let geo = self.geometry?;
+        if rect_contains(geo.groups, col, row) {
+            Some(ConfigPane::Groups)
+        } else if rect_contains(geo.keys_inner, col, row) {
+            Some(ConfigPane::Rows)
+        } else {
+            None
+        }
+    }
+
+    /// Mouse click on the right pane: map `y` (inside the stored
+    /// `keys_inner` rect) to row `row_offset + (y - keys_inner.y)`. Ignored
+    /// (no state change) when the geometry is absent, `y` is above the pane,
+    /// the mapped index is past the current group's last row (an empty
+    /// group has none), or — otherwise — the row is selected and the stored
+    /// `row_offset` snapshot is refreshed via `clamp_offset`
+    /// so the seam stays consistent between renders.
+    pub fn select_row_at(&mut self, y: u16) {
+        let Some(geo) = self.geometry else {
+            return;
+        };
+        if y < geo.keys_inner.y {
+            return;
+        }
+        let idx = self.row_offset + (y - geo.keys_inner.y) as usize;
+        if idx >= self.row_count() {
+            return;
+        }
+        self.row = idx;
+        self.clamp_offset();
+        self.refresh_geometry_offset();
+    }
+
+    /// Mouse click on the left pane: map `y` (inside the stored `groups`
+    /// rect) to group index `y - groups.y` (no scroll offset there). An
+    /// out-of-range index is ignored ENTIRELY — `switch_group`
+    /// is delta-based with `rem_euclid` wrapping, so an unchecked delta would
+    /// land on an unrelated group. In range, the click routes through
+    /// `switch_group` (its row/row_offset reset is intended) and refreshes
+    /// the stored snapshot if `clamp_offset` ran.
+    pub fn select_group_at(&mut self, y: u16) {
+        let Some(geo) = self.geometry else {
+            return;
+        };
+        if y < geo.groups.y {
+            return;
+        }
+        let idx = (y - geo.groups.y) as usize;
+        if idx >= Group::ALL.len() {
+            return;
+        }
+        self.switch_group(idx as isize - self.group as isize);
+        self.refresh_geometry_offset();
+    }
+
+    /// Keep the stored `row_offset` snapshot in sync after a mutation that
+    /// ran [`ConfigState::clamp_offset`] (no-op while geometry is `None`).
+    fn refresh_geometry_offset(&mut self) {
+        if let Some(geo) = &mut self.geometry {
+            geo.row_offset = self.row_offset;
+        }
+    }
 }
 
 /// Canonical truthy literal test for Bool rows (mirrors the backend's
@@ -871,6 +992,14 @@ pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect)
     if !defs.is_empty() {
         state.row = state.row.min(defs.len() - 1);
     }
+    // Mouse seam: snapshot the normalized geometry AFTER the row-window
+    // normalization above so hit-tests agree with what is on screen.
+    state.geometry = Some(ConfigGeometry {
+        groups: main[0],
+        keys_inner,
+        row_offset: state.row_offset,
+        visible: state.rows_visible,
+    });
     let key_w = defs
         .iter()
         .map(|def| def.key.width())
