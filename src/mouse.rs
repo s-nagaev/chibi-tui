@@ -23,6 +23,10 @@ pub enum WheelSurface {
     LogViewer,
     Help,
     ModelPicker,
+    /// The F2 backend-configuration editor modal: wheel + click-to-select
+    /// routed by the pane under the cursor through the shared lib entry
+    /// point (`ConfigState::handle_mouse`).
+    Config,
     Panels,
 }
 
@@ -49,7 +53,15 @@ pub enum WheelSurface {
 ///   plain click that clears). Presses outside the chat pane clear the
 ///   selection too, and a release is finalized anywhere in the base
 ///   surface — the cursor commonly leaves the pane before the button
-///   comes up.
+///   comes up;
+/// - the F2 config-editor modal (`Mode::ConfigEditor`) routes wheel AND
+///   left clicks to the shared lib entry point
+///   `ConfigState::handle_mouse`, which hit-tests the pane under the
+///   cursor (groups list / key rows) and only ever SELECTS — no drag, no
+///   copy, selection state untouched. The app-level quit-confirm popup
+///   (a flag, not a Mode) swallows clicks while up; the wheel stays live
+///   under it, mirroring the Panels convention. The error popup needs no
+///   gate (it renders before the config editor, never over it).
 pub fn handle_mouse(app: &mut chibi_tui::app::App, mouse: MouseEvent, area: Rect) {
     handle_mouse_with_copy(app, mouse, area, &|text| {
         // Selection copy rides the SAME clipboard path as the log
@@ -73,6 +85,7 @@ pub fn handle_mouse_with_copy(
         Mode::LogViewer { .. } => WheelSurface::LogViewer,
         Mode::HelpViewing { .. } => WheelSurface::Help,
         Mode::ModelPicking { .. } => WheelSurface::ModelPicker,
+        Mode::ConfigEditor { .. } => WheelSurface::Config,
         _ => WheelSurface::Panels,
     };
     match surface {
@@ -107,6 +120,29 @@ pub fn handle_mouse_with_copy(
             }
             _ => {}
         },
+        WheelSurface::Config => {
+            // App-level gates that live HERE (the ConfigState component
+            // cannot see app state): the quit-confirmation popup renders
+            // TOPMOST over the config editor and is reachable from it, so
+            // while it is up CLICKS are swallowed (never forwarded — a
+            // click must not select under the popup) and the WHEEL stays
+            // live, matching the documented Panels convention (scrolling
+            // behind a popup is harmless). `error_popup` needs NO gate: it
+            // renders before the config editor and is never visible over
+            // it (verified in ui.rs). Everything else delegates to the
+            // shared lib entry point; selection state is never touched
+            // here — no drag-selection, no copy in config mode.
+            let click = matches!(
+                mouse.kind,
+                MouseEventKind::Up(crossterm::event::MouseButton::Left)
+            );
+            if app.quit_confirm && click {
+                return;
+            }
+            if let Mode::ConfigEditor { state } = &mut app.mode {
+                state.handle_mouse(mouse);
+            }
+        }
         WheelSurface::Panels => {
             let rects = ui::layout_rects(area, app.input_lines_height());
             // Selection presses/drags/releases are Normal-mode-only and
