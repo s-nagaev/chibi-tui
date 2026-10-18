@@ -864,7 +864,7 @@ impl ConfigState {
     }
 
     /// Route one mouse event (the ONE entry point both shells share —
-    /// Shell B's [`crate::mouse`] arm and Shell A's `run` loop both
+    /// Shell B's `mouse` arm and Shell A's `run` loop both
     /// delegate here). Pure state mutation, like [`ConfigState::handle_key`].
     ///
     /// Routing:
