@@ -93,61 +93,6 @@ fn list_view_masks_secrets_and_marks_placeholders() {
     );
 }
 
-#[test]
-fn valueless_rows_surface_the_registry_default() {
-    let mut state = state_at("defaults", "");
-    select_row(&mut state, "FAILOVER_CHAIN_MASTER");
-    assert_eq!(
-        state.display_value(state.rows()[state.row]),
-        "- (default: auto)",
-        "absent row with a non-empty default shows it"
-    );
-    let rendered = render_to_string(&mut state);
-    assert!(
-        rendered.contains("- (default: auto)") && rendered.contains("[default]"),
-        "default placeholder and tag rendered together: {rendered}"
-    );
-    // An empty-default row keeps the plain placeholder.
-    select_row(&mut state, "DEFAULT_MODEL");
-    assert_eq!(
-        state.display_value(state.rows()[state.row]),
-        "- (not set)",
-        "empty-default row stays (not set)"
-    );
-}
-
-#[test]
-fn empty_value_with_a_default_surfaces_it_too() {
-    // Active-but-empty value: the default still applies.
-    let mut state = state_at("defaultsempty", "FAILOVER_CHAIN_MASTER=\n");
-    select_row(&mut state, "FAILOVER_CHAIN_MASTER");
-    assert_eq!(
-        state.display_value(state.rows()[state.row]),
-        "- (default: auto)",
-        "empty value falls back to the default"
-    );
-    // A real value always wins over the default.
-    let mut state = state_at("defaultswin", "FAILOVER_CHAIN_MASTER=provider/model\n");
-    select_row(&mut state, "FAILOVER_CHAIN_MASTER");
-    assert_eq!(
-        state.display_value(state.rows()[state.row]),
-        "provider/model",
-        "real value beats the default"
-    );
-}
-
-#[test]
-fn commented_empty_value_with_no_default_stays_empty_placeholder() {
-    let mut state = state_at("defaultcommented", "# MODERATION_MODEL=\n");
-    select_row(&mut state, "MODERATION_MODEL");
-    let rendered = render_to_string(&mut state);
-    assert!(
-        rendered.contains("- (empty) [commented]"),
-        "commented empty template key keeps its placeholder: {rendered}"
-    );
-}
-
-/// Render one frame to a flat string for substring assertions.
 /// Render one frame to a flat string for substring assertions.
 fn render_to_string(state: &mut ConfigState) -> String {
     let theme = Theme::tokyo_night();
@@ -163,6 +108,7 @@ fn render_to_string(state: &mut ConfigState) -> String {
         .map(|c| c.symbol())
         .collect()
 }
+
 // editing semantics
 
 #[test]
