@@ -1193,16 +1193,28 @@ pub const REGISTRY: &[KeyDef] = &[
         "Default content moderation provider",
     ),
     plain_commented("MODERATION_MODEL", S10, "Default content moderation model"),
-    plain_commented(
-        "FAILOVER_CHAIN_MASTER",
-        S11,
-        "Failover chain for main chat requests (auto, disabled, or provider/model pairs)",
-    ),
-    plain_commented(
-        "FAILOVER_CHAIN_SUBAGENT",
-        S11,
-        "Failover chain for sub-agent requests (auto, disabled, or provider/model pairs)",
-    ),
+    KeyDef {
+        key: "FAILOVER_CHAIN_MASTER",
+        group: Group::ModelRouting,
+        kind: Kind::PlainStr,
+        default: "auto",
+        description:
+            "Failover chain for main chat requests (auto, disabled, or provider/model pairs)",
+        secret: false,
+        commented: true,
+        section: S11,
+    },
+    KeyDef {
+        key: "FAILOVER_CHAIN_SUBAGENT",
+        group: Group::ModelRouting,
+        kind: Kind::PlainStr,
+        default: "auto",
+        description:
+            "Failover chain for sub-agent requests (auto, disabled, or provider/model pairs)",
+        secret: false,
+        commented: true,
+        section: S11,
+    },
     // ---- Group 4: Core behaviour (18 rows) ----
     KeyDef {
         key: "FILESYSTEM_ACCESS",

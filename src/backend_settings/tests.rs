@@ -510,6 +510,8 @@ fn registry_defaults_match_the_template() {
         ("MAX_CONVERSATION_AGE_MINUTES", "360"),
         ("BOT_NAME", "Chibi"),
         ("SHOW_USAGE", "false"),
+        ("FAILOVER_CHAIN_MASTER", "auto"),
+        ("FAILOVER_CHAIN_SUBAGENT", "auto"),
     ];
     for (key, default) in expected {
         assert_eq!(
