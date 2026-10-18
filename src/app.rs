@@ -393,7 +393,7 @@ pub enum Mode {
     /// dispatch-side test pins it against the real key handlers so future
     /// chords cannot silently miss the modal.
     HelpViewing { state: HelpModalState },
-    /// The F2 backend-configuration editor modal is open — a full-frame
+    /// The F2 backend-configuration editor modal is open: a full-frame
     /// editor over `~/chibi-bot/settings` built on the shared
     /// [`crate::config_screen::ConfigState`] component (the SAME component
     /// the pre-loop Shell A screen runs). Modal isolation like the popup
@@ -700,14 +700,14 @@ pub struct ChatGeometry {
 }
 
 /// Render-fed geometry seam for sidebar clicks (same pattern as
-/// [`ChatGeometry`]): the inner rect of the sidebar's list block — its
-/// border rows and side columns are NOT list rows — plus the
+/// [`ChatGeometry`]): the inner rect of the sidebar's list block (its
+/// border rows and side columns are NOT list rows), plus the
 /// [`ratatui::widgets::ListState`] offset read AFTER
 /// `render_stateful_widget`, because ratatui scrolls the list internally
 /// when threads overflow and the offset must come from the state object,
 /// never be recomputed from the active index. Refreshed on every
 /// `render_sidebar`; like [`App::chat_geometry`] it is session-only view
-/// state with no explicit reset path — a fresh frame simply overwrites it.
+/// state with no explicit reset path: a fresh frame simply overwrites it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarGeometry {
     /// Inner rect of the sidebar list block (borders excluded).
@@ -2316,7 +2316,7 @@ impl App {
 
     /// Open the F2 backend-configuration editor modal with a pre-loaded
     /// [`crate::config_screen::ConfigState`]. The STATE arrives from the
-    /// caller (the key dispatch loads the settings file — bin-level I/O,
+    /// caller (the key dispatch loads the settings file, bin-level I/O,
     /// same tier as the loop's persistence calls) so this entry point stays
     /// I/O-free and tests can inject a temp-path state. Normal mode only,
     /// like every other popup entry point; F2 on an open editor is the

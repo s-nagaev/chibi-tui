@@ -1,7 +1,7 @@
 //! Config-editor (F2) dispatch tests: modal isolation, the save → restart
 //! staging round trip and the dirty-close grammar, driven through the REAL
 //! `handle_key` path. States are injected via `begin_config_editor` with a
-//! temp-path `ConfigState` — the user's real `~/chibi-bot/settings` is never
+//! temp-path `ConfigState`; the user's real `~/chibi-bot/settings` is never
 //! read or written here.
 
 use crate::tests::support::*;
@@ -30,8 +30,8 @@ fn open_editor(app: &mut chibi_tui::app::App, path: PathBuf) {
 
 /// FILESYSTEM_ACCESS is the FIRST row of the Core behaviour group. The group
 /// is reached by navigating RELATIVE to its position in `Group::ALL` (not a
-/// hardcoded arrow count), so registry re-orderings — like the 2231ad1
-/// Integrations insertion — cannot silently land the selection on the wrong
+/// hardcoded arrow count), so registry re-orderings (like the 2231ad1
+/// Integrations insertion) cannot silently land the selection on the wrong
 /// group and leave the target key untogglable.
 fn stage_a_bool_toggle(app: &mut chibi_tui::app::App) {
     let steps = chibi_tui::backend_settings::Group::ALL

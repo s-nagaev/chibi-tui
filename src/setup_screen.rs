@@ -9,7 +9,7 @@
 //! → Installed`.
 //!
 //! Discovery is BY EXECUTION only: interpreter binaries are probed with a
-//! `-c` version one-liner (never trusted by name — stock macOS
+//! `-c` version one-liner (never trusted by name: stock macOS
 //! `/usr/bin/python3` is 3.9.6), pipx is probed with `pipx --version` (a
 //! pyenv shim without a backing install fails), and PEP 668
 //! `EXTERNALLY-MANAGED` markers decide whether `pip --user` is ever legal.
@@ -23,14 +23,14 @@
 //!
 //! # Key grammar
 //!
-//! * `i` — start the install (Offer state)
-//! * `n` — after a failed rung, try the next ladder option (an explicit,
+//! * `i`: start the install (Offer state)
+//! * `n`: after a failed rung, try the next ladder option (an explicit,
 //!   warned opt-in for `--break-system-packages`)
-//! * `p` — re-probe (NoPython state)
-//! * `r` — retry the backend spawn
-//! * `q`/Esc — quit confirmation (shared grammar), EXCEPT while installing,
+//! * `p`: re-probe (NoPython state)
+//! * `r`: retry the backend spawn
+//! * `q`/Esc: quit confirmation (shared grammar), EXCEPT while installing,
 //!   where Esc cancels the install and Ctrl+C quits (killing the child)
-//! * Ctrl+C — quit confirmation elsewhere; quit-anyway while installing
+//! * Ctrl+C: quit confirmation elsewhere; quit-anyway while installing
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -88,7 +88,7 @@ pub fn applies(err: &BackendError, backend_bin_env: Option<&OsStr>) -> bool {
 }
 
 /// The effective binary override for the spawn/gate decision: an explicit
-/// `CHIBI_BACKEND_BIN` env value, else the installer's persisted path — but
+/// `CHIBI_BACKEND_BIN` env value, else the installer's persisted path, but
 /// ONLY while that binary still exists. A persisted path whose binary has
 /// vanished must NOT masquerade as an override: the gate rule requires the
 /// setup screen to still apply so the user can reinstall. Pure helper takes
@@ -287,7 +287,7 @@ pub fn no_python_lines(os: TargetOs, theme: &Theme) -> Vec<Line<'static>> {
             dim,
         )),
         Line::from(Span::styled(
-            "not by name \u{2014} stock /usr/bin/python3 is 3.9.6 on macOS).",
+            "not by name: stock /usr/bin/python3 is 3.9.6 on macOS).",
             dim,
         )),
         String::new().into(),
@@ -479,7 +479,7 @@ pub fn draw(f: &mut Frame, theme: &Theme, quit_confirm: bool) {
 
 /// Draw one setup frame for the current onboarding state. `quit_confirm`
 /// overlays the shared "Quit chibi-tui?" popup (the same renderer the
-/// in-app confirm uses, the same shared grammar — see
+/// in-app confirm uses, the same shared grammar; see
 /// [`crate::app::quit_decision`]).
 fn draw_state(
     f: &mut Frame,

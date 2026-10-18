@@ -710,7 +710,7 @@ fn resolve_backend_program(
     std::ffi::OsString::from("chibi")
 }
 
-/// Real-backend spawn argv: `<program> stdio --tui`, nothing else — the
+/// Real-backend spawn argv: `<program> stdio --tui`, nothing else; the
 /// workspace root travels inside request frames, never on the command line.
 /// Shared by the initial spawn and reconnect so the two never diverge.
 /// `<program>` follows [`resolve_backend_program`]: `CHIBI_BACKEND_BIN`,
@@ -969,7 +969,7 @@ mod tests {
     /// both the initial spawn and a reconnect build their argv from
     /// [`real_backend_argv`], so one tail assertion pins both paths. The
     /// program itself comes from the documented resolution order (tested
-    /// separately below) — the tail is the frozen contract.
+    /// separately below); the tail is the frozen contract.
     #[test]
     fn real_backend_spawn_argv_is_exactly_chibi_stdio_tui() {
         let argv = real_backend_argv();

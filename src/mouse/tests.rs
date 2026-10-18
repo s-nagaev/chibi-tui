@@ -858,7 +858,7 @@ fn config_mode_wheel_routes_to_the_config_editor_by_pane() {
         WHEEL_AREA,
     );
     assert_eq!(config_state(&mut app).group_index(), 0);
-    // The top edge clamps — no rem_euclid wraparound to the last group.
+    // The top edge clamps, no rem_euclid wraparound to the last group.
     handle_mouse(
         &mut app,
         wheel(MouseEventKind::ScrollUp, 5, gy as u16),
@@ -944,7 +944,7 @@ fn config_mode_clicks_are_swallowed_under_quit_confirm_wheel_stays_live() {
     let gy = grid_row(&grid, "LLM Providers") as u16;
     let my = grid_row(&grid, "Model Routing") as u16;
     // Ctrl+C from the config editor opens the quit confirm (a flag, not a
-    // Mode — it renders TOPMOST over the editor).
+    // Mode; it renders TOPMOST over the editor).
     press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(app.quit_confirm, "precondition: popup open");
 
@@ -1093,7 +1093,7 @@ fn config_mode_mouse_is_swallowed_while_a_confirm_modal_is_open() {
     );
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
-    // FileChanged: the file changes on disk between load and save — the
+    // FileChanged: the file changes on disk between load and save: the
     // write guard opens the reload/overwrite modal.
     std::fs::write(&path, "DEFAULT_MODEL=external\n").expect("external edit");
     assert_eq!(
@@ -1139,8 +1139,8 @@ fn config_mode_mouse_is_swallowed_while_the_edit_input_is_open() {
         "editor open"
     );
 
-    // Wheel and clicks anywhere — including a group row that would switch
-    // the group — change nothing while the editor owns the screen.
+    // Wheel and clicks anywhere (including a group row that would switch
+    // the group) change nothing while the editor owns the screen.
     handle_mouse(
         &mut app,
         wheel(MouseEventKind::ScrollDown, 5, kr),
@@ -1192,7 +1192,7 @@ fn config_mode_mouse_never_touches_selection_or_copy() {
         let copy = |text: &str| sink.borrow_mut().push(text.to_owned());
         // A full press/drag/release over the (base-surface) chat pane:
         // config mode routes to WheelSurface::Config, which only ever
-        // SELECTS rows/groups — no drag head, no release copy.
+        // SELECTS rows/groups (no drag head, no release copy.
         handle_mouse_with_copy(
             &mut app,
             button(
@@ -1263,7 +1263,7 @@ fn render_base_grid(app: &mut chibi_tui::app::App) -> Vec<String> {
 
 /// Clicking a thread row in the sidebar switches to that thread live
 /// (unread cleared, scroll reset to follow-bottom, text selection
-/// cleared — the exact `select_chat` side effects the arrow keys have)
+/// cleared, the exact `select_chat` side effects the arrow keys have)
 /// and moves focus to the sidebar, without the sidebar holding focus
 /// beforehand.
 #[test]
@@ -1325,7 +1325,7 @@ fn sidebar_click_below_the_last_thread_only_moves_focus() {
 }
 
 /// Clicks on the list block's border rows or side columns are not list
-/// rows: nothing changes at all — no selection, no focus move.
+/// rows: nothing changes at all: no selection, no focus move.
 #[test]
 fn sidebar_click_on_a_border_or_divider_changes_nothing() {
     let mut app = app_with_chats(3);
@@ -1363,7 +1363,7 @@ fn sidebar_click_on_a_border_or_divider_changes_nothing() {
 
 /// With more threads than fit the sidebar, ratatui scrolls the list
 /// internally; the click must map through the render-fed offset, so the
-/// row visually above the selected thread is that thread's neighbour —
+/// row visually above the selected thread is that thread's neighbour;
 /// without the seam offset this click would hit a wrong chat.
 #[test]
 fn sidebar_click_uses_the_render_fed_offset_when_the_list_scrolls() {
@@ -1457,7 +1457,7 @@ fn chat_pane_press_moves_focus_to_chat_and_selection_still_works() {
 }
 
 /// A press on the input region (input editor block / status lines) moves
-/// focus to the chat — typing goes to the prompt — and never starts a
+/// focus to the chat (typing goes to the prompt) and never starts a
 /// selection.
 #[test]
 fn input_region_click_moves_focus_to_chat() {
@@ -1484,7 +1484,7 @@ fn input_region_click_moves_focus_to_chat() {
 }
 
 /// Under the quit-confirm popup and in non-Normal modes, clicks change
-/// nothing: no thread switch, no focus move — the same `selectable` gate
+/// nothing: no thread switch, no focus move: the same `selectable` gate
 /// that swallows selection presses swallows the new click targets too.
 #[test]
 fn base_surface_clicks_are_swallowed_under_popups_and_non_normal_modes() {

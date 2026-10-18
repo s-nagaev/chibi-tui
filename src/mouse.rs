@@ -67,8 +67,8 @@ pub enum WheelSurface {
 /// - the F2 config-editor modal (`Mode::ConfigEditor`) routes wheel AND
 ///   left clicks to the shared lib entry point
 ///   `ConfigState::handle_mouse`, which hit-tests the pane under the
-///   cursor (groups list / key rows) and only ever SELECTS — no drag, no
-///   copy, selection state untouched. The app-level quit-confirm popup
+///   cursor (groups list / key rows) and only ever SELECTS (no drag, no
+///   copy, selection state untouched). The app-level quit-confirm popup
 ///   (a flag, not a Mode) swallows clicks while up; the wheel stays live
 ///   under it, mirroring the Panels convention. The error popup needs no
 ///   gate (it renders before the config editor, never over it).
@@ -134,14 +134,14 @@ pub fn handle_mouse_with_copy(
             // App-level gates that live HERE (the ConfigState component
             // cannot see app state): the quit-confirmation popup renders
             // TOPMOST over the config editor and is reachable from it, so
-            // while it is up CLICKS are swallowed (never forwarded — a
+            // while it is up CLICKS are swallowed (never forwarded: a
             // click must not select under the popup) and the WHEEL stays
             // live, matching the documented Panels convention (scrolling
             // behind a popup is harmless). `error_popup` needs NO gate: it
             // renders before the config editor and is never visible over
             // it (verified in ui.rs). Everything else delegates to the
             // shared lib entry point; selection state is never touched
-            // here — no drag-selection, no copy in config mode.
+            // here: no drag-selection, no copy in config mode.
             let click = matches!(
                 mouse.kind,
                 MouseEventKind::Up(crossterm::event::MouseButton::Left)
@@ -158,7 +158,7 @@ pub fn handle_mouse_with_copy(
             // Selection presses/drags/releases AND the click targets
             // (sidebar thread clicks, click-to-focus chat/input) are
             // Normal-mode-only and popup-free: popups (confirm dialogs,
-            // rename, search) and the error popup own the whole screen —
+            // rename, search) and the error popup own the whole screen,
             // the pointer must not draw a selection, switch threads, nor
             // move focus under them, and events under them are swallowed
             // (same isolation as the keyboard). A selection started before
@@ -200,7 +200,7 @@ pub fn handle_mouse_with_copy(
                     match ui::panel_region(&rects, mouse.column, mouse.row) {
                         ui::PanelRegion::Sidebar => {
                             // Click-to-select a thread through the
-                            // render-fed `App::sidebar_geometry` seam —
+                            // render-fed `App::sidebar_geometry` seam,
                             // the same live switching as the sidebar's
                             // arrow keys, but without requiring focus.
                             // Border/divider rows are not list rows: a
@@ -222,7 +222,7 @@ pub fn handle_mouse_with_copy(
                                 // thread row it also switches threads.
                                 app.focus = Focus::Sidebar;
                                 // A sidebar press is a click, never the
-                                // start of a drag selection — and like
+                                // start of a drag selection, and like
                                 // every press outside the chat pane it
                                 // clears any held selection.
                                 app.clear_selection();
@@ -231,7 +231,7 @@ pub fn handle_mouse_with_copy(
                         // Chat pane and everything else (input block,
                         // spinner, hints): the press keeps its existing
                         // selection semantics and additionally moves
-                        // focus to the chat — typing goes to the prompt.
+                        // focus to the chat, so typing goes to the prompt.
                         _ => {
                             app.focus = Focus::Chat;
                             let in_chat = ui::panel_region(&rects, mouse.column, mouse.row)

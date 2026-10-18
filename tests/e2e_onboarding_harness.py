@@ -3,23 +3,23 @@
 full missing-backend onboarding flow under a pseudo-terminal (PTY).
 
 Adapted from the tui_scheduler_compat e2e harness pattern (JSONL stdio client
-against a deterministic backend) — but here the client is the actual TUI
+against a deterministic backend), but here the client is the actual TUI
 process speaking ratatui/crossterm over a PTY, exercising the user-visible
 flow: splash → setup screen (missing backend) → probe → one-click install →
 backend config screen → save → respawn → handshake → live chat turn → quit.
 
 Two modes:
 
-* ``fake`` (default) — fully OFFLINE and hermetic: fake ``python3`` and
+* ``fake`` (default), fully OFFLINE and hermetic: fake ``python3`` and
   ``pipx`` executables on a prepended PATH simulate the probed environment
   (interpreter by execution, PIPX_BIN_DIR query, instant "install"), and the
   installed ``chibi`` is a wrapper around the repo's deterministic
   ``tests/fake_backend.py``. All state (HOME, storage root, settings file)
   lives in a temp tree; the real ``~/chibi-bot/settings`` is never touched
-  (``CHIBI_TUI_SETTINGS_PATH`` override — the seam both config shells honor).
-* ``live`` — REAL smoke on the owner machine: no fake probes; the TUI probes
+  (``CHIBI_TUI_SETTINGS_PATH`` override, the seam both config shells honor).
+* ``live``: REAL smoke on the owner machine: no fake probes; the TUI probes
   the machine's real interpreters and performs a REAL ``pipx install
-  chibi-bot`` from PyPI — isolated via temp ``PIPX_HOME``/``PIPX_BIN_DIR``
+  chibi-bot`` from PyPI, isolated via temp ``PIPX_HOME``/``PIPX_BIN_DIR``
   and a temp ``HOME``, so nothing outside the temp tree is written. The
   agent turn is NOT attempted in live mode (needs API keys): the fake-mode
   chat turn covers the request pipeline end to end (same precedent as the
@@ -228,7 +228,7 @@ def build_env(tmp: str, mode: str) -> tuple[dict, str, str]:
     env = dict(os.environ)
     env["HOME"] = home
     env["CHIBI_TUI_HOME"] = tui_home
-    # The settings-path test seam both config shells honor — keeps the real
+    # The settings-path test seam both config shells honor; it keeps the real
     # ~/chibi-bot/settings untouched BY CONSTRUCTION.
     env["CHIBI_TUI_SETTINGS_PATH"] = os.path.join(home, "chibi-bot", "settings")
     # MUST be absent (an empty value would route the pipeline into fake-backend
@@ -246,13 +246,13 @@ def build_env(tmp: str, mode: str) -> tuple[dict, str, str]:
             fake_chibi_body(real_py, os.path.join(REPO, "tests", "fake_backend.py")),
         )
         # Minimal PATH: the fake tools first, then only system dirs. The
-        # developer's own `chibi` (backend venv) must NOT be resolvable —
+        # developer's own `chibi` (backend venv) must NOT be resolvable;
         # the whole point is the missing-backend onboarding.
         env["PATH"] = os.pathsep.join(
             [fakebin, "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         )
     else:  # live
-        # Real probes, real PyPI install — isolated via PIPX_HOME/PIPX_BIN_DIR
+        # Real probes, real PyPI install, isolated via PIPX_HOME/PIPX_BIN_DIR
         # and a temp HOME. pipx is exposed through a private wrapper (the
         # developer's pyenv shims also expose a real `chibi`, which must stay
         # out of reach so the onboarding actually triggers).
@@ -354,7 +354,7 @@ def run_flow(bin_path: str, mode: str) -> list[str]:
 
         # 6. Respawn via the persisted store → backend handshake → main loop.
         #    NOTE: the in-app config editor (Shell B) auto-opens only when NO
-        #    provider key is "configured" — but the generated template ships
+        #    provider key is "configured", but the generated template ships
         #    CUSTOMOPENAI_URL=http://localhost:1234/v1 ACTIVE (registry group
         #    ProviderKeys), so on a fresh generated config the auto-open is
         #    skipped (recorded as a residual in the task report). Handle both.
@@ -427,11 +427,11 @@ def main() -> int:
     args = ap.parse_args()
 
     if not os.path.exists(args.bin):
-        raise SystemExit(f"TUI binary not found at {args.bin} — run `cargo build` first")
+        raise SystemExit(f"TUI binary not found at {args.bin}; run `cargo build` first")
 
     print(f"mode={args.mode} bin={args.bin}")
     checks = run_flow(args.bin, args.mode)
-    print("PASS — verified:")
+    print("PASS, verified:")
     for c in checks:
         print(f"  [ok] {c}")
     return 0

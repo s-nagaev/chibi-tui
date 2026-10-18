@@ -1,6 +1,6 @@
 //! Tests for the shared config-screen component (state + render), plus the
 //! masking / secrets-invariant contracts. Uses explicit `load_at(temp)`
-//! paths — no real `~/chibi-bot/settings` is ever touched.
+//! paths; no real `~/chibi-bot/settings` is ever touched.
 
 use super::*;
 use ratatui::backend::TestBackend;
@@ -46,7 +46,6 @@ fn select_row(state: &mut ConfigState, key: &str) {
     panic!("key {key} not in the registry");
 }
 
-//------------------------------------------------------------------------
 // masking
 
 #[test]
@@ -81,11 +80,11 @@ fn list_view_masks_secrets_and_marks_placeholders() {
         "commented-out secret masked too"
     );
     assert!(
-        rendered.contains("\u{2014} (empty)"),
+        rendered.contains("- (empty)"),
         "empty-but-set renders as empty: {rendered}"
     );
     assert!(
-        rendered.contains("\u{2014} (not set)") && rendered.contains("[default]"),
+        rendered.contains("- (not set)") && rendered.contains("[default]"),
         "absent keys marked: {rendered}"
     );
     assert!(
@@ -110,7 +109,6 @@ fn render_to_string(state: &mut ConfigState) -> String {
         .collect()
 }
 
-//------------------------------------------------------------------------
 // editing semantics
 
 #[test]
@@ -266,13 +264,12 @@ fn v_reveals_the_secret_only_while_editing() {
         !render_to_string(&mut state).contains("sk-1234567890abcd"),
         "v toggles back to masked"
     );
-    // Reveal dies with the edit session: commit, then re-open — masked.
+    // Reveal dies with the edit session: commit, then re-open (masked).
     press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
     press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
     assert!(!render_to_string(&mut state).contains("sk-1234567890abcd"));
 }
 
-//------------------------------------------------------------------------
 // navigation
 
 #[test]
@@ -306,7 +303,6 @@ fn page_keys_move_by_the_visible_window() {
     assert_eq!(state.row, 0);
 }
 
-//------------------------------------------------------------------------
 // save pipeline
 
 #[test]
@@ -421,7 +417,6 @@ fn missing_file_saves_create_it_with_sibling_dirs() {
     );
 }
 
-//------------------------------------------------------------------------
 // restart staging (Shell B)
 
 #[test]
@@ -471,7 +466,6 @@ fn no_restart_offer_without_restart_availability() {
     assert_eq!(state.confirm(), Confirm::None, "no restart modal");
 }
 
-//------------------------------------------------------------------------
 // secrets invariant
 
 #[test]
@@ -507,7 +501,6 @@ fn provider_key_configured_detects_set_keys() {
     assert!(some_set, "a real key IS configured");
 }
 
-//------------------------------------------------------------------------
 // render smoke
 
 #[test]
@@ -540,7 +533,7 @@ fn screen_renders_groups_descriptions_and_dirty_marker() {
 fn dev_banner_tracks_exact_chibi_env_value() {
     // SAFETY (single-threaded test binary ordering): setting an env var for
     // a render assertion; the render reads it per frame. Both values are
-    // exercised inside ONE test — the var is process-global and the suite
+    // exercised inside ONE test; the var is process-global and the suite
     // runs in parallel threads.
     std::env::set_var("CHIBI_ENV", "dev");
     let mut state = state_at("devbanner", "DEFAULT_MODEL=x\n");
@@ -550,7 +543,7 @@ fn dev_banner_tracks_exact_chibi_env_value() {
         "dev warning banner in the header: {rendered}"
     );
     // Any value other than exactly `dev` (case-insensitive) leaves the file
-    // live on the backend — the banner must NOT show and auto-open stays on.
+    // live on the backend, so the banner must NOT show and auto-open stays on.
     std::env::set_var("CHIBI_ENV", "production");
     let mut state = state_at("devbanner-prod", "DEFAULT_MODEL=x\n");
     let rendered = render_to_string(&mut state);
@@ -597,7 +590,7 @@ fn discard_confirm_covers_save_discard_and_stay() {
 
 #[test]
 fn discard_confirm_s_is_a_save_alias() {
-    // The modal hint and HOTKEY_ROWS advertise `s/Enter save` — a bare `s`
+    // The modal hint and HOTKEY_ROWS advertise `s/Enter save`, so a bare `s`
     // must confirm-save-and-close, not fall through as a no-op (regression:
     // `s` used to hit the shared grammar's Swallow arm and the modal stayed
     // open forever).
@@ -623,7 +616,6 @@ fn discard_confirm_s_is_a_save_alias() {
     assert!(state.dirty(), "save action leaves the staged change intact");
 }
 
-//------------------------------------------------------------------------
 // mouse seam: render-fed geometry
 
 /// Render one frame on a TestBackend of the given size (geometry tests).
@@ -800,7 +792,6 @@ fn geometry_is_cloned_but_excluded_from_equality() {
     assert_eq!(a, c, "geometry divergence does not affect PartialEq");
 }
 
-//------------------------------------------------------------------------
 // mouse handling: wheel + click routing (the shared lib entry point)
 
 /// Hand-built mouse event at a terminal position, as crossterm delivers it.
@@ -884,7 +875,7 @@ fn wheel_over_the_groups_pane_moves_the_group_selection() {
 
     state.handle_mouse(mouse_at(MouseEventKind::ScrollDown, cx, cy));
     assert_eq!(state.group_index(), 2);
-    // Wheel up twice lands on group 0 and CLAMPS there — no rem_euclid
+    // Wheel up twice lands on group 0 and CLAMPS there, no rem_euclid
     // wraparound to the last group.
     state.handle_mouse(mouse_at(MouseEventKind::ScrollUp, cx, cy));
     state.handle_mouse(mouse_at(MouseEventKind::ScrollUp, cx, cy));
@@ -968,7 +959,7 @@ fn mouse_events_are_swallowed_while_the_edit_input_is_open() {
     press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
     assert!(state.edit.is_some(), "precondition: editor open");
 
-    // Wheel and clicks anywhere — even on a group row — change nothing.
+    // Wheel and clicks anywhere (even on a group row) change nothing.
     state.handle_mouse(mouse_at(
         MouseEventKind::ScrollDown,
         geo.groups.x,

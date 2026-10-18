@@ -195,7 +195,7 @@ async fn main() -> io::Result<()> {
                     // the default `chibi` is simply absent: show the
                     // dedicated setup screen instead of the generic popup.
                     // The override is `CHIBI_BACKEND_BIN` OR a persisted
-                    // installer path whose binary still exists — a persisted
+                    // installer path whose binary still exists; a persisted
                     // path pointing at a vanished binary must NOT suppress
                     // the screen (the reinstall flow owns that case).
                     // Everything else (a broken custom binary, handshake
@@ -212,7 +212,7 @@ async fn main() -> io::Result<()> {
                             setup_screen::Flow::Installed => {
                                 // Unconditional handoff (BYOK): after a
                                 // verified install the backend config screen
-                                // always opens — running without keys would
+                                // always opens, since running without keys would
                                 // be pointless. Save-and-close respawns the
                                 // backend; cancel keeps the quit semantics.
                                 let mut cfg_reader = EventStream::new();
@@ -247,10 +247,10 @@ async fn main() -> io::Result<()> {
 
     // Auto-open the config editor (once per session, dismissable): a live
     // session whose settings file has NO provider key configured opens the
-    // editor on startup — a warning, never a block (stdio does not fail
+    // editor on startup: a warning, never a block (stdio does not fail
     // fast on a missing config, verified). Skipped in mock mode (nothing to
     // configure) and under CHIBI_ENV=dev (the backend ignores the file in
-    // dev mode — the editor's own banner carries the same warning).
+    // dev mode; the editor's own banner carries the same warning).
     if !cli.mock
         && !chibi_tui::config_screen::is_dev_mode()
         && !chibi_tui::config_screen::provider_key_configured()
@@ -789,7 +789,7 @@ async fn run_loop(
         }
 
         // Popup-requested reconnect (R from the error popup, or the config
-        // editor's restart confirmation). Runs on EVERY loop iteration — a
+        // editor's restart confirmation). Runs on EVERY loop iteration, so a
         // request staged anywhere (key arm or the deferred check above) is
         // consumed on the same pass.
         if let Some(ReconnectRequest {}) = app.reconnect_requested.take() {

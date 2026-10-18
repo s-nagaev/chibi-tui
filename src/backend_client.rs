@@ -641,7 +641,7 @@ mod tests {
 
     /// `CHIBI_BACKEND_BIN` set to a broken path: the setup screen must NOT
     /// apply (the override is explicit), so the generic error popup is the
-    /// surface — and its text names the exact binary the user pointed at,
+    /// surface, and its text names the exact binary the user pointed at,
     /// not the default `chibi`.
     #[tokio::test]
     async fn broken_env_override_surfaces_a_generic_error_naming_the_binary() {
@@ -674,7 +674,7 @@ mod tests {
     }
 
     /// R1-A: the extra bin dir is PREPENDED to the backend child's `PATH`
-    /// (not appended, not replacing) — a freshly installed `chibi`'s helpers
+    /// (not appended, not replacing), so a freshly installed `chibi`'s helpers
     /// must win over whatever the TUI inherited.
     #[tokio::test]
     async fn extra_bin_dir_is_prepended_to_the_child_path() {

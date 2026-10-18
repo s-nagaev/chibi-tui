@@ -104,8 +104,8 @@ fn backend_override_prefers_env_then_existing_persisted_path() {
 
 /// Full gate matrix: the setup screen applies ONLY to a bare spawn failure
 /// with no effective override. The override is `CHIBI_BACKEND_BIN` (even a
-/// broken one — the user's explicit choice wins and the generic popup keeps
-/// the error text) or a persisted installer path — but only while that
+/// broken one; the user's explicit choice wins and the generic popup keeps
+/// the error text) or a persisted installer path, but only while that
 /// binary still exists; a vanished persisted path re-opens the screen so the
 /// reinstall flow can run.
 #[test]
@@ -119,7 +119,7 @@ fn gate_matrix_env_and_live_persisted_close_the_screen_vanished_persisted_reopen
         &spawn(),
         backend_override_with(None, None).as_deref()
     ));
-    // 2. CHIBI_BACKEND_BIN set — even pointing at a nonexistent binary:
+    // 2. CHIBI_BACKEND_BIN set, even pointing at a nonexistent binary:
     //    the user's explicit override closes the screen (the generic error
     //    popup owns the message; see the backend_client test that pins the
     //    error text naming the binary).

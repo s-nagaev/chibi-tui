@@ -710,7 +710,7 @@ pub fn handle_key_with_copy(
         // over `~/chibi-bot/settings` (the shared component; the pre-loop
         // Shell A screen reuses it offline). Toggle-close runs through the
         // ConfigEditor modal branch above, which captures every key while
-        // the editor is open — this arm only ever OPENS.
+        // the editor is open, so this arm only ever OPENS.
         //
         // Chord verification (same audit class as F1): only F(1) was bound;
         // F(2) has a dedicated escape sequence on legacy terminals (no

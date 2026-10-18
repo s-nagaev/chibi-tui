@@ -1,9 +1,9 @@
 //! Backend-configuration screen: ONE state + render + key-handling component
 //! consumed by TWO thin IO shells (plan.md v2 Architecture):
 //!
-//! * **Shell B (in-app)** — the [`crate::app::Mode::ConfigEditor`] modal over a
+//! * **Shell B (in-app)**: the [`crate::app::Mode::ConfigEditor`] modal over a
 //!   running session. The component lives here; `App`/`Mode` only carry it.
-//! * **Shell A (pre-loop)** — [`run`], a standalone mini-app structurally
+//! * **Shell A (pre-loop)**: [`run`], a standalone mini-app structurally
 //!   cloned from `setup_screen::run`: no backend process, no `App`, sync
 //!   `std::fs` only. It never spawns the backend; the caller's setup loop
 //!   respawns after a save.
@@ -33,7 +33,7 @@
 //!
 //! `CHIBI_TUI_SETTINGS_PATH` overrides the settings file location (test/CI
 //! seam, same pattern as `CHIBI_TUI_HOME` in `history.rs`); otherwise the
-//! engine's canonical `~/chibi-bot/settings` (the backend hardcodes it — no
+//! engine's canonical `~/chibi-bot/settings` (the backend hardcodes it, no
 //! XDG).
 
 use std::collections::HashMap;
@@ -75,7 +75,7 @@ pub fn resolve_settings_path() -> Option<PathBuf> {
 
 /// True when at least one Group-1 provider key is actively set to a
 /// non-empty value in the settings file. A missing/unreadable file is NOT
-/// configured — the auto-open signal of both shells.
+/// configured (the auto-open signal of both shells.
 pub fn provider_key_configured() -> bool {
     let Some(path) = resolve_settings_path() else {
         return false;
@@ -97,7 +97,7 @@ pub enum Flow {
     Cancelled,
 }
 
-/// What the key handler asks the OWNING shell to do. Purely declarative —
+/// What the key handler asks the OWNING shell to do. Purely declarative;
 /// the shells own the I/O (the save write in Shell B's dispatch, the restart
 /// in the event loop).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,8 +188,8 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 /// The open single-line value editor (the `Renaming` pattern, scoped to one
-/// row). The `Debug` impl is manual and redacts `buf` — it may hold a secret
-/// between keystrokes.
+/// row). The `Debug` impl is manual and redacts `buf` (it may hold a secret
+/// between keystrokes).
 struct EditState {
     buf: String,
     /// `v` toggle: show the secret as typed. Dies with the edit session.
@@ -240,7 +240,7 @@ pub struct ConfigState {
     /// Render-fed visible row count (same seam as `picker_visible_rows`).
     rows_visible: usize,
     /// Render-fed pane geometry for the mouse seam (the "Mouse seam" module
-    /// section): `None` until the first config render — mouse events that
+    /// section): `None` until the first config render: mouse events that
     /// precede it are no-ops. Excluded from `PartialEq` (like
     /// `rows_visible`): pure render output, not user-visible state.
     pub geometry: Option<ConfigGeometry>,
@@ -255,7 +255,7 @@ pub struct ConfigState {
     /// Transient status note (saved / reloaded / file-missing hint).
     note: Option<String>,
     /// Shell B: whether a restart offer makes sense (live session). Shell A
-    /// and mock sessions run with `false` — no restart prompt after a save.
+    /// and mock sessions run with `false`: no restart prompt after a save.
     restart_available: bool,
 }
 
@@ -286,7 +286,7 @@ impl Clone for ConfigState {
 impl fmt::Debug for ConfigState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Redacted on purpose: the document and the edit buffer hold secret
-        // values (secrets invariant) — never rendered through Debug.
+        // values (secrets invariant), never rendered through Debug.
         f.debug_struct("ConfigState")
             .field("path", &self.path)
             .field("group", &self.group)
@@ -320,7 +320,7 @@ impl Eq for ConfigState {}
 impl ConfigState {
     /// Load the resolved settings file (Shell B's F2 / auto-open path). A
     /// missing file is NOT generated here: the screen starts empty and the
-    /// first save creates it — a mere keypress in the app must never write
+    /// first save creates it: a mere keypress in the app must never write
     /// the user's disk.
     pub fn load(restart_available: bool) -> ConfigState {
         match resolve_settings_path() {
@@ -355,8 +355,7 @@ impl ConfigState {
         match stat_settings(&state.path) {
             Ok(None) => {
                 state.file_missing = true;
-                state.note =
-                    Some("settings file not found — it will be created on save".to_owned());
+                state.note = Some("settings file not found; it will be created on save".to_owned());
             }
             Ok(Some(meta)) => match load_settings(&state.path) {
                 Ok((doc, _)) => {
@@ -438,8 +437,8 @@ impl ConfigState {
     /// Text rendered in the value column of the list (masking included).
     fn display_value(&self, def: &KeyDef) -> String {
         match self.current_value(def) {
-            None => "\u{2014} (not set)".to_owned(),
-            Some(v) if v.is_empty() => "\u{2014} (empty)".to_owned(),
+            None => "- (not set)".to_owned(),
+            Some(v) if v.is_empty() => "- (empty)".to_owned(),
             Some(v) => match def.kind {
                 Kind::Secret => mask_secret(&v),
                 Kind::Bool => format!("[{}]", v.trim().to_ascii_lowercase()),
@@ -487,7 +486,7 @@ impl ConfigState {
                 buf: edit.buf,
                 reveal: edit.reveal,
                 error: Some(
-                    "${VAR} interpolation is not supported here — paste the literal value"
+                    "${VAR} interpolation is not supported here; paste the literal value"
                         .to_owned(),
                 ),
             });
@@ -555,7 +554,7 @@ impl ConfigState {
 
     fn handle_discard_confirm(&mut self, key: KeyEvent, ctrl: bool) -> ConfigAction {
         // `d` (discard & close) and `s` (save & close) ride outside the shared
-        // two-decision grammar — the modal hint and HOTKEY_ROWS advertise
+        // two-decision grammar: the modal hint and HOTKEY_ROWS advertise
         // `s/Enter save · d discard · Esc/n stay`.
         if !ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
             self.reload_from_disk();
@@ -749,7 +748,7 @@ impl ConfigState {
         if !failures.is_empty() {
             self.errors = failures.into_iter().map(|e| (e.key, e.message)).collect();
             let n = self.errors.len();
-            self.note = Some(format!("{n} invalid value(s) — fix them before saving"));
+            self.note = Some(format!("{n} invalid value(s), fix them before saving"));
             return SaveOutcome::ValidationFailed;
         }
         self.errors.clear();
@@ -781,7 +780,7 @@ impl ConfigState {
     }
 
     /// Post-save modal staging (Shell B only): with a restart available, ask
-    /// about the backend restart — the plain variant when idle, the
+    /// about the backend restart: the plain variant when idle, the
     /// in-flight-warning variant when a request is running. Called by the
     /// dispatch after a successful [`ConfigState::perform_save`].
     pub fn after_save(&mut self, any_busy: bool) {
@@ -822,7 +821,7 @@ impl ConfigState {
     /// `keys_inner` rect) to row `row_offset + (y - keys_inner.y)`. Ignored
     /// (no state change) when the geometry is absent, `y` is above the pane,
     /// the mapped index is past the current group's last row (an empty
-    /// group has none), or — otherwise — the row is selected and the stored
+    /// group has none), or, otherwise, the row is selected and the stored
     /// `row_offset` snapshot is refreshed via `clamp_offset`
     /// so the seam stays consistent between renders.
     pub fn select_row_at(&mut self, y: u16) {
@@ -843,7 +842,7 @@ impl ConfigState {
 
     /// Mouse click on the left pane: map `y` (inside the stored `groups`
     /// rect) to group index `y - groups.y` (no scroll offset there). An
-    /// out-of-range index is ignored ENTIRELY — `switch_group`
+    /// out-of-range index is ignored ENTIRELY: `switch_group`
     /// is delta-based with `rem_euclid` wrapping, so an unchecked delta would
     /// land on an unrelated group. In range, the click routes through
     /// `switch_group` (its row/row_offset reset is intended) and refreshes
@@ -863,7 +862,7 @@ impl ConfigState {
         self.refresh_geometry_offset();
     }
 
-    /// Route one mouse event (the ONE entry point both shells share —
+    /// Route one mouse event (the ONE entry point both shells share:
     /// Shell B's `mouse` arm and Shell A's `run` loop both
     /// delegate here). Pure state mutation, like [`ConfigState::handle_key`].
     ///
@@ -876,13 +875,13 @@ impl ConfigState {
     ///   (moving only `row_offset` would let the highlight scroll out of
     ///   the visible window), over the groups pane the group selection
     ///   moves one step per notch through the same guarded path as
-    ///   `select_group_at` (range-checked — no `rem_euclid` wraparound;
+    ///   `select_group_at` (range-checked, no `rem_euclid` wraparound;
     ///   `switch_group`'s row/row_offset reset is intended, it mirrors
     ///   ←/→); outside both panes: no-op. The stored geometry snapshot is
     ///   refreshed after every move so hit-tests stay consistent between
     ///   renders;
     /// - LEFT-BUTTON-UP clicks only SELECT (`select_row_at` /
-    ///   `select_group_at`) — no toggle-on-click, no editing, no secret
+    ///   `select_group_at`): no toggle-on-click, no editing, no secret
     ///   reveal (keyboard parity);
     /// - other buttons and press/drag/motion states are ignored (no
     ///   drag-selection in the config screen).
@@ -937,8 +936,8 @@ fn is_bool_true(v: &str) -> bool {
 }
 
 /// Mask a secret for the LIST view: `••••…last4` when long enough, a fixed
-/// bullet run otherwise. (`— (not set)` / `— (empty)` are handled by the
-/// caller — they are state, not masking.)
+/// bullet run otherwise. (`- (not set)` / `- (empty)` are handled by the
+/// caller; they are state, not masking.)
 pub fn mask_secret(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() >= 8 {
@@ -951,7 +950,7 @@ pub fn mask_secret(value: &str) -> String {
 
 /// True when `CHIBI_ENV` equals `dev` (case-insensitive). This mirrors the
 /// backend's exact check (`chibi/config/app.py`: `os.getenv("CHIBI_ENV",
-/// "no-dev").lower() != "dev"` skips the settings file) — any other value
+/// "no-dev").lower() != "dev"` skips the settings file); any other value
 /// leaves the file live, so no warning is shown.
 pub fn is_dev_mode() -> bool {
     std::env::var("CHIBI_ENV")
@@ -960,7 +959,7 @@ pub fn is_dev_mode() -> bool {
 }
 
 /// Render the screen (full-frame overlay for Shell B, whole terminal for
-/// Shell A). Purely visual — all key handling lives in
+/// Shell A). Purely visual: all key handling lives in
 /// [`ConfigState::handle_key`].
 pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect) {
     f.render_widget(Clear, area);
@@ -996,7 +995,7 @@ pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect)
     if dev_mode && rows[0].height > 0 {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " \u{26a0} CHIBI_ENV=dev — the backend ignores this file in dev mode",
+                " \u{26a0} CHIBI_ENV=dev: the backend ignores this file in dev mode",
                 Style::new().fg(theme.yellow),
             ))),
             rows[0],
@@ -1078,7 +1077,7 @@ pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect)
             ValueState::Absent => (false, true),
         };
         let value_text = state.display_value(def);
-        let placeholder = value_text.starts_with('\u{2014}');
+        let placeholder = value_text.starts_with('-');
         let value_style = match def.kind {
             Kind::Bool
                 if !placeholder && state.current_value(def).is_some_and(|v| is_bool_true(&v)) =>
@@ -1132,7 +1131,7 @@ pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect)
 
 /// The two footer rows: while editing, the first row becomes the single-line
 /// value editor (masked until `v`); otherwise it shows the selected key's
-/// DESCRIPTION only — never a value. The second row carries the key hints and
+/// DESCRIPTION only, never a value. The second row carries the key hints and
 /// the transient note / error.
 fn render_footer(f: &mut Frame, state: &mut ConfigState, theme: &Theme, desc: Rect, hints: Rect) {
     let width = desc.width.max(hints.width) as usize;
@@ -1188,7 +1187,7 @@ fn render_footer(f: &mut Frame, state: &mut ConfigState, theme: &Theme, desc: Re
                     ))
                 } else {
                     Line::from(Span::styled(
-                        format!("{} \u{2014} {}", def.key, def.description),
+                        format!("{}: {}", def.key, def.description),
                         Style::new().fg(theme.dim),
                     ))
                 }
@@ -1313,7 +1312,7 @@ fn render_confirm(f: &mut Frame, state: &ConfigState, theme: &Theme, area: Rect)
 }
 
 /// Shell A: the pre-loop configuration screen (structural clone of
-/// `setup_screen::run`). No `App`, no event channel, no backend process —
+/// `setup_screen::run`). No `App`, no event channel, no backend process,
 /// sync file IO only; the save path is the engine's atomic pipeline. A
 /// missing file is generated from the vendored template first (this shell IS
 /// the onboarding step after a backend install).
@@ -1321,7 +1320,7 @@ fn render_confirm(f: &mut Frame, state: &ConfigState, theme: &Theme, area: Rect)
 /// `q`/`Ctrl+C` ask before quitting (the shared quit-confirmation popup);
 /// Esc closes via the component (`Flow::Cancelled`, or the save/discard/
 /// stay confirm when dirty). A successful save-and-close returns
-/// [`Flow::Saved`]; the caller respawns the backend either way — NO restart
+/// [`Flow::Saved`]; the caller respawns the backend either way; NO restart
 /// is attempted here.
 pub async fn run(terminal: &mut Tui, reader: &mut EventStream, theme: &Theme) -> io::Result<Flow> {
     let mut state = match resolve_settings_path() {
@@ -1369,7 +1368,7 @@ pub async fn run(terminal: &mut Tui, reader: &mut EventStream, theme: &Theme) ->
             }
             Some(Ok(CtEvent::Mouse(mouse))) => {
                 // Shell A's local quit-confirmation: same parity as Shell B's
-                // app-level gate — clicks are swallowed while the popup is
+                // app-level gate: clicks are swallowed while the popup is
                 // up, the WHEEL stays live (scrolling behind the popup is
                 // harmless, the documented Panels convention). Everything
                 // else delegates to the shared lib entry point.

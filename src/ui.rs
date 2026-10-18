@@ -179,7 +179,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     if matches!(app.mode, Mode::ModelPicking { .. }) {
         render_model_picker(f, app, theme);
     }
-    // backend-configuration editor (rendered last — it owns the frame).
+    // backend-configuration editor (rendered last, it owns the frame).
     if matches!(app.mode, Mode::ConfigEditor { .. }) {
         if let Mode::ConfigEditor { state } = &mut app.mode {
             crate::config_screen::render(f, state, theme, f.area());
@@ -377,7 +377,7 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
     // Render-fed geometry seam for the mouse router (same pattern as
     // chat_geometry): the list's inner rect plus the ListState offset
-    // AFTER the render — ratatui scrolls the list internally when threads
+    // AFTER the render: ratatui scrolls the list internally when threads
     // overflow, so the offset is read from the state object, not
     // recomputed from app.active. Refreshed every frame like
     // chat_geometry; no explicit reset path anywhere.

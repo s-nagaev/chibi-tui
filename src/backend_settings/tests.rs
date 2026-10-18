@@ -6,9 +6,7 @@
 use super::*;
 use std::path::PathBuf;
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// Unique temp directory (no `tempfile` dependency in this crate).
 fn temp_dir(tag: &str) -> PathBuf {
@@ -32,9 +30,7 @@ fn active_value(doc: &SettingsDoc, key: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Parse semantics — every row of the analysis §1.1 probe matrix
-// ---------------------------------------------------------------------------
+// Parse semantics: every row of the analysis §1.1 probe matrix
 
 #[test]
 fn plain_value_parses_as_is() {
@@ -167,9 +163,7 @@ fn comment_prose_lines_are_not_mistaken_for_keys() {
     assert_eq!(active_value(&doc, "K"), "1");
 }
 
-// ---------------------------------------------------------------------------
 // Preservation: EOL kind, BOM, trailing newline, CRLF
-// ---------------------------------------------------------------------------
 
 #[test]
 fn crlf_line_endings_are_preserved() {
@@ -213,9 +207,7 @@ fn non_utf8_file_is_reported_not_parsed_silently() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-// ---------------------------------------------------------------------------
 // Round-trip byte-exactness (required)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn round_trip_is_byte_exact_on_a_complex_document() {
@@ -234,9 +226,7 @@ fn vendored_template_round_trips_byte_exactly() {
     assert_eq!(doc.render(), template);
 }
 
-// ---------------------------------------------------------------------------
 // Edit operations
-// ---------------------------------------------------------------------------
 
 #[test]
 fn set_patches_only_the_target_line() {
@@ -381,9 +371,7 @@ fn debug_impls_never_leak_values() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Quoting / serialization rules (analysis §2.1)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn serialization_quotes_dangerous_values_and_round_trips() {
@@ -423,9 +411,7 @@ fn serialization_leaves_safe_values_unquoted() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Key registry
-// ---------------------------------------------------------------------------
 
 #[test]
 fn registry_row_counts_match_the_approved_slice() {
@@ -562,9 +548,7 @@ fn registry_environment_names_match_the_backend_configs() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Validation
-// ---------------------------------------------------------------------------
 
 #[test]
 fn bool_validation_matches_pydantic_parsing() {
@@ -632,9 +616,7 @@ fn validate_doc_returns_structured_per_row_errors() {
     assert!(errors.iter().all(|e| !e.message.is_empty()));
 }
 
-// ---------------------------------------------------------------------------
 // Template generation + drift guard
-// ---------------------------------------------------------------------------
 
 #[test]
 fn generated_output_interpolates_paths_and_forces_defaults() {
@@ -681,7 +663,7 @@ fn vendored_template_matches_backend_checkout_drift_guard() {
     // Skipped when the backend checkout is not found (e.g. CI without it).
     let backend_src = Path::new("../chibi/chibi/config_generator.py");
     if !backend_src.exists() {
-        eprintln!("backend checkout not found at ../chibi — drift guard skipped");
+        eprintln!("backend checkout not found at ../chibi, drift guard skipped");
         return;
     }
     let src = std::fs::read_to_string(backend_src).unwrap();
@@ -695,7 +677,7 @@ fn vendored_template_matches_backend_checkout_drift_guard() {
     assert_eq!(
         strip_provenance_header(VENDORED_TEMPLATE),
         template,
-        "vendored template drifted from backend main — re-copy the fixture"
+        "vendored template drifted from backend main; re-copy the fixture"
     );
 }
 
@@ -719,9 +701,7 @@ fn windows_path_shape_uses_platform_separators() {
     assert!(text.contains("HOME_DIR=C:\\Users\\someone\\chibi-bot\\home"));
 }
 
-// ---------------------------------------------------------------------------
 // Atomic write pipeline
-// ---------------------------------------------------------------------------
 
 #[test]
 fn save_writes_atomically_with_backup_and_chmod() {
@@ -802,9 +782,7 @@ fn load_captures_external_change_guard_metadata() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-// ---------------------------------------------------------------------------
 // Realistic end-to-end flow over the real template
-// ---------------------------------------------------------------------------
 
 #[test]
 fn template_edit_flow_patches_registry_keys_in_place() {

@@ -1,7 +1,7 @@
 //! Backend installer engine for the missing-backend onboarding flow.
 //!
-//! Discovers a usable Python interpreter (>=3.11, <4) **by execution** —
-//! never by binary name, since stock macOS `/usr/bin/python3` is 3.9.6 —
+//! Discovers a usable Python interpreter (>=3.11, <4) **by execution** (
+//! never by binary name, since stock macOS `/usr/bin/python3` is 3.9.6),
 //! detects pipx by execution (pyenv shims without backing installs fail),
 //! picks a rung from the owner-approved installer ladder, and runs the
 //! install with streamed, piped output. Installer children are always piped:
@@ -10,7 +10,7 @@
 //!
 //! All probes are time-limited. The pure decision logic (rung ladder,
 //! version gate, candidate enumeration) is separated from execution so it
-//! can be unit-tested offline with a mock [`ProbeExec`] — no network, no
+//! can be unit-tested offline with a mock [`ProbeExec`]: no network, no
 //! real interpreters.
 
 use std::collections::VecDeque;
@@ -36,7 +36,7 @@ pub enum Rung {
     /// `pip install --user` (only when the interpreter is not
     /// externally-managed, e.g. pyenv).
     PipUser,
-    /// `pip install --user --break-system-packages` — LAST resort, explicit
+    /// `pip install --user --break-system-packages`: LAST resort, explicit
     /// warning, never silent.
     BreakSystemPackages,
 }
@@ -112,9 +112,7 @@ impl ProbeExec for SysProbe {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Python discovery
-// ---------------------------------------------------------------------------
 
 /// A Python interpreter that passed the version gate by execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,9 +244,7 @@ pub async fn probe_python(exec: &dyn ProbeExec, candidate: &Candidate) -> Option
     })
 }
 
-// ---------------------------------------------------------------------------
 // Facts + ladder decision
-// ---------------------------------------------------------------------------
 
 /// Probed environment facts driving the ladder decision.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -259,7 +255,7 @@ pub struct Facts {
     pub externally_managed: bool,
 }
 
-/// Full discovery: interpreter probe, pipx probe (by execution — a pyenv shim
+/// Full discovery: interpreter probe, pipx probe (by execution: a pyenv shim
 /// without a backing install fails here), PEP 668 marker probe.
 pub async fn discover(exec: &dyn ProbeExec, os: TargetOs) -> Facts {
     let mut facts = Facts::default();
@@ -308,10 +304,10 @@ pub async fn discover(exec: &dyn ProbeExec, os: TargetOs) -> Facts {
 }
 
 /// Installer ladder, authoritative order. Applicability per rung:
-/// 1. pipx — requires a working pipx probe
-/// 2. TUI-owned venv — always available once a python exists
-/// 3. `pip --user` — ONLY when the interpreter is not externally managed
-/// 4. `--break-system-packages` — last resort, never silent
+/// 1. pipx, requires a working pipx probe
+/// 2. TUI-owned venv, always available once a python exists
+/// 3. `pip --user`, ONLY when the interpreter is not externally managed
+/// 4. `--break-system-packages`, last resort, never silent
 pub fn applicable_rungs(facts: &Facts) -> Vec<Rung> {
     if facts.python.is_none() {
         return Vec::new();
@@ -340,9 +336,7 @@ pub fn next_applicable_rung(current: Rung, facts: &Facts) -> Option<Rung> {
     rungs.into_iter().nth(idx + 1)
 }
 
-// ---------------------------------------------------------------------------
 // Installer commands + binary resolution
-// ---------------------------------------------------------------------------
 
 /// One install command to execute and stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -507,9 +501,7 @@ pub async fn verify_binary(exec: &dyn ProbeExec, binary: &Path) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Streaming install runner
-// ---------------------------------------------------------------------------
 
 /// Bounded tail of streamed installer output (ANSI-stripped, CR-split).
 #[derive(Clone, Debug)]
@@ -613,7 +605,7 @@ impl InstallHandle {
 
 /// Spawn the installer for a rung as a detached task that streams output
 /// into the shared log tail and reports one final outcome. Children are
-/// always piped — never inheriting the TUI's stdio.
+/// always piped, never inheriting the TUI's stdio.
 pub fn spawn_install(facts: &Facts, rung: Rung, venv_dir: PathBuf) -> InstallHandle {
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let log = Arc::new(Mutex::new(LogTail::new(400)));
@@ -1165,7 +1157,7 @@ mod tests {
         assert_eq!(next_applicable_rung(Rung::Venv, &f), Some(Rung::PipUser));
 
         // Marker probe itself fails (no output): the safe reading is
-        // "not externally managed" — the rung stays available.
+        // "not externally managed": the rung stays available.
         *exec.versions.lock().unwrap() = vec!["3.12.4"];
         exec.externally_managed = None;
         let f = discover(&exec, TargetOs::Unix).await;

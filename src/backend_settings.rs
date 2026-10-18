@@ -1,5 +1,5 @@
 //! Lossless dotenv engine + key registry for the backend settings file
-//! (`~/chibi-bot/settings` — the file the Python backend reads with
+//! (`~/chibi-bot/settings`, the file the Python backend reads with
 //! `python-dotenv`'s `dotenv_values()` at startup).
 //!
 //! This is the pure core consumed by both the pre-loop config screen and the
@@ -51,9 +51,7 @@ use std::time::SystemTime;
 
 use thiserror::Error;
 
-// ---------------------------------------------------------------------------
 // Errors
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
@@ -76,9 +74,7 @@ pub struct FileMeta {
     pub len: u64,
 }
 
-// ---------------------------------------------------------------------------
 // Line model
-// ---------------------------------------------------------------------------
 
 /// Line terminator of a key record's last physical line (`None` = last line of
 /// a file without a trailing newline).
@@ -146,7 +142,7 @@ impl fmt::Debug for KeyLine {
 
 /// A line of the settings file. `Banner` marks the `# ====…` frame lines used
 /// as section anchors; `Other` holds non-key, non-comment junk lines that
-/// python-dotenv would ignore — they are preserved verbatim.
+/// python-dotenv would ignore; they are preserved verbatim.
 #[derive(Clone)]
 pub enum Line {
     Blank { raw: String },
@@ -541,9 +537,7 @@ impl KeyLine {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Physical line splitting & dotenv parsing
-// ---------------------------------------------------------------------------
 
 struct PhysLine {
     /// Raw bytes of the line including its EOL (absent for a final line
@@ -666,7 +660,7 @@ fn try_parse_key_line(text: &str, eol: Option<Eol>, allow_commented: bool) -> Op
 /// Fold a multiline double-quoted record starting at `phys[start]` (the
 /// physical line whose value opened a `"` that never closed). Consumes
 /// physical lines until the closing quote; physical line breaks inside the
-/// quotes become `\n` in the decoded value — matching python-dotenv.
+/// quotes become `\n` in the decoded value, matching python-dotenv.
 fn fold_multiline(phys: &[PhysLine], start: usize, opened: KeyStart) -> (KeyLine, usize) {
     let mut raw = opened.line.raw.clone();
     let mut inner = opened.line.raw_value[1..].to_string();
@@ -799,9 +793,9 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// Serialize a value for writing: quote (double) only when required — value
+/// Serialize a value for writing: quote (double) only when required (value
 /// contains ` #`, `"`, `\`, `${`, `=`, a newline/tab, or leading/trailing
-/// whitespace — escaping `\`, `"`, `\n`, `\r`, `\t` inside the quotes.
+/// whitespace), escaping `\`, `"`, `\n`, `\r`, `\t` inside the quotes.
 fn serialize_value(value: &str) -> String {
     let needs_quotes = value != value.trim()
         || value.contains('"')
@@ -832,9 +826,7 @@ fn serialize_value(value: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Key registry
-// ---------------------------------------------------------------------------
 
 /// Value kind of a registry key, driving client-side validation and the UI
 /// editor shape. The backend validates nothing at startup and type violations
@@ -854,21 +846,21 @@ pub enum Kind {
 /// Registry group (mirrors the template's section layout).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Group {
-    /// Template §2 — provider API keys.
+    /// Template §2: provider API keys.
     ProviderKeys,
-    /// Template §3 — Suno / ElevenLabs.
+    /// Template §3: Suno / ElevenLabs.
     MediaProviders,
-    /// Template §12 — web/search integration keys (Jina, Google Custom Search).
+    /// Template §12: web/search integration keys (Jina, Google Custom Search).
     Integrations,
-    /// Template §10 (+ DEFAULT_* from §8) — model & role routing.
+    /// Template §10 (+ DEFAULT_* from §8): model & role routing.
     ModelRouting,
     /// Core behaviour toggles & limits (§5/§6/§8/§11/§13/§16/§17/§18/§4.1).
     CoreBehaviour,
-    /// Template §7 — model/tool restriction lists.
+    /// Template §7: model/tool restriction lists.
     Restrictions,
-    /// Template §5 — agent filesystem paths.
+    /// Template §5: agent filesystem paths.
     AgentPaths,
-    /// Storage & metrics services (§4/§15) — Redis, InfluxDB.
+    /// Storage & metrics services (§4/§15): Redis, InfluxDB.
     Service,
 }
 
@@ -940,7 +932,7 @@ const S41: &str = "4.1 INFINITE CONTEXT (ChromaDB)";
 
 /// The static key registry (owner-approved stripped slice, plan.md v2;
 /// reworked 2026-10-10 with the Integrations and Service groups). Explicitly
-/// excluded: `CLIENT` (force-set by the backend CLI — inert in the file),
+/// excluded: `CLIENT` (force-set by the backend CLI, inert in the file),
 /// telegram keys and telegram-access whitelists, memory group, heartbeat.
 /// Unknown file keys are tolerated and never rewritten.
 pub const REGISTRY: &[KeyDef] = &[
@@ -1247,7 +1239,7 @@ pub const REGISTRY: &[KeyDef] = &[
         group: Group::CoreBehaviour,
         kind: Kind::Float { min: 0.0, max: 2.0 },
         default: "1.0",
-        description: "Sampling temperature (0.0–2.0)",
+        description: "Sampling temperature (0.0-2.0)",
         secret: false,
         commented: false,
         section: S8,
@@ -1454,7 +1446,7 @@ pub const REGISTRY: &[KeyDef] = &[
 /// Keys that the generated template MUST ship with a forced `true` value
 /// (owner decision 2026-10-03), regardless of what the vendored template
 /// carries. This list is only about template generation: the keys here may
-/// (and do) also appear as registered UI rows in [`REGISTRY`] — being listed
+/// (and do) also appear as registered UI rows in [`REGISTRY`]; being listed
 /// here does not make them hidden from the config screen.
 pub const TEMPLATE_ONLY_FORCED_DEFAULTS: &[(&str, &str)] = &[("ENABLE_INFINITE_CONTEXT", "true")];
 
@@ -1541,9 +1533,7 @@ pub fn registry_get(key: &str) -> Option<&'static KeyDef> {
     REGISTRY.iter().find(|d| d.key == key)
 }
 
-// ---------------------------------------------------------------------------
 // Validation (client-side; the backend validates nothing at startup)
-// ---------------------------------------------------------------------------
 
 /// A per-row validation failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1628,9 +1618,7 @@ pub fn validate_doc(doc: &SettingsDoc) -> Vec<ValidationError> {
     errors
 }
 
-// ---------------------------------------------------------------------------
 // Template generation (missing-file path)
-// ---------------------------------------------------------------------------
 
 /// Vendored canonical copy of the backend template (`DEFAULT_CONFIG` body of
 /// `chibi/config_generator.py`, with the f-string placeholders intact).
@@ -1649,7 +1637,7 @@ fn strip_provenance_header(template: &str) -> &str {
     }
 }
 
-/// Literal `~/chibi-bot` base directory — the backend hardcodes it (no XDG).
+/// Literal `~/chibi-bot` base directory; the backend hardcodes it (no XDG).
 pub fn settings_base_dir() -> Result<PathBuf, SettingsError> {
     dirs::home_dir()
         .map(|home| home.join("chibi-bot"))
@@ -1676,7 +1664,7 @@ pub fn ensure_chibi_bot_dirs(base: &Path) -> std::io::Result<()> {
 }
 
 /// Render the generated settings file body: interpolate the four path
-/// placeholders (LOCAL_DATA_PATH, HOME_DIR, WORKING_DIR, SKILLS_DIR — note the
+/// placeholders (LOCAL_DATA_PATH, HOME_DIR, WORKING_DIR, SKILLS_DIR; note the
 /// template uses the HOME_DIR placeholder for WORKING_DIR too, mirrored
 /// verbatim) and force the three defaults to `true` in the generated output
 /// only (FILESYSTEM_ACCESS, ENABLE_MCP_STDIO, ENABLE_INFINITE_CONTEXT).
@@ -1720,9 +1708,7 @@ pub fn write_generated_settings(path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-// ---------------------------------------------------------------------------
 // Atomic write pipeline
-// ---------------------------------------------------------------------------
 
 /// File fingerprint captured on load.
 pub fn stat_settings(path: &Path) -> std::io::Result<Option<FileMeta>> {

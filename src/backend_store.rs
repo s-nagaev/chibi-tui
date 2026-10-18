@@ -8,7 +8,7 @@
 //! `CHIBI_BACKEND_BIN` by hand.
 //!
 //! The store is one small JSON document under the history root
-//! (`<data>/chibi-tui/backend.json`, `CHIBI_TUI_HOME` override — same
+//! (`<data>/chibi-tui/backend.json`, `CHIBI_TUI_HOME` override, same
 //! resolution as [`crate::history`]). It holds exactly one non-secret key:
 //! the absolute path of the verified backend binary. I/O failures degrade:
 //! save failures are non-fatal, an unreadable/corrupt file reads as "no
@@ -17,7 +17,7 @@
 //! The persisted path is NOT `CHIBI_BACKEND_BIN`: the env var stays the
 //! user's explicit escape hatch and keeps gating the setup screen; the
 //! store only feeds the spawn resolution order
-//! (`CHIBI_BACKEND_BIN` → persisted path → `PATH` lookup) — see
+//! (`CHIBI_BACKEND_BIN` → persisted path → `PATH` lookup); see
 //! [`crate::request_pipeline`] and [`crate::setup_screen::backend_override`].
 
 use std::io;
@@ -44,14 +44,14 @@ pub fn resolve_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".chibi-tui"))
 }
 
-/// Store document path under an explicit root (test seam — keeps tests off
+/// Store document path under an explicit root (test seam: keeps tests off
 /// process env).
 pub fn store_path(root: &Path) -> PathBuf {
     root.join("backend.json")
 }
 
 /// Read the persisted binary path from an explicit root. `None` on missing,
-/// unreadable, corrupt, or empty entries — never an error.
+/// unreadable, corrupt, or empty entries, never an error.
 pub fn load_backend_path_at(root: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(store_path(root)).ok()?;
     let doc: StoreDoc = serde_json::from_str(&text).ok()?;
@@ -79,7 +79,7 @@ pub fn load_backend_path() -> Option<PathBuf> {
 }
 
 /// Persist the binary path under the default root. Best-effort: a failed
-/// save must never take down the installer — the session still works (the
+/// save must never take down the installer; the session still works (the
 /// binary path was just resolved in memory); only the NEXT launch loses the
 /// shortcut and sees the setup screen again.
 pub fn save_backend_path(path: &Path) {
