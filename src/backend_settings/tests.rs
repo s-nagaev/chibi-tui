@@ -418,12 +418,12 @@ fn registry_row_counts_match_the_approved_slice() {
     assert_eq!(Group::ProviderKeys.keys().count(), 31);
     assert_eq!(Group::MediaProviders.keys().count(), 2);
     assert_eq!(Group::Integrations.keys().count(), 3);
-    assert_eq!(Group::ModelRouting.keys().count(), 12);
+    assert_eq!(Group::ModelRouting.keys().count(), 14);
     assert_eq!(Group::CoreBehaviour.keys().count(), 18);
     assert_eq!(Group::Restrictions.keys().count(), 3);
     assert_eq!(Group::AgentPaths.keys().count(), 3);
     assert_eq!(Group::Service.keys().count(), 5);
-    assert_eq!(REGISTRY.len(), 77);
+    assert_eq!(REGISTRY.len(), 79);
 }
 
 #[test]

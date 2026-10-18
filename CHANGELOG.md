@@ -10,6 +10,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Mouse support in the backend settings editor: the wheel moves the group or row selection by the pane under the cursor, and a left click selects a group or row; mouse events are swallowed while the value editor or a confirmation prompt is open. Available in both editor shells (the F2 in-app modal and the post-onboarding screen).
 - Base-surface mouse clicks: a left click on a thread in the sidebar switches to that thread (same live switching as the arrow keys) and focuses the sidebar; clicking below the last thread only moves focus, and clicks on the sidebar borders change nothing. A left click in the chat pane or the input area moves focus to the chat, alongside the existing drag-to-select text behavior.
+- Failover chain settings in the config editor: `FAILOVER_CHAIN_MASTER` (main chat requests) and `FAILOVER_CHAIN_SUBAGENT` (sub-agent requests) are now editable in the Model Routing group, accepting `auto`, `disabled`, or an ordered comma-separated list of `provider/model` pairs.
 
 ## [0.5.0] - 2026-10-09
 
