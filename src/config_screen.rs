@@ -435,15 +435,19 @@ impl ConfigState {
     }
 
     /// Text rendered in the value column of the list (masking included).
+    /// A valueless row (absent, or set to an empty value) surfaces the
+    /// registry default when one exists; otherwise the `- (not set)` /
+    /// `- (empty)` placeholder. A real non-empty value always wins.
     fn display_value(&self, def: &KeyDef) -> String {
         match self.current_value(def) {
-            None => "- (not set)".to_owned(),
-            Some(v) if v.is_empty() => "- (empty)".to_owned(),
-            Some(v) => match def.kind {
+            Some(v) if !v.is_empty() => match def.kind {
                 Kind::Secret => mask_secret(&v),
                 Kind::Bool => format!("[{}]", v.trim().to_ascii_lowercase()),
                 _ => v,
             },
+            _ if !def.default.is_empty() => format!("- (default: {})", def.default),
+            None => "- (not set)".to_owned(),
+            Some(_) => "- (empty)".to_owned(),
         }
     }
 
