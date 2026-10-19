@@ -143,14 +143,20 @@ impl BackendClient {
     /// The binary is resolved from `CHIBI_BACKEND_BIN` (override seam),
     /// falling back to `"chibi"` on `$PATH`.
     pub async fn spawn(workspace_root: impl AsRef<Path>) -> Result<Self, BackendError> {
-        Self::spawn_command(workspace_root, &default_argv()).await
+        Self::spawn_command(workspace_root, &default_argv(), &[]).await
     }
 
     /// Shared spawn path. `argv` is either the production command line or
     /// (in tests) `/bin/sh -c <script>` / `python3 fake_backend.py`.
+    /// `extra_path_dirs` are PREPENDED to the child's `PATH` (backend spawn
+    /// R1-A): a freshly installed `chibi` usually lives in a directory that
+    /// is not on the TUI's own `PATH` (`~/.local/bin`, a venv's bin dir, an
+    /// interpreter-specific user scripts dir). `std::env::join_paths` handles
+    /// the platform separator (`:` vs `;`).
     async fn spawn_command(
         workspace_root: impl AsRef<Path>,
         argv: &[std::ffi::OsString],
+        extra_path_dirs: &[std::path::PathBuf],
     ) -> Result<Self, BackendError> {
         let workspace_root = workspace_root.as_ref().to_path_buf();
         let (program, args) = argv.split_first().ok_or_else(|| BackendError::Spawn {
@@ -167,6 +173,19 @@ impl BackendClient {
             .stderr(Stdio::piped())
             // Never leave orphan processes behind if we are dropped in the middle of the protocol.
             .kill_on_drop(true);
+
+        // R1-A: prepend the resolved backend bin dir(s) to the child PATH so
+        // the freshly installed binary (and any helper it shells out to) is
+        // findable even when the TUI itself was launched with a minimal PATH.
+        if !extra_path_dirs.is_empty() {
+            let mut joined: Vec<std::path::PathBuf> = extra_path_dirs.to_vec();
+            joined.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(path_value) = std::env::join_paths(&joined) {
+                command.env("PATH", path_value);
+            }
+        }
 
         let mut child = command.spawn().map_err(|source| BackendError::Spawn {
             program: program_display.clone(),
@@ -210,7 +229,7 @@ impl BackendClient {
     /// `chibi` install.
     #[cfg(test)]
     async fn spawn_script(script: &str) -> Result<Self, BackendError> {
-        Self::spawn_command(".", &["/bin/sh".into(), "-c".into(), script.into()]).await
+        Self::spawn_command(".", &["/bin/sh".into(), "-c".into(), script.into()], &[]).await
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -441,8 +460,9 @@ impl BackendClient {
 pub(crate) async fn spawn_argv(
     workspace_root: &str,
     argv: Vec<std::ffi::OsString>,
+    extra_path_dirs: &[std::path::PathBuf],
 ) -> Result<BackendClient, BackendError> {
-    BackendClient::spawn_command(workspace_root, &argv).await
+    BackendClient::spawn_command(workspace_root, &argv, extra_path_dirs).await
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +629,7 @@ mod tests {
                 "stdio".into(),
                 "--tui".into(),
             ],
+            &[],
         )
         .await;
         let err = match res {
@@ -616,6 +637,77 @@ mod tests {
             Ok(_) => panic!("spawn of a missing binary must fail"),
         };
         assert!(matches!(err, BackendError::Spawn { .. }), "got: {err:?}");
+    }
+
+    /// `CHIBI_BACKEND_BIN` set to a broken path: the setup screen must NOT
+    /// apply (the override is explicit), so the generic error popup is the
+    /// surface, and its text names the exact binary the user pointed at,
+    /// not the default `chibi`.
+    #[tokio::test]
+    async fn broken_env_override_surfaces_a_generic_error_naming_the_binary() {
+        // Production argv shape with the override resolved as the program:
+        // `<CHIBI_BACKEND_BIN> stdio --tui`.
+        let err = match BackendClient::spawn_command(
+            ".",
+            &[
+                "/nonexistent/broken-chibi".into(),
+                "stdio".into(),
+                "--tui".into(),
+            ],
+            &[],
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("broken override binary must fail to spawn"),
+        };
+        assert!(matches!(err, BackendError::Spawn { .. }), "got: {err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("/nonexistent/broken-chibi"),
+            "error must name the overridden binary, got: {text}"
+        );
+        assert!(
+            !text.contains("setup"),
+            "no setup-screen framing in the popup path"
+        );
+    }
+
+    /// R1-A: the extra bin dir is PREPENDED to the backend child's `PATH`
+    /// (not appended, not replacing), so a freshly installed `chibi`'s helpers
+    /// must win over whatever the TUI inherited.
+    #[tokio::test]
+    async fn extra_bin_dir_is_prepended_to_the_child_path() {
+        let extra =
+            std::env::temp_dir().join(format!("chibi-tui-pathinj-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&extra).unwrap();
+        let probe =
+            std::env::temp_dir().join(format!("chibi-tui-pathinj-out-{}", uuid::Uuid::new_v4()));
+        let script = format!("printf '%s' \"$PATH\" > {}; sleep 60", probe.display());
+        let mut client = BackendClient::spawn_command(
+            ".",
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            std::slice::from_ref(&extra),
+        )
+        .await
+        .expect("sh is always spawnable");
+        // Give the shell a moment to write the file.
+        for _ in 0..50 {
+            if std::fs::read_to_string(&probe).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let child_path = std::fs::read_to_string(&probe).expect("child must have written $PATH");
+        client.kill().await;
+        let mut parts = std::env::split_paths(&child_path);
+        assert_eq!(
+            parts.next().as_deref(),
+            Some(extra.as_path()),
+            "extra bin dir must be FIRST on the child PATH, got: {child_path}"
+        );
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::remove_dir_all(&extra);
     }
 
     #[tokio::test]

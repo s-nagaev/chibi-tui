@@ -393,6 +393,15 @@ pub enum Mode {
     /// dispatch-side test pins it against the real key handlers so future
     /// chords cannot silently miss the modal.
     HelpViewing { state: HelpModalState },
+    /// The F2 backend-configuration editor modal is open: a full-frame
+    /// editor over `~/chibi-bot/settings` built on the shared
+    /// [`crate::config_screen::ConfigState`] component (the SAME component
+    /// the pre-loop Shell A screen runs). Modal isolation like the popup
+    /// family: the component owns every key until Esc/F2 closes it (dirty
+    /// close asks first), Ctrl+C opens the quit confirmation. F2 toggles.
+    ConfigEditor {
+        state: crate::config_screen::ConfigState,
+    },
 }
 
 impl Mode {
@@ -690,6 +699,23 @@ pub struct ChatGeometry {
     pub rows: Vec<ChatRowMeta>,
 }
 
+/// Render-fed geometry seam for sidebar clicks (same pattern as
+/// [`ChatGeometry`]): the inner rect of the sidebar's list block (its
+/// border rows and side columns are NOT list rows), plus the
+/// [`ratatui::widgets::ListState`] offset read AFTER
+/// `render_stateful_widget`, because ratatui scrolls the list internally
+/// when threads overflow and the offset must come from the state object,
+/// never be recomputed from the active index. Refreshed on every
+/// `render_sidebar`; like [`App::chat_geometry`] it is session-only view
+/// state with no explicit reset path: a fresh frame simply overwrites it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarGeometry {
+    /// Inner rect of the sidebar list block (borders excluded).
+    pub inner: Rect,
+    /// First visible thread row at snapshot time (post-render list offset).
+    pub offset: usize,
+}
+
 impl ChatGeometry {
     /// Map a terminal position onto a document [`SelectionPoint`].
     /// `None` outside the chat pane's inner rect or with no rows (the
@@ -916,12 +942,27 @@ pub struct App {
     /// `App::select_chat` seam). `dragging` marks the live press →
     /// release window.
     pub selection: Option<ChatSelection>,
+    /// deferred backend restart staged by the config editor's
+    /// "restart when idle" choice: consumed by the event loop once
+    /// [`App::any_busy`] turns false (the last in-flight request resolved).
+    pub config_restart_when_idle: bool,
+    /// one-shot toast arm: a config save staged a restart, so the first
+    /// successful re-handshake should surface "Configuration applied".
+    pub config_apply_pending: bool,
+    /// this session runs on mocks (`--mock`): the config editor hides the
+    /// restart offer (reconnect is a no-op there) and the auto-open skips.
+    pub mock_session: bool,
     /// the wrapped-row geometry the renderer painted THIS frame
     /// ([`ChatGeometry`]), the hit-test seam the mouse router maps
     /// cursor positions through. Refreshed on every `render_chat`;
     /// rejected by consumers when its `chat_id` no longer matches the
     /// active thread.
     pub chat_geometry: Option<ChatGeometry>,
+    /// Render-fed sidebar geometry for click-to-select-a-thread
+    /// ([`SidebarGeometry`]), the same session-only view-state pattern as
+    /// [`App::chat_geometry`]: written by `ui::render_sidebar` each frame,
+    /// read by the mouse router, never persisted.
+    pub sidebar_geometry: Option<SidebarGeometry>,
     /// Content-keyed cache of rendered markdown lines
     /// ([`MarkdownCache`], plan D1): a finalized message renders exactly
     /// once per `(content, theme)` pair instead of being re-parsed and
@@ -1087,6 +1128,10 @@ impl App {
             thoughts_visible: true,
             selection: None,
             chat_geometry: None,
+            sidebar_geometry: None,
+            config_restart_when_idle: false,
+            config_apply_pending: false,
+            mock_session: false,
             md_cache: MarkdownCache::new(markdown::render),
             stream_prefix_cache: MarkdownCache::new(markdown::render),
         }
@@ -1115,7 +1160,9 @@ impl App {
     /// the entered chat's own [`Chat::last_thoughts`], so the view follows
     /// the thread by construction. Every selection mutation (arrows, ^N,
     /// search jump, delete/clone ack, restore activation) goes through here.
-    fn select_chat(&mut self, index: usize) {
+    /// Public because the mouse router (compiled into the bin crate too)
+    /// uses it as the click-to-select live-switching parity path.
+    pub fn select_chat(&mut self, index: usize) {
         self.active = index.min(self.chats.len().saturating_sub(1));
         if let Some(chat) = self.chats.get_mut(self.active) {
             chat.unread = false;
@@ -1342,7 +1389,8 @@ impl App {
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
-            | Mode::HelpViewing { .. } => None,
+            | Mode::HelpViewing { .. }
+            | Mode::ConfigEditor { .. } => None,
         }
     }
 
@@ -1367,7 +1415,8 @@ impl App {
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
-            | Mode::HelpViewing { .. } => self.input.lines().len(),
+            | Mode::HelpViewing { .. }
+            | Mode::ConfigEditor { .. } => self.input.lines().len(),
         };
         buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
     }
@@ -1391,7 +1440,8 @@ impl App {
             | Mode::SearchingAll { .. }
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
-            | Mode::HelpViewing { .. } => return false,
+            | Mode::HelpViewing { .. }
+            | Mode::ConfigEditor { .. } => return false,
         };
         self.mode = Mode::Normal;
         // a closed modal returns keyboard ownership to
@@ -2262,6 +2312,20 @@ impl App {
             Mode::ModelPicking { state } => state.selected,
             _ => 0,
         }
+    }
+
+    /// Open the F2 backend-configuration editor modal with a pre-loaded
+    /// [`crate::config_screen::ConfigState`]. The STATE arrives from the
+    /// caller (the key dispatch loads the settings file, bin-level I/O,
+    /// same tier as the loop's persistence calls) so this entry point stays
+    /// I/O-free and tests can inject a temp-path state. Normal mode only,
+    /// like every other popup entry point; F2 on an open editor is the
+    /// toggle-close handled inside the component.
+    pub fn begin_config_editor(&mut self, state: crate::config_screen::ConfigState) {
+        if !self.mode.is_normal() {
+            return;
+        }
+        self.mode = Mode::ConfigEditor { state };
     }
 
     /// Enter in the picker: close the popup and stage a hidden

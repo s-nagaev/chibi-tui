@@ -234,6 +234,10 @@ enum ActorEvent {
 struct ActorConfig {
     workspace_root: String,
     script_path: String,
+    /// Bin dirs prepended to the backend child's PATH (R1-A), surviving
+    /// reconnects: a freshly installed `chibi` is usually NOT on the TUI's
+    /// own PATH.
+    extra_path_dirs: Vec<std::path::PathBuf>,
 }
 
 /// Everything mutable the actor owns. Single owner ⇒ no locks.
@@ -332,6 +336,18 @@ impl RequestPipeline {
         status_channel_capacity: usize,
         extra_args: &[String],
     ) -> Result<Self, BackendError> {
+        Self::connect_with_bin_dir(workspace_root, status_channel_capacity, extra_args, None).await
+    }
+
+    /// [`RequestPipeline::connect`] with an extra bin dir prepended to the
+    /// backend child's `PATH` (setup-screen R1-A): points at the directory of
+    /// a freshly installed `chibi` that the TUI's own `PATH` may lack.
+    pub async fn connect_with_bin_dir(
+        workspace_root: impl AsRef<Path>,
+        status_channel_capacity: usize,
+        extra_args: &[String],
+        extra_bin_dir: Option<&Path>,
+    ) -> Result<Self, BackendError> {
         let workspace_root = workspace_root.as_ref().to_path_buf();
         let script_path =
             std::env::var("CHIBI_FAKE_BACKEND").unwrap_or_else(|_| "chibi".to_owned());
@@ -349,7 +365,15 @@ impl RequestPipeline {
         };
         argv.extend(extra_args.iter().map(Into::into));
 
-        let mut client = spawn_argv(&workspace_root.display().to_string(), argv).await?;
+        let extra_path_dirs: Vec<std::path::PathBuf> = extra_bin_dir
+            .map(|d| vec![d.to_path_buf()])
+            .unwrap_or_default();
+        let mut client = spawn_argv(
+            &workspace_root.display().to_string(),
+            argv,
+            &extra_path_dirs,
+        )
+        .await?;
         let ready = client.handshake().await?;
         let commands = ready.commands().to_vec();
 
@@ -372,6 +396,7 @@ impl RequestPipeline {
             ActorConfig {
                 workspace_root: workspace_root.display().to_string(),
                 script_path,
+                extra_path_dirs,
             },
         ));
 
@@ -666,11 +691,38 @@ async fn handle_shutdown(state: &mut ActorState) -> Result<(), BackendError> {
     }
 }
 
-/// Real-backend spawn argv: `chibi stdio --tui`, nothing else — the workspace
-/// root travels inside request frames, never on the command line. Shared by
-/// the initial spawn and reconnect so the two never diverge.
+/// Backend program resolution order for the real spawn: explicit
+/// `CHIBI_BACKEND_BIN` → persisted install path (`backend_store`, written by
+/// the setup screen's installer) → plain `chibi` from PATH. Pure helper so
+/// the order itself is unit-testable without touching process env.
+fn resolve_backend_program(
+    env_override: Option<&std::ffi::OsStr>,
+    persisted: Option<&std::path::Path>,
+) -> std::ffi::OsString {
+    if let Some(v) = env_override {
+        if !v.is_empty() {
+            return v.to_owned();
+        }
+    }
+    if let Some(p) = persisted {
+        return p.as_os_str().to_owned();
+    }
+    std::ffi::OsString::from("chibi")
+}
+
+/// Real-backend spawn argv: `<program> stdio --tui`, nothing else; the
+/// workspace root travels inside request frames, never on the command line.
+/// Shared by the initial spawn and reconnect so the two never diverge.
+/// `<program>` follows [`resolve_backend_program`]: `CHIBI_BACKEND_BIN`,
+/// then the persisted install path (R1-B), then the PATH `chibi` lookup.
 fn real_backend_argv() -> Vec<std::ffi::OsString> {
-    vec!["chibi".into(), "stdio".into(), "--tui".into()]
+    let persisted = crate::backend_store::load_backend_path();
+    let env = std::env::var_os("CHIBI_BACKEND_BIN");
+    vec![
+        resolve_backend_program(env.as_deref(), persisted.as_deref()),
+        "stdio".into(),
+        "--tui".into(),
+    ]
 }
 
 /// `Command::Reconnect`: tear down whatever is left, respawn + re-handshake a
@@ -699,7 +751,7 @@ async fn handle_reconnect(
     };
 
     let spawn_result = async {
-        let mut client = spawn_argv(&config.workspace_root, argv).await?;
+        let mut client = spawn_argv(&config.workspace_root, argv, &config.extra_path_dirs).await?;
         client.handshake().await?;
         Ok::<_, BackendError>(client.into_parts())
     }
@@ -913,18 +965,49 @@ fn spawn_reader(
 mod tests {
     use super::*;
 
-    /// The real-backend spawn command line is exactly `chibi stdio --tui`:
+    /// The real-backend spawn command line is `<program> stdio --tui`:
     /// both the initial spawn and a reconnect build their argv from
-    /// [`real_backend_argv`], so one exact-argv assertion pins both paths.
+    /// [`real_backend_argv`], so one tail assertion pins both paths. The
+    /// program itself comes from the documented resolution order (tested
+    /// separately below); the tail is the frozen contract.
     #[test]
     fn real_backend_spawn_argv_is_exactly_chibi_stdio_tui() {
+        let argv = real_backend_argv();
         assert_eq!(
-            real_backend_argv(),
-            vec![
-                std::ffi::OsString::from("chibi"),
+            &argv[1..],
+            &[
                 std::ffi::OsString::from("stdio"),
                 std::ffi::OsString::from("--tui"),
             ]
+        );
+    }
+
+    /// Resolution order for the spawned program: explicit
+    /// `CHIBI_BACKEND_BIN` wins over the persisted install path, which wins
+    /// over the bare PATH lookup. An empty env value is treated as unset.
+    #[test]
+    fn backend_program_resolution_prefers_env_then_persisted_then_path() {
+        let env = std::ffi::OsStr::new("/explicit/chibi");
+        let persisted = std::path::Path::new("/persisted/chibi");
+        assert_eq!(
+            resolve_backend_program(Some(env), Some(persisted)),
+            std::ffi::OsString::from("/explicit/chibi"),
+            "env override wins"
+        );
+        assert_eq!(
+            resolve_backend_program(None, Some(persisted)),
+            std::ffi::OsString::from("/persisted/chibi"),
+            "persisted path wins over PATH"
+        );
+        assert_eq!(
+            resolve_backend_program(None, None),
+            std::ffi::OsString::from("chibi"),
+            "plain PATH fallback"
+        );
+        assert_eq!(
+            resolve_backend_program(Some(std::ffi::OsStr::new("")), Some(persisted)),
+            std::ffi::OsString::from("/persisted/chibi"),
+            "empty env value counts as unset"
         );
     }
 

@@ -21,6 +21,11 @@ const DISPATCH_CHORDS: &[(&str, &str, &str)] = &[
     ("Global", "F1", "open / close this keybindings help"),
     (
         "Global",
+        "F2",
+        "open / close the backend configuration editor",
+    ),
+    (
+        "Global",
         "Ctrl+C",
         "cancel the active request · quit when idle (confirmation)",
     ),
@@ -153,6 +158,50 @@ const DISPATCH_CHORDS: &[(&str, &str, &str)] = &[
     ("Quit confirm", "Esc · n · q", "stay"),
     ("Help (F1)", "↑ / ↓ · PgUp / PgDn", "scroll the list"),
     ("Help (F1)", "F1 · Esc", "close"),
+    (
+        "Config editor (F2)",
+        "↑ / ↓ · j / k",
+        "move the row selection",
+    ),
+    ("Config editor (F2)", "← / →", "switch the key group"),
+    ("Config editor (F2)", "PgUp / PgDn", "page the rows"),
+    (
+        "Config editor (F2)",
+        "g / G",
+        "jump to the first / last row",
+    ),
+    (
+        "Config editor (F2)",
+        "Enter · Space",
+        "edit the value · toggle booleans",
+    ),
+    (
+        "Config editor (F2)",
+        "Backspace",
+        "delete backwards while editing",
+    ),
+    ("Config editor (F2)", "v", "reveal the secret while editing"),
+    ("Config editor (F2)", "s", "save the settings file"),
+    (
+        "Config editor (F2)",
+        "Esc · F2",
+        "close (asks when there are unsaved changes)",
+    ),
+    (
+        "Config editor (F2)",
+        "s/Enter · d · Esc/n",
+        "save / discard / stay (closing unsaved)",
+    ),
+    (
+        "Config editor (F2)",
+        "y/Enter · d · Esc/n",
+        "restart now / when idle / stay (after saving)",
+    ),
+    (
+        "Config editor (F2)",
+        "r · o · Esc",
+        "reload / overwrite / cancel (file changed on disk)",
+    ),
 ];
 
 #[test]
@@ -195,6 +244,11 @@ enum DraftEffect {
 /// stays pinned by the enumeration test above plus the dedicated
 /// `ctrl_v_pastes_clipboard_into_input`, so coverage parity with the
 /// pre-probe suite is preserved — one arboard caller, not three.
+/// `F2` is excluded for a third reason: opening the config editor READS
+/// the user's real `~/chibi-bot/settings` (the probe must never touch the
+/// user's actual configuration file); the chord is pinned by the
+/// enumeration test above plus the dedicated keymap/config-editor tests,
+/// which inject temp-path states explicitly.
 fn normal_mode_probes() -> Vec<(String, Vec<crossterm::event::KeyEvent>, DraftEffect, bool)> {
     use crossterm::event::KeyModifiers as M;
     let e = |code, m| key_event(code, m);

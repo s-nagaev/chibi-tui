@@ -10,6 +10,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use chibi_tui::app::{Focus, Mode, ReconnectRequest};
+use chibi_tui::config_screen::{ConfigAction, ConfigState, SaveOutcome};
 
 /// Map one Cyrillic character onto its Latin counterpart for the Russian
 /// (ЙЦУКЕН) and Ukrainian keyboard layouts, preserving case for letters
@@ -434,6 +435,72 @@ pub fn handle_key_with_copy(
         return;
     }
 
+    // backend-configuration editor modal captures everything ----
+    //
+    // While the F2 config editor is open, ONLY the component's keys work:
+    // ↑/↓ (and k/j) walk the rows of the selected group, ←/→ switch groups,
+    // PgUp/PgDn page, g/G jump to the ends, Enter/Space edit or toggle the
+    // selected value, `v` reveals the edited secret, `s` saves. F2 and Esc
+    // close (a dirty screen asks first: save / discard / stay). Ctrl+C
+    // opens the quit confirmation (same class as the other popups). The
+    // save WRITE happens here (bin-level dispatch, same tier as the loop's
+    // persist_chat calls: the file is small and the engine's pipeline is
+    // atomic); the restart decision staged by the component hands over to
+    // the event loop via `reconnect_requested` / the idle-deferred flag.
+    // Everything else (typing, global chords, thread switching) is
+    // swallowed so no keystroke leaks into the textarea and no global
+    // binding fires.
+    if matches!(app.mode, Mode::ConfigEditor { .. }) {
+        if ctrl && matches!(key.code, KeyCode::Char('c')) {
+            app.begin_quit_confirm();
+            return;
+        }
+        let action = if let Mode::ConfigEditor { state } = &mut app.mode {
+            state.handle_key(key)
+        } else {
+            ConfigAction::None
+        };
+        match action {
+            ConfigAction::None => {}
+            ConfigAction::Save { close, overwrite } => {
+                let saved = if let Mode::ConfigEditor { state } = &mut app.mode {
+                    matches!(state.perform_save(overwrite), SaveOutcome::Saved)
+                } else {
+                    false
+                };
+                if saved {
+                    let busy = app.any_busy();
+                    if let Mode::ConfigEditor { state } = &mut app.mode {
+                        state.after_save(busy);
+                    }
+                    if close {
+                        app.mode = Mode::Normal;
+                        // modal closed → editor pane.
+                        app.focus = Focus::Chat;
+                    }
+                }
+            }
+            ConfigAction::RestartNow => {
+                app.config_apply_pending = true;
+                app.reconnect_requested = Some(ReconnectRequest {});
+                app.mode = Mode::Normal;
+                app.focus = Focus::Chat;
+            }
+            ConfigAction::RestartWhenIdle => {
+                app.config_apply_pending = true;
+                app.config_restart_when_idle = true;
+                app.mode = Mode::Normal;
+                app.focus = Focus::Chat;
+            }
+            ConfigAction::Closed => {
+                app.mode = Mode::Normal;
+                // modal closed → editor pane.
+                app.focus = Focus::Chat;
+            }
+        }
+        return;
+    }
+
     // ---- global quit / cancel semantics ----
     //
     // Ctrl+C cancels the in-flight request when one exists, otherwise opens
@@ -563,6 +630,11 @@ pub fn handle_key_with_copy(
             // same Normal-mode F1 semantics under
             // sidebar focus (parity contract with the chord match below).
             KeyCode::F(1) => app.begin_help_modal(),
+            // same Normal-mode F2 semantics under
+            // sidebar focus (parity contract with the chord match below).
+            KeyCode::F(2) => {
+                app.begin_config_editor(ConfigState::load(!app.mock_session));
+            }
             // same Normal-mode ^P semantics under sidebar
             // focus (parity contract with the chord match below).
             KeyCode::Char('p') if ctrl => app.begin_clone_thread(),
@@ -632,6 +704,22 @@ pub fn handle_key_with_copy(
         // kitty keyboard protocol. Mnemonic: the universal help key.
         (KeyCode::F(1), _) => {
             app.begin_help_modal();
+            return;
+        }
+        // F2: OPEN THE BACKEND-CONFIGURATION EDITOR, the full-frame modal
+        // over `~/chibi-bot/settings` (the shared component; the pre-loop
+        // Shell A screen reuses it offline). Toggle-close runs through the
+        // ConfigEditor modal branch above, which captures every key while
+        // the editor is open, so this arm only ever OPENS.
+        //
+        // Chord verification (same audit class as F1): only F(1) was bound;
+        // F(2) has a dedicated escape sequence on legacy terminals (no
+        // kitty dependency), no editor mapping (unknown keys are inert in
+        // the readline fall-through), and the voice-input conflict is moot
+        // (that feature is deferred). Mnemonic: the settings key next to
+        // the help key.
+        (KeyCode::F(2), _) => {
+            app.begin_config_editor(ConfigState::load(!app.mock_session));
             return;
         }
         // Ctrl+L: stop the RUNNING request via

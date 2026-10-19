@@ -5,6 +5,7 @@
 //! `crate::tests::support` (used by both keymap and the remaining
 //! `src/tests/` topics — deliberately not duplicated).
 
+mod config_editor;
 mod cyrillic;
 mod delete_confirm;
 mod error_popup;
