@@ -6,6 +6,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
 ### Added
 
 - Mouse support in the backend settings editor: the wheel moves the group or row selection by the pane under the cursor, and a left click selects a group or row; mouse events are swallowed while the value editor or a confirmation prompt is open. Available in both editor shells (the F2 in-app modal and the post-onboarding screen).
