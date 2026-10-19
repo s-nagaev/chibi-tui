@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The crate published to crates.io failed to build during publish verification because the vendored settings template lived under `tests/`, which is excluded from the package; the template now ships inside the source tree.
+
 ### Added
 
 - Mouse support in the backend settings editor: the wheel moves the group or row selection by the pane under the cursor, and a left click selects a group or row; mouse events are swallowed while the value editor or a confirmation prompt is open. Available in both editor shells (the F2 in-app modal and the post-onboarding screen).
