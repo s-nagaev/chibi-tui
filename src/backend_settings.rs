@@ -1646,7 +1646,7 @@ pub fn validate_doc(doc: &SettingsDoc) -> Vec<ValidationError> {
 /// `chibi/config_generator.py`, with the f-string placeholders intact).
 /// Provenance (source branch + commit) is recorded in the fixture header,
 /// which generation strips. Never edit the body here: fix upstream, re-copy.
-pub const VENDORED_TEMPLATE: &str = include_str!("../tests/fixtures/backend_settings_template");
+pub const VENDORED_TEMPLATE: &str = include_str!("backend_settings_vendored_template");
 
 fn strip_provenance_header(template: &str) -> &str {
     const BODY_START: &str = "\n# Chibi Agent Configuration File\n";
