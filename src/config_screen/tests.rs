@@ -1065,3 +1065,68 @@ fn handle_mouse_ignores_other_buttons_and_press_states() {
     assert_eq!(state.group_index(), 0);
     assert!(!state.dirty());
 }
+
+// paste
+
+#[test]
+fn paste_appends_to_the_edit_buffer_and_clears_error() {
+    let mut state = state_at("paste", "DEFAULT_MODEL=\n");
+    select_row(&mut state, "DEFAULT_MODEL");
+    press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    state.insert_paste("glm-5");
+    let edit = state.edit.as_ref().expect("edit open");
+    assert_eq!(edit.buf, "glm-5");
+    assert_eq!(edit.error, None);
+
+    // A rejected commit leaves the edit open with an inline error; the
+    // next paste lands in the buffer and clears it.
+    for ch in "${X}".chars() {
+        press(&mut state, KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    let edit = state.edit.as_ref().expect("rejected commit keeps editing");
+    assert_eq!(edit.buf, "glm-5${X}");
+    assert!(edit.error.is_some(), "commit rejection recorded");
+    state.insert_paste(" and more");
+    let edit = state.edit.as_ref().expect("edit still open");
+    assert_eq!(edit.buf, "glm-5${X} and more");
+    assert_eq!(edit.error, None, "paste clears the inline error");
+}
+
+#[test]
+fn paste_is_a_noop_without_an_open_edit() {
+    let mut state = state_at("pastenoop", "DEFAULT_MODEL=\n");
+    select_row(&mut state, "DEFAULT_MODEL");
+    state.insert_paste("zzz");
+    assert!(state.edit.is_none(), "paste never opens an edit");
+    assert!(
+        state.doc.render().contains("DEFAULT_MODEL="),
+        "document untouched: {}",
+        state.doc.render()
+    );
+    assert!(!state.dirty(), "nothing staged");
+}
+
+#[test]
+fn paste_normalizes_line_endings() {
+    let mut state = state_at("pastecrlf", "DEFAULT_MODEL=\n");
+    select_row(&mut state, "DEFAULT_MODEL");
+    press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    state.insert_paste("a\r\nb\rc");
+    let edit = state.edit.as_ref().expect("edit open");
+    assert_eq!(edit.buf, "a\nb\nc");
+}
+
+#[test]
+fn ctrl_v_pastes_without_typing_v_or_revealing() {
+    let mut state = state_at("pastectrlv", "OPENAI_API_KEY=sk-1\n");
+    select_row(&mut state, "OPENAI_API_KEY");
+    press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    // Ctrl+V routes to the clipboard insert (which may fail silently in a
+    // headless test run): it must never type a literal `v` into the buffer
+    // and never touch the secret-reveal flag (bare/Alt+`v` keeps that).
+    press(&mut state, KeyCode::Char('v'), KeyModifiers::CONTROL);
+    let edit = state.edit.as_ref().expect("edit open");
+    assert!(edit.buf.starts_with("sk-1"), "no `v` typed: {:?}", edit.buf);
+    assert!(!edit.reveal, "reveal untouched by Ctrl+V");
+}

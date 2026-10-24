@@ -636,6 +636,15 @@ impl ConfigState {
                     edit.buf.pop();
                 }
             }
+            KeyCode::Char('v') if ctrl => {
+                // Ctrl+V (any Alt rides along): read the system clipboard
+                // and land it in the edit buffer through the shared insert.
+                // Failures are silent — a locked clipboard must not disturb
+                // typing. Bare/Alt+`v` keeps the reveal toggle below.
+                if let Some(text) = crate::clipboard::get_text() {
+                    self.insert_paste(&text);
+                }
+            }
             KeyCode::Char('v') if !ctrl && !alt && secret => {
                 if let Some(edit) = &mut self.edit {
                     edit.reveal = !edit.reveal;
@@ -649,6 +658,24 @@ impl ConfigState {
             }
             _ => {}
         }
+    }
+
+    /// Paste a payload into the open edit buffer — the shared sink for BOTH
+    /// paste entry points: the Ctrl+V clipboard read and the terminal's
+    /// bracketed-paste event (`Event::Paste`).
+    ///
+    /// No-op unless a row is being edited: paste must never mutate the row
+    /// selection or a confirmation state. Line endings are normalized
+    /// (`\r\n` and bare `\r` → `\n`) so a foreign clipboard never leaves
+    /// stray `\r` in the buffer. Never commits: staging stays on bare
+    /// Enter alone, a paste event carries no key at all.
+    pub fn insert_paste(&mut self, text: &str) {
+        let Some(edit) = &mut self.edit else {
+            return;
+        };
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        edit.buf.push_str(&normalized);
+        edit.error = None;
     }
 
     /// Route one key press. Pure state mutation: the returned
@@ -1364,6 +1391,16 @@ pub async fn run(terminal: &mut Tui, reader: &mut EventStream, theme: &Theme) ->
                     // Restart actions are unreachable in Shell A (no
                     // restart offer is ever staged with restart_available=false).
                     _ => {}
+                }
+            }
+            Some(Ok(CtEvent::Paste(text))) => {
+                // A bracketed paste is not a key: it lands in the edit
+                // buffer in one insert, can never match bare Enter and can
+                // never commit. No-op unless a row is being edited; behind
+                // the quit-confirmation popup it is swallowed, same parity
+                // as clicks.
+                if !quit_confirm {
+                    state.insert_paste(&text);
                 }
             }
             Some(Ok(CtEvent::Mouse(mouse))) => {
