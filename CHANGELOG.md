@@ -6,6 +6,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-25
+
 ### Fixed
 
 - Pasting into the backend settings editor did nothing: clipboard paste (Ctrl+V) and terminal bracketed paste are now inserted into the value being edited in both editor shells (the F2 in-app modal and the post-onboarding screen). A paste never submits or commits, and it is ignored unless a value is being edited.
