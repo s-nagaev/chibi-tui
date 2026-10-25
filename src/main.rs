@@ -692,8 +692,17 @@ async fn run_loop(
                         // A bracketed paste is NOT a key: it never reaches
                         // `handle_key`, can never match bare Enter, and can
                         // never submit. The whole payload — newlines
-                        // included — lands in the draft in one insert.
-                        handle_paste(&mut app, &text);
+                        // included — lands in one insert: the config
+                        // editor's edit buffer when it holds the keyboard,
+                        // the message draft otherwise.
+                        if app.quit_confirm {
+                            // Swallowed behind the quit-confirmation popup,
+                            // same gate `handle_paste` applies.
+                        } else if let Mode::ConfigEditor { state } = &mut app.mode {
+                            state.insert_paste(&text);
+                        } else {
+                            handle_paste(&mut app, &text);
+                        }
                         redraw.request();
                     }
                     Some(Ok(_)) => {} // focus and other crossterm events
