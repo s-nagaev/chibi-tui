@@ -1,7 +1,7 @@
 # Vendored canonical copy of the backend settings template (Chibi backend, chibi-bot).
 # Source file: chibi/config_generator.py, DEFAULT_CONFIG f-string body.
-# Source branch: main, commit: 14495621940c01a51ebea89a502ddd57ed988d90 (Chore: Release 1.18.0 #128).
-# Snapshot date: 2026-10-04.
+# Source branch: main, commit: a359ccb22fb2a2ad8ab058c90aa4659ac1a2ee73 (Feat: Add MCP SSE auth and REST transport #141).
+# Snapshot date: 2026-10-25.
 # NEVER edit the template body here: fix upstream and re-copy.
 # The provenance header above is stripped by generation and by the drift-guard
 # test (everything before the first '# Chibi Agent Configuration File' line).
@@ -244,6 +244,9 @@ ENABLE_MCP_SSE=true
 # Enable MCP stdio (standard input/output) connections (default: false)
 ENABLE_MCP_STDIO=false
 
+# Enable MCP REST (streamable-HTTP) connections (default: false)
+ENABLE_MCP_REST=false
+
 
 # ============================================================================
 # 7. WHITELISTS AND RESTRICTIONS
@@ -422,6 +425,13 @@ MAX_HISTORY_TOKENS=100000
 # Google Custom Search Engine ID
 # Get from: https://programmablesearchengine.google.com/
 # GOOGLE_SEARCH_CX=
+
+# Jina AI API key (optional)
+# Enables the key-gated `jina_search` tool, lifts r.jina.ai Reader rate limits
+# to 500 RPM, and switches the hybrid `read_web_page` to Jina-first routing.
+# Without it, `jina_read` and `read_web_page` still work on the free 20 RPM tier.
+# Get from: https://jina.ai/
+# JINA_API_KEY=
 
 
 # ============================================================================
