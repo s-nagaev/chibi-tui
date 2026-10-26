@@ -1105,15 +1105,23 @@ pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect)
         };
         let value_text = state.display_value(def);
         let placeholder = value_text.starts_with('-');
-        let value_style = match def.kind {
-            Kind::Bool
-                if !placeholder && state.current_value(def).is_some_and(|v| is_bool_true(&v)) =>
-            {
-                Style::new().fg(theme.green)
+        // A commented-out key reads as a disabled toggle: the whole row is
+        // dim gray, which wins over placeholder/secret/bool-true styling.
+        let row_disabled = commented;
+        let value_style = if row_disabled {
+            Style::new().fg(theme.dim)
+        } else {
+            match def.kind {
+                Kind::Bool
+                    if !placeholder
+                        && state.current_value(def).is_some_and(|v| is_bool_true(&v)) =>
+                {
+                    Style::new().fg(theme.green)
+                }
+                _ if placeholder => Style::new().fg(theme.dim),
+                Kind::Secret => Style::new().fg(theme.purple),
+                _ => Style::new().fg(theme.fg),
             }
-            _ if placeholder => Style::new().fg(theme.dim),
-            Kind::Secret => Style::new().fg(theme.purple),
-            _ => Style::new().fg(theme.fg),
         };
         let mut spans = vec![
             Span::styled(
@@ -1122,13 +1130,17 @@ pub fn render(f: &mut Frame, state: &mut ConfigState, theme: &Theme, area: Rect)
             ),
             Span::styled(
                 format!("{:<key_w$}", def.key),
-                Style::new().fg(if placeholder { theme.dim } else { theme.cyan }),
+                Style::new().fg(if row_disabled || placeholder {
+                    theme.dim
+                } else {
+                    theme.cyan
+                }),
             ),
             Span::raw("  "),
             Span::styled(value_text, value_style),
         ];
         if commented {
-            spans.push(Span::styled(" [commented]", Style::new().fg(theme.yellow)));
+            spans.push(Span::styled(" [disabled]", Style::new().fg(theme.dim)));
         }
         if absent {
             spans.push(Span::styled(" [default]", Style::new().fg(theme.dim)));

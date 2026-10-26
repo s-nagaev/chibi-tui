@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Commented-out keys in the backend settings editor now read as disabled: the whole row renders in dim gray with a `[disabled]` marker instead of a yellow `[commented]` marker.
+
 ## [0.5.1] - 2026-10-25
 
 ### Fixed

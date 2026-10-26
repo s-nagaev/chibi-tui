@@ -88,8 +88,50 @@ fn list_view_masks_secrets_and_marks_placeholders() {
         "absent keys marked: {rendered}"
     );
     assert!(
-        rendered.contains("[commented]"),
+        rendered.contains("[disabled]"),
         "commented keys marked: {rendered}"
+    );
+}
+
+#[test]
+fn commented_rows_render_as_disabled_dim() {
+    let mut state = state_at("disabled", "# GROK_API_KEY=oldvalue9876543\n");
+    select_row(&mut state, "GROK_API_KEY");
+    let theme = Theme::tokyo_night();
+    let mut terminal = Terminal::new(TestBackend::new(110, 30)).expect("terminal");
+    terminal
+        .draw(|f| render(f, &mut state, &theme, f.area()))
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+
+    let mut key_fg = None;
+    let mut key_bg = None;
+    let mut content = String::new();
+    'outer: for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            content.push_str(buf[(x, y)].symbol());
+        }
+        content.push('\n');
+        if let Some(pos) = content
+            .lines()
+            .last()
+            .and_then(|line| line.find("GROK_API_KEY"))
+        {
+            let cell = &buf[(pos as u16, y)];
+            key_fg = Some(cell.fg);
+            key_bg = Some(cell.bg);
+            break 'outer;
+        }
+    }
+    assert!(
+        content.contains("[disabled]"),
+        "commented row carries the disabled marker: {content}"
+    );
+    assert_eq!(key_fg, Some(theme.dim), "commented key renders dim gray");
+    assert_eq!(
+        key_bg,
+        Some(theme.selection),
+        "selection bg still applies on a disabled row"
     );
 }
 
@@ -233,8 +275,8 @@ fn empty_secret_commit_clears_the_key() {
     assert!(state.dirty());
     let rendered = render_to_string(&mut state);
     assert!(
-        rendered.contains("[commented]"),
-        "cleared key renders its commented marker: {rendered}"
+        rendered.contains("[disabled]"),
+        "cleared key renders its disabled marker: {rendered}"
     );
     assert!(
         state.doc.render().contains("# OPENAI_API_KEY="),
