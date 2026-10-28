@@ -74,6 +74,12 @@ pub enum BackendEvent {
     /// it to the owning chat. NON-terminal by construction: it must never
     /// resolve any request lifecycle, spinner or queue state.
     CwdUpdate { wire_thread_id: i64, cwd: String },
+    /// Thread title of a thread changed (opt-in via
+    /// `capabilities.thread_renames`): a `thread_renamed` frame forwarded
+    /// by the pump. Carries the WIRE thread id (i64 hash) — the consumer
+    /// maps it to the owning chat. NON-terminal by construction: it must
+    /// never resolve any request lifecycle, spinner or queue state.
+    ThreadRenamed { wire_thread_id: i64, name: String },
     /// Live text chunk for a running request (real backend only, emitted
     /// for clients that declared `capabilities.streaming`). NON-terminal:
     /// the app appends it to the request's in-flight placeholder; the

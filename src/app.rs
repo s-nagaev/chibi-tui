@@ -2927,7 +2927,9 @@ impl App {
             // Not control-related (or no lifecycle frame at all).
             BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => false,
             // Unreachable: handled by the early returns in apply_backend_event.
-            BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => false,
+            BackendEvent::BackgroundMessage { .. }
+            | BackendEvent::CwdUpdate { .. }
+            | BackendEvent::ThreadRenamed { .. } => false,
         }
     }
 
@@ -3090,7 +3092,9 @@ impl App {
             // Not clone-related (or no lifecycle frame at all).
             BackendEvent::QueueDrain { .. } | BackendEvent::Disconnected => false,
             // Unreachable: handled by the early returns in apply_backend_event.
-            BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => false,
+            BackendEvent::BackgroundMessage { .. }
+            | BackendEvent::CwdUpdate { .. }
+            | BackendEvent::ThreadRenamed { .. } => false,
         }
     }
 
@@ -3223,6 +3227,9 @@ impl App {
             BackendEvent::QueueDrain { .. } => return,
             // Unreachable: handled by the early returns above.
             BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => return,
+            // Thread-scoped, non-terminal frontend-state update: no request
+            // lifecycle to resolve here, so nothing to route.
+            BackendEvent::ThreadRenamed { .. } => return,
             BackendEvent::Disconnected => None,
         };
         let target = match route_thread_id {
@@ -3455,7 +3462,9 @@ impl App {
                 }
             }
             // Unreachable: handled by the early returns above.
-            BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => {}
+            BackendEvent::BackgroundMessage { .. }
+            | BackendEvent::CwdUpdate { .. }
+            | BackendEvent::ThreadRenamed { .. } => {}
         }
     }
 
