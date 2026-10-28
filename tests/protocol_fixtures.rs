@@ -423,3 +423,83 @@ fn result_frame_without_model_fields_roundtrips_without_them() {
         "no provider key invented: {back}"
     );
 }
+
+// thread_renames capability (canonical ready frames + frame decode) -----
+
+/// The canonical `ready` frames (byte-for-byte upstream copies) advertise
+/// `/rename_thread` in the command set: this is the feature-detect the TUI
+/// (and any client) uses to decide whether the hidden rename push may fire.
+/// Every output fixture's `ready` frame must carry it, so no scenario
+/// accidentally regresses the advertised command list.
+#[test]
+fn ready_frames_advertise_the_rename_thread_command() {
+    const OUTPUT_FIXTURES: [&str; 5] = [
+        "valid_session_output.jsonl",
+        "valid_cancel_output.jsonl",
+        "valid_shutdown_output.jsonl",
+        "valid_subagent_events_output.jsonl",
+        "valid_streaming_session_output.jsonl",
+        // invalid_cases embeds its own `ready` frames in `expected_output`.
+    ];
+
+    for name in OUTPUT_FIXTURES {
+        let ready = read_lines(name)
+            .iter()
+            .find_map(
+                |line| match serde_json::from_str::<ServerMessage>(line).unwrap() {
+                    ServerMessage::Ready { capabilities, .. } => Some(
+                        capabilities
+                            .expect("ready carries the command set")
+                            .commands,
+                    ),
+                    _ => None,
+                },
+            )
+            .unwrap_or_else(|| panic!("{name}: no ready frame"));
+        assert!(
+            ready.iter().any(|c| c == "/rename_thread"),
+            "{name}: ready must advertise /rename_thread: {ready:?}"
+        );
+    }
+
+    // The invalid-case manifests carry their ready frames inside
+    // `expected_output`; every one of them must advertise the command too.
+    for line in read_lines("invalid_cases.jsonl") {
+        let case: serde_json::Value = serde_json::from_str(&line).unwrap();
+        for frame in case["expected_output"].as_array().expect("frames") {
+            if frame["type"] == "ready" {
+                let commands = frame["capabilities"]["commands"]
+                    .as_array()
+                    .expect("ready carries commands");
+                assert!(
+                    commands
+                        .iter()
+                        .any(|c| c.as_str() == Some("/rename_thread")),
+                    "case `{}`: ready must advertise /rename_thread",
+                    case["name"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// The `thread_renamed` server frame decodes into its exact variant and
+/// round-trips on the wire: thread-scoped (integer `thread_id`, no request
+/// id) and NON-terminal. Wire shape mirrors the backend's emission.
+#[test]
+fn thread_renamed_frame_roundtrips() {
+    let wire = r#"{"type": "thread_renamed", "thread_id": 42, "name": "errands"}"#;
+    let msg: ServerMessage = serde_json::from_str(wire).expect("thread_renamed parses");
+    match &msg {
+        ServerMessage::ThreadRenamed { thread_id, name } => {
+            assert_eq!(*thread_id, 42);
+            assert_eq!(name, "errands");
+        }
+        other => panic!("expected ThreadRenamed, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(&msg).unwrap(),
+        value(wire),
+        "round-trip mismatch for: {wire}"
+    );
+}

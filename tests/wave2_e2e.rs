@@ -1392,3 +1392,314 @@ async fn reset_command_clears_dialog_end_to_end() {
 
     let _ = live.shutdown().await;
 }
+
+// thread_renamed wave (capabilities.thread_renames) ----
+
+/// The deterministic title the fake backend renames the request's thread to.
+const RENAME_NAME: &str = "Renamed by the backend";
+
+/// The fake backend's rename gating at the raw wire level: without
+/// `capabilities.thread_renames` no `thread_renamed` frame is emitted at all;
+/// with the opt-in exactly one frame rides strictly between the request's
+/// `status running` and its terminal `result` (mid-turn), routed by the
+/// request's integer thread id.
+#[test]
+fn fake_backend_gates_thread_renamed_frames_on_client_capability() {
+    let off = raw_fake_session_with(None, &["--with-thread-rename"], None);
+    assert!(
+        !off.iter().any(|f| f["type"] == "thread_renamed"),
+        "no thread_renamed without capabilities.thread_renames: {off:?}"
+    );
+    assert!(
+        off.iter().any(|f| f["type"] == "result"),
+        "the session still completes without the opt-in"
+    );
+
+    let on = raw_fake_session_with(
+        Some(serde_json::json!({"thread_renames": true})),
+        &["--with-thread-rename"],
+        None,
+    );
+    let renames: Vec<&serde_json::Value> = on
+        .iter()
+        .filter(|f| f["type"] == "thread_renamed")
+        .collect();
+    assert_eq!(renames.len(), 1, "exactly one rename frame: {on:?}");
+    assert_eq!(
+        renames[0]["thread_id"], 42,
+        "the frame routes by the request's wire thread id"
+    );
+    assert_eq!(renames[0]["name"], RENAME_NAME);
+
+    // Wire order: strictly mid-turn — after `status running`, before result.
+    let running_pos = on
+        .iter()
+        .position(|f| f["type"] == "status" && f["state"] == "running")
+        .expect("status running present");
+    let rename_pos = on
+        .iter()
+        .position(|f| f["type"] == "thread_renamed")
+        .expect("rename frame present");
+    let result_pos = on.iter().position(|f| f["type"] == "result").unwrap();
+    assert!(
+        running_pos < rename_pos && rename_pos < result_pos,
+        "thread_renamed must land mid-turn on the wire: {on:?}"
+    );
+}
+
+/// Mid-turn rename through the real glue path: the pump forwards the frame
+/// while the request is still in flight, the chat title changes (sidebar AND
+/// chat-pane header repaint), and the in-flight turn is untouched — the
+/// lifecycle stays busy through the frame and resolves with its real answer.
+#[tokio::test]
+async fn mid_turn_thread_rename_renders_and_leaves_the_turn_intact() {
+    let live = connect(&["--with-thread-rename"]).await;
+    let mut app = app_with_one_chat();
+    let (rename_tx, mut rename_rx) = tokio::sync::mpsc::channel(16);
+    live.pump_thread_renames(rename_tx);
+
+    let submitted = submitted_for(&app, "rename me mid-turn");
+    app.begin_request(&submitted);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    live.submit_encoded(submitted, tx);
+
+    let mut rename_arrived = false;
+    loop {
+        // The rename rides its own pump channel concurrently with the
+        // request's per-request channel; fold both exactly like the event
+        // loop does.
+        let got = tokio::time::timeout(TIMEOUT, async {
+            tokio::select! {
+                evt = rx.recv() => Ok(evt.expect("request channel alive")),
+                ren = rename_rx.recv() => Err(ren.expect("rename pump alive")),
+            }
+        })
+        .await
+        .expect("event in time");
+        match got {
+            Err(ren) => {
+                assert!(
+                    app.chats[0].is_busy(),
+                    "the frame lands while the turn is still in flight"
+                );
+                app.apply_backend_event(ren);
+                assert_eq!(
+                    app.chats[0].name, RENAME_NAME,
+                    "the stored title changes immediately"
+                );
+                assert!(
+                    app.chats[0].is_busy(),
+                    "a rename frame must never resolve the in-flight turn"
+                );
+                rename_arrived = true;
+            }
+            Ok(evt) => {
+                let done = matches!(evt, BackendEvent::QueueDrain { .. });
+                app.apply_backend_event(evt);
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(rename_arrived, "the rename frame must have been folded");
+
+    // The turn resolved normally with its real answer.
+    assert!(matches!(app.chats[0].lifecycle, ChatLifecycle::Idle));
+    assert_eq!(app.chats[0].messages.len(), 2, "user prompt + answer");
+    assert_eq!(app.chats[0].messages[0].markdown, "rename me mid-turn");
+    assert_eq!(
+        app.chats[0].messages[1].markdown, ANSWER,
+        "the turn's answer is intact after the mid-turn rename"
+    );
+
+    // Sidebar AND chat-pane header repaint with the new title; the old one
+    // is gone from the whole surface.
+    let rows = render_grid(&mut app);
+    let flat = rows.join("\n");
+    assert!(
+        flat.contains(RENAME_NAME),
+        "the new title must render:\n{flat}"
+    );
+    assert!(
+        !flat.contains("wave2"),
+        "the old title must be gone everywhere:\n{flat}"
+    );
+    let header_row = rows
+        .iter()
+        .position(|r| r.contains(" #1/1 \u{00b7} "))
+        .expect("chat-pane header row");
+    assert!(
+        rows[header_row].contains(RENAME_NAME),
+        "the header repaints with the new title: {:?}",
+        rows[header_row]
+    );
+
+    let _ = live.shutdown().await;
+}
+
+/// Persistence round-trip through the real glue path: the rename arrives for
+/// a chat that is NOT the active selection (background thread), the event
+/// loop routes the snapshot write to the OWNING chat (by wire id, never the
+/// active default), and the new title survives a restart.
+#[tokio::test]
+async fn background_thread_rename_persists_the_owning_chat_across_restart() {
+    let live = connect(&["--with-thread-rename"]).await;
+    let mut app = App::new(vec![Chat::new("persist-a"), Chat::new("persist-b")]);
+    let (rename_tx, mut rename_rx) = tokio::sync::mpsc::channel(16);
+    live.pump_thread_renames(rename_tx);
+
+    let submitted = Submitted {
+        request_id: new_request_id(),
+        thread_id: app.chats[0].id.clone(),
+        prompt: "turn on the doomed-title thread".to_owned(),
+    };
+    app.begin_request(&submitted);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    live.submit_encoded(submitted, tx);
+    loop {
+        let evt = tokio::time::timeout(TIMEOUT, rx.recv())
+            .await
+            .expect("event in time")
+            .expect("channel alive");
+        let done = matches!(evt, BackendEvent::QueueDrain { .. });
+        app.apply_backend_event(evt);
+        if done {
+            break;
+        }
+    }
+    let _ = live.shutdown().await;
+
+    // The renamed chat becomes a BACKGROUND thread: the selection moves to
+    // the other chat before the frame is folded.
+    let wire_id = chibi_tui::live::wire_thread_id(&app.chats[0].id);
+    let other_id = app.chats[1].id.clone();
+    app.activate_thread(&other_id);
+    assert_eq!(app.active, 1, "precondition: a different chat is active");
+
+    let ren = tokio::time::timeout(TIMEOUT, rename_rx.recv())
+        .await
+        .expect("rename event in time")
+        .expect("rename pump alive");
+    match &ren {
+        BackendEvent::ThreadRenamed {
+            wire_thread_id,
+            name,
+        } => {
+            assert_eq!(*wire_thread_id, wire_id, "routes to the owning thread");
+            assert_eq!(name, RENAME_NAME);
+        }
+        other => panic!("expected ThreadRenamed, got {other:?}"),
+    }
+    app.apply_backend_event(ren);
+    assert_eq!(app.chats[0].name, RENAME_NAME);
+    assert_eq!(app.chats[1].name, "persist-b", "the active chat untouched");
+
+    // Persist the OWNING chat only — the same wire-id routing the event loop
+    // performs (never the active-chat default, which would save chat 2).
+    let owning_index = app
+        .chats
+        .iter()
+        .position(|c| chibi_tui::live::wire_thread_id(&c.id) == wire_id)
+        .expect("owning chat resolves");
+    assert_ne!(
+        owning_index, app.active,
+        "the persisted chat must be the background one"
+    );
+    let owning = &app.chats[owning_index];
+
+    let dir = std::env::temp_dir().join(format!(
+        "chibi-tui-rename-e2e-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp root created");
+    save_chat_in(Some(&dir), owning).expect("owning chat saved");
+
+    let chats = load_chats_from(Some(&dir));
+    assert_eq!(chats.len(), 1, "only the routed chat was persisted");
+    assert_eq!(
+        chats[0].name, RENAME_NAME,
+        "the background rename survived the restart"
+    );
+    let mut fresh = App::new(chats);
+    let flat = render_grid(&mut fresh).join("\n");
+    assert!(
+        flat.contains(RENAME_NAME),
+        "the restored title renders after restart:\n{flat}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Last-writer-wins (OQ1) through the real glue path: the frame lands while
+/// the user's rename draft is open. The stored title changes, the draft
+/// survives untouched, and the user's commit is the last writer.
+#[tokio::test]
+async fn rename_frame_under_open_draft_applies_then_user_commit_wins() {
+    let live = connect(&["--with-thread-rename"]).await;
+    let mut app = app_with_one_chat();
+
+    // The draft opens BEFORE the request goes out: the frame must land
+    // under it deterministically (the fake renames ~150 ms into the turn).
+    app.begin_rename();
+    for ch in "my draft".chars() {
+        app.rename_push(ch);
+    }
+    assert!(matches!(app.mode, Mode::Renaming { .. }));
+
+    let (rename_tx, mut rename_rx) = tokio::sync::mpsc::channel(16);
+    live.pump_thread_renames(rename_tx);
+    let submitted = submitted_for(&app, "agent renames under the draft");
+    app.begin_request(&submitted);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    live.submit_encoded(submitted, tx);
+
+    let mut frame_landed_under_draft = false;
+    loop {
+        let got = tokio::time::timeout(TIMEOUT, async {
+            tokio::select! {
+                evt = rx.recv() => Ok(evt.expect("request channel alive")),
+                ren = rename_rx.recv() => Err(ren.expect("rename pump alive")),
+            }
+        })
+        .await
+        .expect("event in time");
+        match got {
+            Err(ren) => {
+                assert!(
+                    matches!(app.mode, Mode::Renaming { .. }),
+                    "the draft is still open when the frame lands"
+                );
+                app.apply_backend_event(ren);
+                assert_eq!(
+                    app.chats[0].name, RENAME_NAME,
+                    "the frame applies to the stored title"
+                );
+                assert!(
+                    matches!(app.mode, Mode::Renaming { .. }),
+                    "the open draft survives the frame untouched"
+                );
+                frame_landed_under_draft = true;
+            }
+            Ok(evt) => {
+                let done = matches!(evt, BackendEvent::QueueDrain { .. });
+                app.apply_backend_event(evt);
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(frame_landed_under_draft, "the frame landed under the draft");
+
+    // The user's commit is the last writer and wins.
+    assert!(app.commit_rename());
+    assert_eq!(
+        app.chats[0].name, "wave2my draft",
+        "the user's draft title is the final state"
+    );
+    assert_eq!(app.mode, Mode::Normal);
+
+    let _ = live.shutdown().await;
+}
