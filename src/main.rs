@@ -667,6 +667,17 @@ async fn run_loop(
                                 }
                             }
 
+                            // A committed rename ALSO pushes the new title
+                            // to the backend as a hidden `/rename_thread`
+                            // exchange (feature-detected inside App): the
+                            // SAME `send_submitted` path as any prompt, but
+                            // strictly fire-and-forget — a failed or
+                            // unavailable push never reverts the local
+                            // title.
+                            if let Some(push) = app.take_rename_submission() {
+                                send_submitted(source, &push, event_tx.clone());
+                            }
+
                             // Any key press that reached the handlers may have
                             // changed state (draft, mode, popups, ...): mark
                             // the frame dirty for the next loop iteration.

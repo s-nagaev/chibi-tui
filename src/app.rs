@@ -871,6 +871,11 @@ pub struct App {
     /// the backend source via the SAME `send_submitted` path as any prompt.
     /// The bundle carries its own ids; nothing here touches the transcript.
     pub picker_submission: Option<Submitted>,
+    /// hidden `/rename_thread <name>` push staged by a rename commit
+    /// for the event loop to send (same seam as `picker_submission`).
+    /// Strictly fire-and-forget: nothing tracks success and a failed or
+    /// unavailable push never reverts the already-committed local title.
+    rename_submission: Option<Submitted>,
     /// purpose registry of in-flight hidden
     /// exchanges, keyed by protocol request id. A terminal event whose
     /// tracked id is found here is suppressed from the transcript and
@@ -1021,6 +1026,11 @@ enum HiddenPurpose {
     FetchListing,
     /// `/model <n>`: the confirmation resolves into a status toast.
     SelectModel,
+    /// `/rename_thread <name>`: the push of the user's own rename to the
+    /// backend (OQ3). Strictly fire-and-forget: results and errors both
+    /// resolve silently; the backend's `thread_renamed` echo re-syncs the
+    /// title through the session frame instead.
+    RenameThread,
 }
 
 const SPINNER: [&str; 10] = [
@@ -1037,6 +1047,14 @@ pub const MAX_INPUT_LINES: usize = 20;
 /// how many 100 ms spinner ticks a transient status
 /// toast stays visible (~2.5 s).
 pub const STATUS_MSG_TICKS: u8 = 25;
+
+/// hard cap on the NAME pushed to the backend by a rename commit (the
+/// `/rename_thread <name>` payload is built from at most this many
+/// characters). The LOCAL title stays exactly as the user typed it; the
+/// backend receives the truncated form. Documented choice: with
+/// last-writer-wins semantics the next rename re-syncs the full title, and
+/// the push is best-effort plumbing rather than a source of truth.
+const RENAME_PUSH_MAX_CHARS: usize = 128;
 
 /// the bare listing request. Sent verbatim through
 /// the normal pipeline; the real backend treats it as a slash command and
@@ -1116,6 +1134,7 @@ impl App {
             workspace_root: None,
             thread_cwds: HashMap::new(),
             picker_submission: None,
+            rename_submission: None,
             hidden_requests: HashMap::new(),
             hidden_queue: VecDeque::new(),
             picker_model_labels,
@@ -1423,7 +1442,10 @@ impl App {
 
     /// Commit the ACTIVE chat's rename: trims whitespace; empty/whitespace-only
     /// names are rejected (the old name survives). Returns whether the name
-    /// changed. The caller persists afterwards — [`App`] has no I/O.
+    /// changed. The caller persists afterwards — [`App`] has no I/O. On a
+    /// successful commit the new title is ALSO staged as a hidden
+    /// `/rename_thread` push (feature-detected, fire-and-forget; see the
+    /// private `stage_rename_push` staging helper).
     ///
     /// Works regardless of the active chat's lifecycle: a thread title has
     /// nothing to do with request state, so renaming busy chats is allowed.
@@ -1453,8 +1475,63 @@ impl App {
         if trimmed.is_empty() || chat.name == trimmed {
             return false;
         }
-        chat.name = trimmed;
+        let thread_id = chat.id.clone();
+        chat.name = trimmed.clone();
+        // OQ3: the local commit ALSO pushes the new title to the backend
+        // as a hidden `/rename_thread` exchange. Feature-detected and
+        // fire-and-forget: no capability, no push; a failed push never
+        // reverts the title set above.
+        self.stage_rename_push(&thread_id, &trimmed);
         true
+    }
+
+    /// Stage the hidden `/rename_thread <name>` push for the event loop
+    /// (staged into [`App::rename_submission`]; kept I/O-free like every
+    /// other staging entry point). No-op without the backend capability
+    /// ([`App::supports_rename_command`]), for empty/newline names, or
+    /// when the chat vanished. A busy chat parks the push in the hidden
+    /// FIFO (dispatched on the next idle drain), an idle chat gets the
+    /// bundle staged for immediate send — the same per-thread busy rules
+    /// as a picker action.
+    fn stage_rename_push(&mut self, thread_id: &str, name: &str) {
+        if !self.supports_rename_command() {
+            return;
+        }
+        // Guard: a raw newline cannot ride a one-line title exchange
+        // (the local title keeps whatever the user typed either way).
+        if name.is_empty() || name.contains('\n') {
+            return;
+        }
+        // The PUSHED payload is truncated to [`RENAME_PUSH_MAX_CHARS`]
+        // chars; the local title stays full (see the constant's notes).
+        let pushed: String = name.chars().take(RENAME_PUSH_MAX_CHARS).collect();
+        let prompt = format!("{} {}", Self::RENAME_COMMAND, pushed);
+        let Some(chat) = self.chats.iter_mut().find(|c| c.id == thread_id) else {
+            return;
+        };
+        if chat.lifecycle.is_busy() {
+            self.hidden_queue.push_back((thread_id.to_owned(), prompt));
+            return;
+        }
+        let submitted = Submitted {
+            request_id: crate::history::new_request_id(),
+            thread_id: thread_id.to_owned(),
+            prompt,
+        };
+        chat.lifecycle = ChatLifecycle::Awaiting {
+            request_id: submitted.request_id.clone(),
+        };
+        self.hidden_requests
+            .insert(submitted.request_id.clone(), HiddenPurpose::RenameThread);
+        self.rename_submission = Some(submitted);
+    }
+
+    /// Drain the hidden rename push staged by a rename commit. The event
+    /// loop hands it to the backend source via the SAME `send_submitted`
+    /// path as any prompt; nothing ever comes back from it that the user
+    /// sees (the purpose registry suppresses the terminal event).
+    pub fn take_rename_submission(&mut self) -> Option<Submitted> {
+        self.rename_submission.take()
     }
 
     /// Leave rename mode discarding the draft. The everyday prompt buffer
@@ -2404,6 +2481,14 @@ impl App {
         };
         let purpose = if submitted.prompt == MODEL_LISTING_PROMPT {
             HiddenPurpose::FetchListing
+        } else if submitted
+            .prompt
+            .strip_prefix(Self::RENAME_COMMAND)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        {
+            // a parked rename push: infer the purpose from the
+            // `/rename_thread` prefix exactly like the listing special-case.
+            HiddenPurpose::RenameThread
         } else {
             HiddenPurpose::SelectModel
         };
@@ -2740,6 +2825,19 @@ impl App {
         self.backend_commands
             .iter()
             .any(|command| command == Self::RESET_COMMAND)
+    }
+
+    /// Slash command the backend intercepts pre-LLM to rename the thread
+    /// — the push path for the user's own rename (OQ3).
+    pub const RENAME_COMMAND: &str = "/rename_thread";
+
+    /// Whether the connected backend advertises `/rename_thread` at
+    /// handshake. Mocks and offline sessions never do, so a rename stays
+    /// purely local there (no push is staged at all).
+    pub fn supports_rename_command(&self) -> bool {
+        self.backend_commands
+            .iter()
+            .any(|command| command == Self::RENAME_COMMAND)
     }
 
     /// Open the stop-confirmation popup for the ACTIVE chat — BUSY ONLY.
@@ -3340,6 +3438,12 @@ impl App {
                         Some(HiddenPurpose::SelectModel) => {
                             self.resolve_hidden_selection(&markdown, model.as_deref(), chat_index);
                         }
+                        Some(HiddenPurpose::RenameThread) => {
+                            // fire-and-forget: nothing to resolve. The
+                            // backend's own `thread_renamed` echo (when the
+                            // capability is on) re-syncs the title through
+                            // the session frame instead.
+                        }
                         None => {
                             // a visible reply that
                             // stamps its OWN model label retires any
@@ -3405,6 +3509,14 @@ impl App {
                     if purpose.is_some() {
                         if is_transport_failure(&message) {
                             self.connection = Connection::Disconnected;
+                        }
+                        // fire-and-forget: a failed rename push
+                        // never surfaces an error and never reverts the
+                        // local title — the commit already happened; the
+                        // push just dies quietly (last-writer-wins means
+                        // the next rename re-syncs).
+                        if purpose == Some(HiddenPurpose::RenameThread) {
+                            return;
                         }
                         if matches!(self.mode, Mode::ModelPicking { .. }) {
                             self.mode = Mode::Normal;
