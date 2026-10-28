@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Thread renaming by the agent: when the agent renames the current thread, the new title shows up immediately in the sidebar and the chat pane header. Renames made in the TUI itself (Ctrl+R) are now pushed to the backend, so a custom title set either way survives between sessions.
+
 ## [0.5.2] - 2026-10-28
 
 ### Changed
