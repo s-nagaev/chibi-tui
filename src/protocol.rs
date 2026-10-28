@@ -119,6 +119,12 @@ pub struct ClientCapabilities {
     /// unknown flag, so the field is safe to always send.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cwd_updates: bool,
+    /// Opts in to `thread_renamed` frames: the backend reports thread title
+    /// changes (agent-side renames or user renames echoed back). Old
+    /// backends ignore the unknown flag, so the field is safe to always
+    /// send.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thread_renames: bool,
     /// Opts in to `delta` frames: the backend streams partial LLM text while
     /// a request is still running (the terminal `result` frame stays
     /// authoritative and overwrites the accumulated deltas). `default` keeps
@@ -328,6 +334,13 @@ pub enum ServerMessage {
     /// backend's `get_effective_working_dir` chain resolves to (thread
     /// override → user default → application default, expanduser-normalized).
     CwdUpdate { thread_id: i64, cwd: String },
+    /// Thread title change for an existing thread (opt-in via
+    /// `capabilities.thread_renames` at handshake). NON-terminal,
+    /// thread-scoped, pure frontend-state update: like `status`/`agent_event`
+    /// it must never affect a request lifecycle. `name` is the thread's new
+    /// title as the backend resolved it (the last writer wins); consumers
+    /// update the sidebar entry and any mirrored thread names.
+    ThreadRenamed { thread_id: i64, name: String },
     /// Failure for a request or a global failure (`request_id: null`).
     Error {
         /// `None` serializes as explicit `request_id: null` (global error),
@@ -529,7 +542,8 @@ mod tests {
 
     /// Handshake: the client's initialize frame carries
     /// `capabilities: {"thoughts": true, "subagents": true,
-    /// "background_messages": true, "cwd_updates": true, "streaming": true}`
+    /// "background_messages": true, "cwd_updates": true, "thread_renames":
+    /// true, "streaming": true}`
     /// on the wire, protocol_version 1.
     #[test]
     fn initialize_serializes_client_capabilities() {
@@ -544,6 +558,7 @@ mod tests {
                 subagents: true,
                 background_messages: true,
                 cwd_updates: true,
+                thread_renames: true,
                 streaming: true,
             }),
         };
@@ -554,6 +569,7 @@ mod tests {
         assert_eq!(value["capabilities"]["subagents"], true);
         assert_eq!(value["capabilities"]["background_messages"], true);
         assert_eq!(value["capabilities"]["cwd_updates"], true);
+        assert_eq!(value["capabilities"]["thread_renames"], true);
         assert_eq!(value["capabilities"]["streaming"], true);
 
         // Deserializing it back keeps the capabilities (round-trip sanity).
@@ -566,6 +582,7 @@ mod tests {
                         subagents: true,
                         background_messages: true,
                         cwd_updates: true,
+                        thread_renames: true,
                         streaming: true,
                     })
                 );
@@ -962,5 +979,62 @@ mod tests {
             ClientMessage::GetCwd { thread_id } => assert_eq!(thread_id, 7),
             other => panic!("expected GetCwd, got {other:?}"),
         }
+    }
+
+    /// The `thread_renamed` frame parses exactly (thread-scoped, non-terminal)
+    /// and round-trips with `thread_renamed` as the type tag.
+    #[test]
+    fn thread_renamed_frame_parses_and_round_trips() {
+        let frame = r#"{"type":"thread_renamed","thread_id":42,"name":"Cycling plans"}"#;
+        let msg: ServerMessage = serde_json::from_str(frame).expect("thread_renamed parses");
+        assert_eq!(
+            msg,
+            ServerMessage::ThreadRenamed {
+                thread_id: 42,
+                name: "Cycling plans".into(),
+            }
+        );
+        let line = serde_json::to_string(&msg).expect("serializes");
+        assert_eq!(
+            line,
+            r#"{"type":"thread_renamed","thread_id":42,"name":"Cycling plans"}"#
+        );
+    }
+
+    /// Unknown extra fields inside the `thread_renamed` frame are ignored
+    /// (forward-compatible additions must not break parsing).
+    #[test]
+    fn thread_renamed_frame_tolerates_unknown_fields() {
+        let with_extra = r#"{"type":"thread_renamed","thread_id":7,"name":"x","future_field":1}"#;
+        match serde_json::from_str::<ServerMessage>(with_extra).expect("parses") {
+            ServerMessage::ThreadRenamed { thread_id, name } => {
+                assert_eq!(thread_id, 7);
+                assert_eq!(name, "x");
+            }
+            other => panic!("expected ThreadRenamed, got {other:?}"),
+        }
+    }
+
+    /// An `initialize` handshake that never carried `thread_renames` parses
+    /// with the flag off AND re-serializes without it: disabled flags are
+    /// never invented on the wire (the canonical fixtures' contract).
+    #[test]
+    fn initialize_without_thread_renames_serializes_without_the_flag() {
+        let frame =
+            r#"{"type":"initialize","protocol_version":1,"capabilities":{"cwd_updates":true}}"#;
+        let msg: ClientMessage = serde_json::from_str(frame).expect("initialize parses");
+        match &msg {
+            ClientMessage::Initialize { capabilities, .. } => {
+                let caps = capabilities.expect("capabilities present");
+                assert!(!caps.thread_renames, "absent flag defaults to false");
+                assert!(caps.cwd_updates, "declared flag parses true");
+            }
+            other => panic!("expected Initialize, got {other:?}"),
+        }
+        let back = serde_json::to_string(&msg).expect("re-serializes");
+        assert_eq!(
+            back, frame,
+            "absent thread_renames must not appear on the wire"
+        );
     }
 }
