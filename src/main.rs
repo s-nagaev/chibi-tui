@@ -717,24 +717,18 @@ async fn run_loop(
             Some(evt) = event_rx.recv() => {
                 // Per-thread async: after a chat's terminal event, start its
                 // next queued prompt (FIFO), including for background chats.
-                let background_wire_id = match &evt {
-                    BackendEvent::BackgroundMessage { wire_thread_id, .. } => Some(*wire_thread_id),
-                    _ => None,
-                };
+                let event_wire_id = thread_event_wire_id(&evt);
                 let drain_thread_id = match &evt {
                     BackendEvent::QueueDrain { thread_id } => Some(thread_id.clone()),
                     _ => None,
                 };
-                if let Some(wire_id) = background_wire_id {
+                if let Some(wire_id) = event_wire_id {
                     app.apply_backend_event(evt);
-                    // Persist the chat the continuation belongs to (routed by
-                    // the wire thread id; the active-chat default below misses
-                    // background threads).
-                    if let Some(chat) = app
-                        .chats
-                        .iter()
-                        .find(|c| chibi_tui::live::wire_thread_id(&c.id) == wire_id)
-                    {
+                    // Persist the chat the event belongs to (routed by the
+                    // wire thread id; the active-chat default below misses
+                    // background continuations and renames of non-active
+                    // chats).
+                    if let Some(chat) = chat_for_wire_id(&app.chats, wire_id) {
                         persist_chat(chat, history_dir);
                     }
                 } else if let Some(thread_id) = drain_thread_id {
@@ -934,6 +928,32 @@ fn persist_chat(chat: &chibi_tui::app::Chat, dir_override: Option<&std::path::Pa
 /// event kind) persist as before, so the authoritative text always lands.
 fn should_persist_after(evt: &BackendEvent) -> bool {
     !matches!(evt, BackendEvent::Delta { .. })
+}
+
+/// Which wire thread id does this event concern, if any? Covers the
+/// session-scoped events keyed by the wire id (`BackgroundMessage`
+/// continuations and `ThreadRenamed` title changes): the event loop routes
+/// their persistence to the OWNING chat, which the active-chat default below
+/// misses for background threads and for renames of non-active chats.
+/// `QueueDrain` carries a chat `thread_id` (UUID), not a wire id, and keeps
+/// its own extraction in the event loop.
+fn thread_event_wire_id(evt: &BackendEvent) -> Option<i64> {
+    match evt {
+        BackendEvent::BackgroundMessage { wire_thread_id, .. }
+        | BackendEvent::ThreadRenamed { wire_thread_id, .. } => Some(*wire_thread_id),
+        _ => None,
+    }
+}
+
+/// Which chat does a session-scoped wire-id event belong to? Same
+/// id→chat mapping `App::apply_thread_rename` uses: the event loop routes
+/// the snapshot write to the OWNING chat, which the active-chat default
+/// below misses for background threads and for renames of non-active
+/// chats. An unknown wire id resolves to nothing (nothing is persisted).
+fn chat_for_wire_id(chats: &[chibi_tui::app::Chat], wire_id: i64) -> Option<&chibi_tui::app::Chat> {
+    chats
+        .iter()
+        .find(|c| chibi_tui::live::wire_thread_id(&c.id) == wire_id)
 }
 
 /// Build the live-mode startup app: persisted history (or one fresh chat on
