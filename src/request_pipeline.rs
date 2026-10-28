@@ -896,6 +896,10 @@ async fn dispatch_frame(
         } => {}
         // A repeated `ready` after the handshake is a no-op for the pipeline.
         ServerMessage::Ready { .. } => {}
+        // Thread title change: thread-scoped frontend state, consumed by a
+        // later feature's wiring; until then the pipeline drops it like any
+        // other lifecycle-irrelevant frame.
+        ServerMessage::ThreadRenamed { .. } => {}
     }
 }
 
