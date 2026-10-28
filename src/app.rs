@@ -3215,6 +3215,19 @@ impl App {
             return;
         }
 
+        // Thread title change: session-scoped, keyed by the wire thread
+        // id, never by a request. It must not pass through the
+        // request-lifecycle routing below (it carries no request id at
+        // all).
+        if let BackendEvent::ThreadRenamed {
+            wire_thread_id,
+            name,
+        } = event
+        {
+            self.apply_thread_rename(wire_thread_id, name);
+            return;
+        }
+
         // Route to the owning chat by thread id (empty → active chat).
         let route_thread_id: Option<String> = match &event {
             BackendEvent::Queued { thread_id, .. } => Some(thread_id.clone()),
@@ -3227,8 +3240,8 @@ impl App {
             BackendEvent::QueueDrain { .. } => return,
             // Unreachable: handled by the early returns above.
             BackendEvent::BackgroundMessage { .. } | BackendEvent::CwdUpdate { .. } => return,
-            // Thread-scoped, non-terminal frontend-state update: no request
-            // lifecycle to resolve here, so nothing to route.
+            // Unreachable: handled by the early returns above (name-only
+            // frontend state, applied by `apply_thread_rename`).
             BackendEvent::ThreadRenamed { .. } => return,
             BackendEvent::Disconnected => None,
         };
@@ -3479,6 +3492,39 @@ impl App {
     /// active later in the session.
     fn apply_cwd_update(&mut self, wire_thread_id: i64, cwd: String) {
         self.thread_cwds.insert(wire_thread_id, cwd);
+    }
+
+    /// Apply a thread title change (`thread_renamed` frame) to the sidebar
+    /// name of the chat owning the wire thread id.
+    ///
+    /// Name-only mutation: the ONLY state the frame may touch is the
+    /// matching chat's `name`. It never resolves a request lifecycle,
+    /// never changes the active selection, focus or open `Mode::Renaming`
+    /// draft (the user keeps typing while a frame lands; the draft's
+    /// `commit_rename` is the last writer — OQ1), never scrolls, lifts the
+    /// thread, stamps `updated_at` or raises unread markers. Unknown wire
+    /// ids are dropped silently (no second title store; see
+    /// [`App::apply_cwd_update`] for the contrast). Empty/whitespace-only
+    /// titles are rejected; a title equal to the current one is an
+    /// idempotent no-op, which makes the backend echo of the user's own
+    /// rename (and of the hidden `/rename_thread` push) safe.
+    fn apply_thread_rename(&mut self, wire_thread_id: i64, name: String) {
+        let Some(chat_index) = self
+            .chats
+            .iter()
+            .position(|c| crate::live::wire_thread_id(&c.id) == wire_thread_id)
+        else {
+            return; // unknown thread: not ours
+        };
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let chat = &mut self.chats[chat_index];
+        if chat.name == trimmed {
+            return; // idempotent: backend echo of the current title
+        }
+        chat.name = trimmed.to_owned();
     }
 
     /// Apply an out-of-band continuation answer (`message` frame) to the

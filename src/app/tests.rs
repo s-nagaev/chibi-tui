@@ -29,6 +29,7 @@ mod streaming;
 mod subagent;
 mod submit_result;
 mod support;
+mod thread_rename;
 mod unread;
 mod usage_thoughts;
 mod viewer_ring;
