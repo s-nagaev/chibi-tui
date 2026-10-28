@@ -122,6 +122,17 @@ pub struct CwdUpdateUpdate {
     pub cwd: String,
 }
 
+/// Thread title change for a thread, delivered from a `thread_renamed`
+/// frame. Thread-scoped like [`BackgroundMessageUpdate`]: it correlates to
+/// NO request — it is a pure frontend-state update. `wire_thread_id` is the
+/// backend's raw thread identifier; mapping it to a local chat happens in
+/// the event pump, not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRenameUpdate {
+    pub wire_thread_id: i64,
+    pub name: String,
+}
+
 /// Live streaming text chunk delivered out-of-band from a `delta` frame
 /// (opt-in via `capabilities.streaming` at handshake). Request-scoped like
 /// [`AgentEventUpdate`]: it correlates to the request that is still
@@ -311,6 +322,7 @@ pub struct RequestPipeline {
     agent_tx: broadcast::Sender<AgentEventUpdate>,
     background_tx: broadcast::Sender<BackgroundMessageUpdate>,
     cwd_tx: broadcast::Sender<CwdUpdateUpdate>,
+    rename_tx: broadcast::Sender<ThreadRenameUpdate>,
     delta_tx: broadcast::Sender<DeltaUpdate>,
     /// Slash commands the backend advertised in the handshake `ready` frame
     ///. Captured once at connect; a reconnect
@@ -383,6 +395,7 @@ impl RequestPipeline {
         let (agent_tx, _) = broadcast::channel(status_channel_capacity.max(1));
         let (background_tx, _) = broadcast::channel(status_channel_capacity.max(1));
         let (cwd_tx, _) = broadcast::channel(status_channel_capacity.max(1));
+        let (rename_tx, _) = broadcast::channel(status_channel_capacity.max(1));
         let (delta_tx, _) = broadcast::channel(status_channel_capacity.max(1));
 
         tokio::spawn(actor_loop(
@@ -392,6 +405,7 @@ impl RequestPipeline {
             agent_tx.clone(),
             background_tx.clone(),
             cwd_tx.clone(),
+            rename_tx.clone(),
             delta_tx.clone(),
             ActorConfig {
                 workspace_root: workspace_root.display().to_string(),
@@ -406,6 +420,7 @@ impl RequestPipeline {
             agent_tx,
             background_tx,
             cwd_tx,
+            rename_tx,
             delta_tx,
             commands,
         })
@@ -491,6 +506,15 @@ impl RequestPipeline {
         self.cwd_tx.subscribe()
     }
 
+    /// Subscribe to thread title changes (`thread_renamed` frames). Same
+    /// broadcast semantics as [`RequestPipeline::subscribe_status`]:
+    /// session-scoped updates that are structurally unable to touch any
+    /// request's lifecycle. `wire_thread_id` is the backend's raw thread
+    /// identifier; local-chat mapping happens downstream.
+    pub fn subscribe_thread_renames(&self) -> broadcast::Receiver<ThreadRenameUpdate> {
+        self.rename_tx.subscribe()
+    }
+
     /// Subscribe to live streaming text chunks (`delta` frames, emitted
     /// only for clients that declared `capabilities.streaming`).
     /// Request-scoped like [`RequestPipeline::subscribe_agent_events`]:
@@ -542,6 +566,7 @@ async fn actor_loop(
     agent_tx: broadcast::Sender<AgentEventUpdate>,
     background_tx: broadcast::Sender<BackgroundMessageUpdate>,
     cwd_tx: broadcast::Sender<CwdUpdateUpdate>,
+    rename_tx: broadcast::Sender<ThreadRenameUpdate>,
     delta_tx: broadcast::Sender<DeltaUpdate>,
     config: ActorConfig,
 ) {
@@ -592,6 +617,7 @@ async fn actor_loop(
                         &agent_tx,
                         &background_tx,
                         &cwd_tx,
+                        &rename_tx,
                         &delta_tx,
                         msg,
                     )
@@ -777,12 +803,14 @@ async fn handle_reconnect(
 }
 
 /// Route one parsed server frame to its destination.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_frame(
     state: &mut ActorState,
     status_tx: &broadcast::Sender<StatusUpdate>,
     agent_tx: &broadcast::Sender<AgentEventUpdate>,
     background_tx: &broadcast::Sender<BackgroundMessageUpdate>,
     cwd_tx: &broadcast::Sender<CwdUpdateUpdate>,
+    rename_tx: &broadcast::Sender<ThreadRenameUpdate>,
     delta_tx: &broadcast::Sender<DeltaUpdate>,
     msg: ServerMessage,
 ) {
@@ -896,10 +924,15 @@ async fn dispatch_frame(
         } => {}
         // A repeated `ready` after the handshake is a no-op for the pipeline.
         ServerMessage::Ready { .. } => {}
-        // Thread title change: thread-scoped frontend state, consumed by a
-        // later feature's wiring; until then the pipeline drops it like any
-        // other lifecycle-irrelevant frame.
-        ServerMessage::ThreadRenamed { .. } => {}
+        // Thread title change: fan out to the rename channel and leave every
+        // pending entry untouched — like `cwd_update` the frame carries no
+        // request id and must never resolve any request's lifecycle.
+        ServerMessage::ThreadRenamed { thread_id, name } => {
+            let _ = rename_tx.send(ThreadRenameUpdate {
+                wire_thread_id: thread_id,
+                name,
+            });
+        }
     }
 }
 
@@ -1107,6 +1140,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = broadcast::channel(4);
         let (background_tx, _background_rx) = broadcast::channel(4);
         let (cwd_tx, _cwd_rx) = broadcast::channel(4);
+        let (rename_tx, _rename_rx) = broadcast::channel(4);
         let (delta_tx, _delta_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
@@ -1127,6 +1161,7 @@ mod tests {
             &agent_tx,
             &background_tx,
             &cwd_tx,
+            &rename_tx,
             &delta_tx,
             frame,
         )
@@ -1163,6 +1198,7 @@ mod tests {
         let (agent_tx, _agent_rx) = broadcast::channel(4);
         let (background_tx, mut background_rx) = broadcast::channel(4);
         let (cwd_tx, _cwd_rx) = broadcast::channel(4);
+        let (rename_tx, _rename_rx) = broadcast::channel(4);
         let (delta_tx, _delta_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
@@ -1183,6 +1219,7 @@ mod tests {
             &agent_tx,
             &background_tx,
             &cwd_tx,
+            &rename_tx,
             &delta_tx,
             frame,
         )
@@ -1220,6 +1257,7 @@ mod tests {
         let (agent_tx, _agent_rx) = broadcast::channel(4);
         let (background_tx, _background_rx) = broadcast::channel(4);
         let (cwd_tx, mut cwd_rx) = broadcast::channel(4);
+        let (rename_tx, _rename_rx) = broadcast::channel(4);
         let (delta_tx, _delta_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
@@ -1240,6 +1278,7 @@ mod tests {
             &agent_tx,
             &background_tx,
             &cwd_tx,
+            &rename_tx,
             &delta_tx,
             frame,
         )
@@ -1272,6 +1311,7 @@ mod tests {
         let (agent_tx, _agent_rx) = broadcast::channel(4);
         let (background_tx, _background_rx) = broadcast::channel(4);
         let (cwd_tx, _cwd_rx) = broadcast::channel(4);
+        let (rename_tx, _rename_rx) = broadcast::channel(4);
         let (delta_tx, mut delta_rx) = broadcast::channel(4);
         let (result_tx, mut result_rx) = oneshot::channel();
         let mut state = ActorState {
@@ -1292,6 +1332,7 @@ mod tests {
             &agent_tx,
             &background_tx,
             &cwd_tx,
+            &rename_tx,
             &delta_tx,
             frame,
         )
@@ -1312,6 +1353,82 @@ mod tests {
                 request_id: "r1".to_owned(),
                 thread_id: 42,
                 text: "hel".to_owned(),
+            }
+        );
+    }
+
+    /// Non-terminal lifecycle: a `thread_renamed` frame fans out to the
+    /// rename channel and must NEVER resolve any request's pending
+    /// final-outcome receiver — it carries no request id at all.
+    #[tokio::test]
+    async fn thread_renamed_dispatch_never_resolves_pending() {
+        let (status_tx, _status_rx) = broadcast::channel(4);
+        let (agent_tx, _agent_rx) = broadcast::channel(4);
+        let (background_tx, _background_rx) = broadcast::channel(4);
+        let (cwd_tx, _cwd_rx) = broadcast::channel(4);
+        let (rename_tx, mut rename_rx) = broadcast::channel(4);
+        let (delta_tx, _delta_rx) = broadcast::channel(4);
+        let (result_tx, mut result_rx) = oneshot::channel();
+        let mut state = ActorState {
+            stdin: None,
+            reaper: None,
+            pending: HashMap::new(),
+            broken_reason: None,
+        };
+        state.pending.insert("r1".to_owned(), result_tx);
+
+        let frame: ServerMessage =
+            serde_json::from_str(r#"{"type":"thread_renamed","thread_id":42,"name":"errands"}"#)
+                .expect("thread_renamed frame parses");
+        dispatch_frame(
+            &mut state,
+            &status_tx,
+            &agent_tx,
+            &background_tx,
+            &cwd_tx,
+            &rename_tx,
+            &delta_tx,
+            frame,
+        )
+        .await;
+
+        assert!(
+            state.pending.contains_key("r1"),
+            "request-less frame must not consume the pending entry"
+        );
+        assert!(
+            result_rx.try_recv().is_err(),
+            "final-outcome receiver must stay unresolved"
+        );
+        let update = rename_rx.try_recv().expect("rename fanned out");
+        assert_eq!(
+            update,
+            ThreadRenameUpdate {
+                wire_thread_id: 42,
+                name: "errands".to_owned(),
+            }
+        );
+    }
+
+    /// The handle-side accessor hands out a live subscription: an update
+    /// broadcast through the pipeline's rename channel reaches every
+    /// subscriber taken before the send.
+    #[tokio::test]
+    async fn thread_renamed_subscription_delivers_updates() {
+        let rename_tx: broadcast::Sender<ThreadRenameUpdate> = broadcast::channel(4).0;
+        let mut sub = rename_tx.subscribe();
+
+        let _ = rename_tx.send(ThreadRenameUpdate {
+            wire_thread_id: 7,
+            name: "trip planning".to_owned(),
+        });
+
+        let update = sub.try_recv().expect("subscriber receives the update");
+        assert_eq!(
+            update,
+            ThreadRenameUpdate {
+                wire_thread_id: 7,
+                name: "trip planning".to_owned(),
             }
         );
     }
