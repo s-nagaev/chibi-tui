@@ -56,6 +56,10 @@ declared in the handshake):
                          MARKDOWN document: a complete fenced code block
                          early, then an open fence as the in-progress tail
                          (drives the incremental md stream renderer)
+``--with-thread-rename`` after a request's ``status running``, emit one
+                         mid-turn ``thread_renamed`` frame for the request's
+                         thread id when the handshake declared
+                         ``capabilities.thread_renames``
 """
 
 from __future__ import annotations
@@ -122,6 +126,13 @@ USAGE_OUTPUT_TOKENS = 512
 USAGE_CONTEXT_WINDOW = 131072
 
 
+# Mid-turn thread title change (--with-thread-rename): the deterministic
+# name the backend renames the request's thread to. Emitted strictly between
+# `status running` and the terminal result so clients can prove the rename
+# never disturbs the in-flight turn.
+THREAD_RENAME_NAME = "Renamed by the backend"
+
+
 def cap_thoughts(thoughts: str) -> str:
     """Cap reasoning text at MAX_THOUGHTS_BYTES with a truncation marker.
 
@@ -166,6 +177,7 @@ def ready_frame():
                 "/reset",
                 "/stop",
                 "/new_thread_with_current_context",
+                "/rename_thread",
                 "/model",
                 "/imagine",
                 "/info",
@@ -258,6 +270,13 @@ def main() -> int:
         "fenced code block early, then an OPEN fence as the in-progress "
         "tail (exercises incremental md rendering of completed blocks)",
     )
+    parser.add_argument(
+        "--with-thread-rename",
+        action="store_true",
+        help="emit one mid-turn thread_renamed frame for the request's "
+        "thread id (after status running, before the result) when the "
+        "client opted in via capabilities.thread_renames",
+    )
     args = parser.parse_args()
     if args.usage_windowless:
         args.with_usage = True
@@ -276,6 +295,7 @@ def main() -> int:
     caps_subagents = False
     caps_background_messages = False
     caps_streaming = False
+    caps_thread_renames = False
     # thread id of the latest request, used by the --with-background-message
     # continuation timer (the frame carries no request id, only the thread)
     last_request_thread = None
@@ -365,7 +385,7 @@ def main() -> int:
 
     def handle_initialize(obj) -> None:
         nonlocal initialized, caps_thoughts, caps_subagents
-        nonlocal caps_background_messages, caps_streaming
+        nonlocal caps_background_messages, caps_streaming, caps_thread_renames
         version = obj.get("protocol_version")
         if version != 1:
             emit(
@@ -387,6 +407,7 @@ def main() -> int:
         caps_subagents = caps.get("subagents") is True
         caps_background_messages = caps.get("background_messages") is True
         caps_streaming = caps.get("streaming") is True
+        caps_thread_renames = caps.get("thread_renames") is True
 
         emit(ready_frame())
         if args.garbage_on_start:
@@ -530,6 +551,14 @@ def main() -> int:
         if args.crash_after_running:
             sys.stdout.flush()
             os._exit(69)
+        if args.with_thread_rename and caps_thread_renames:
+            emit(
+                {
+                    "type": "thread_renamed",
+                    "thread_id": obj["thread_id"],
+                    "name": THREAD_RENAME_NAME,
+                }
+            )
         if args.with_unknown_frame:
             emit(
                 {

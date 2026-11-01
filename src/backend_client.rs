@@ -283,6 +283,7 @@ impl BackendClient {
                 subagents: true,
                 background_messages: true,
                 cwd_updates: true,
+                thread_renames: true,
                 streaming: true,
             }),
         };

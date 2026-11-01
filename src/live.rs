@@ -174,6 +174,36 @@ impl LiveBackend {
             }
         });
     }
+
+    /// Forward thread title changes into the shared UI event channel for
+    /// the lifetime of this connection.
+    ///
+    /// `thread_renamed` frames are thread-scoped (no request id), so they
+    /// cannot ride the per-request glue tasks: a rename may arrive while NO
+    /// request is in flight. The spawned pump subscribes once and
+    /// translates every broadcast update into a
+    /// [`BackendEvent::ThreadRenamed`]; it retires itself when the channel
+    /// closes (backend dropped / replaced by a reconnect pump).
+    pub fn pump_thread_renames(&self, tx: mpsc::Sender<BackendEvent>) {
+        let mut rx = self.pipeline.subscribe_thread_renames();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(update) => {
+                        let event = BackendEvent::ThreadRenamed {
+                            wire_thread_id: update.wire_thread_id,
+                            name: update.name,
+                        };
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
 }
 
 impl Backend for LiveBackend {
@@ -926,6 +956,7 @@ mod tests {
                 BackendEvent::Result { .. } => panic!("cancelled request must not yield Result"),
                 BackendEvent::BackgroundMessage { .. } => continue,
                 BackendEvent::CwdUpdate { .. } => continue,
+                BackendEvent::ThreadRenamed { .. } => continue,
                 BackendEvent::Disconnected => continue,
             }
         }

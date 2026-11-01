@@ -111,7 +111,8 @@ summary drifts.
   hides at 0, and switches with the thread (session state, never
   persisted).
 - **Capabilities.** The TUI advertises `{"thoughts": true, "subagents": true,
-  "background_messages": true, "cwd_updates": true, "streaming": true}` at
+  "background_messages": true, "cwd_updates": true, "thread_renames": true,
+  "streaming": true}` at
   the handshake; the protocol version stays `1`. Absent flags mean "off"
   and disabled flags are never serialized (partial capability objects
   round-trip byte-exact). Unknown fields inside known frames are ignored;
@@ -179,9 +180,12 @@ Client → server: `initialize` (client info + capabilities), `request`,
 `delta` (streaming partial text, opt-in via `capabilities.streaming`),
 `result` (optional `model` / `provider` / `usage` / `thoughts`),
 `message` (out-of-band background continuation, routed by `thread_id`),
-`cwd_update` (effective working directory, routed by `thread_id`), `error`
+`cwd_update` (effective working directory, routed by `thread_id`),
+`thread_renamed` (thread title change, routed by `thread_id`, opt-in via
+`capabilities.thread_renames`), `error`
 (`request_id: null` = global; the pipeline drops those). `delta`, `status`,
-`agent_event`, `message`, and `cwd_update` are non-terminal — only
+`agent_event`, `message`, `thread_renamed`, and `cwd_update` are
+non-terminal — only
 `result` / `error` resolve a request's lifecycle. Wire `request_id`s
 are client-chosen UUID strings (`Submitted`); `BackendEvent` variants carry
 numeric stand-ins (`u64`, derived from the UUID hash in `live.rs`); the
