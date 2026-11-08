@@ -1,7 +1,8 @@
 # Vendored canonical copy of the backend settings template (Chibi backend, chibi-bot).
 # Source file: chibi/config_generator.py, DEFAULT_CONFIG f-string body.
-# Source branch: main, commit: a359ccb22fb2a2ad8ab058c90aa4659ac1a2ee73 (Feat: Add MCP SSE auth and REST transport #141).
-# Snapshot date: 2026-10-25.
+# Source branch: main, commit: a359ccb22fb2a2ad8ab058c90aa4659ac1a2ee73 (Feat: Add MCP SSE auth and REST transport #141);
+# STEPFUN_API_KEY hunk re-copied from feat/stepfun-provider, commit: 75b28f39c174b3fbf4bcbd7a97a6593459c42861 (Feat: Add StepFun provider #171).
+# Snapshot date: 2026-11-08.
 # NEVER edit the template body here: fix upstream and re-copy.
 # The provenance header above is stripped by generation and by the drift-guard
 # test (everything before the first '# Chibi Agent Configuration File' line).
@@ -129,6 +130,9 @@ FEATHERLESS_API_KEY=
 
 # DeepSeek, GLM and other open models. https://entrim.ai
 ENTRIM_API_KEY=
+
+# StepFun (Step model series). https://api.stepfun.ai
+# STEPFUN_API_KEY=
 
 # Open-source models from Cloudflare. Chat-only. https://dash.cloudflare.com/profile/api-tokens
 CLOUDFLARE_API_KEY=

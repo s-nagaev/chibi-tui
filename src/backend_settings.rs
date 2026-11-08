@@ -936,7 +936,7 @@ const S41: &str = "4.1 INFINITE CONTEXT (ChromaDB)";
 /// telegram keys and telegram-access whitelists, memory group, heartbeat.
 /// Unknown file keys are tolerated and never rewritten.
 pub const REGISTRY: &[KeyDef] = &[
-    // ---- Group 1: LLM Providers (31 rows) ----
+    // ---- Group 1: LLM Providers (32 rows) ----
     secret(
         "OPENAI_API_KEY",
         Group::ProviderKeys,
@@ -1094,6 +1094,12 @@ pub const REGISTRY: &[KeyDef] = &[
         "Featherless API key",
     ),
     secret("ENTRIM_API_KEY", Group::ProviderKeys, S2, "Entrim API key"),
+    secret_commented(
+        "STEPFUN_API_KEY",
+        Group::ProviderKeys,
+        S2,
+        "StepFun API key (Step models)",
+    ),
     secret(
         "CLOUDFLARE_API_KEY",
         Group::ProviderKeys,
