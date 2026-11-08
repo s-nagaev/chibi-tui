@@ -8,6 +8,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- StepFun provider key: `STEPFUN_API_KEY` is now a first-class row in the LLM Providers group of the backend settings editor, so the key is editable like the other provider keys. It ships commented out in the generated settings template, so the row reads as disabled until a value is set.
 - Thread renaming by the agent: when the agent renames the current thread, the new title shows up immediately in the sidebar and the chat pane header. Renames made in the TUI itself (Ctrl+R) are now pushed to the backend, so a custom title set either way survives between sessions.
 
 ## [0.5.2] - 2026-10-28

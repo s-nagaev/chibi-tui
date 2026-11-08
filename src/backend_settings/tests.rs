@@ -415,7 +415,7 @@ fn serialization_leaves_safe_values_unquoted() {
 
 #[test]
 fn registry_row_counts_match_the_approved_slice() {
-    assert_eq!(Group::ProviderKeys.keys().count(), 31);
+    assert_eq!(Group::ProviderKeys.keys().count(), 32);
     assert_eq!(Group::MediaProviders.keys().count(), 2);
     assert_eq!(Group::Integrations.keys().count(), 3);
     assert_eq!(Group::ModelRouting.keys().count(), 14);
@@ -423,16 +423,16 @@ fn registry_row_counts_match_the_approved_slice() {
     assert_eq!(Group::Restrictions.keys().count(), 3);
     assert_eq!(Group::AgentPaths.keys().count(), 3);
     assert_eq!(Group::Service.keys().count(), 5);
-    assert_eq!(REGISTRY.len(), 79);
+    assert_eq!(REGISTRY.len(), 80);
 }
 
 #[test]
-fn registry_group1_is_30_secrets_plus_customopenai_url() {
+fn registry_group1_is_31_secrets_plus_customopenai_url() {
     let secrets = Group::ProviderKeys
         .keys()
         .filter(|d| d.kind == Kind::Secret)
         .count();
-    assert_eq!(secrets, 30);
+    assert_eq!(secrets, 31);
     let url = registry_get("CUSTOMOPENAI_URL").unwrap();
     assert_eq!(url.kind, Kind::PlainStr);
     assert_eq!(url.default, "http://localhost:1234/v1");
@@ -442,7 +442,7 @@ fn registry_group1_is_30_secrets_plus_customopenai_url() {
 #[test]
 fn registry_secrets_and_commented_flags_are_correct() {
     for def in Group::ProviderKeys.keys() {
-        // 30 Secret rows + CUSTOMOPENAI_URL (PlainStr) in group 1.
+        // 31 Secret rows + CUSTOMOPENAI_URL (PlainStr) in group 1.
         assert_eq!(
             def.secret,
             def.key != "CUSTOMOPENAI_URL",
@@ -545,6 +545,7 @@ fn registry_environment_names_match_the_backend_configs() {
         "JINA_API_KEY",
         "GOOGLE_SEARCH_API_KEY",
         "GOOGLE_SEARCH_CX",
+        "STEPFUN_API_KEY",
     ] {
         assert!(registry_get(key).is_some(), "{} missing from registry", key);
     }

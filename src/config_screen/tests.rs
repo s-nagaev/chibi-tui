@@ -776,8 +776,9 @@ fn select_row_at_ignores_clicks_past_the_last_row() {
     // idx == len (one past the final row) → ignored.
     state.select_row_at(geo.keys_inner.y + state.row_count() as u16);
     assert_eq!(state.row, last, "click one past the last row ignored");
-    // Far below the pane → ignored too.
-    state.select_row_at(geo.keys_inner.y + geo.keys_inner.height + 5);
+    // Far below the pane (beyond the group's row count, so the mapped
+    // index is out of range regardless of pane height) → ignored too.
+    state.select_row_at(geo.keys_inner.y + geo.keys_inner.height + state.row_count() as u16);
     assert_eq!(state.row, last, "click far below the pane ignored");
     // Empty-group branch: with an out-of-window snapshot the mapped index
     // is always past the last row (the same `idx >= row_count` comparison
@@ -849,7 +850,7 @@ fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 #[test]
 fn wheel_over_the_rows_pane_moves_the_selection_with_clamping() {
     let mut state = state_at("mouserows", "DEFAULT_MODEL=x\n");
-    // 60x12: the pane shows ~8 of the 31 provider rows, so both the
+    // 60x12: the pane shows ~8 of the 32 provider rows, so both the
     // selection movement and the window scrolling are exercised.
     render_once_sized(&mut state, 60, 12);
     let geo = state.geometry.expect("rendered");
