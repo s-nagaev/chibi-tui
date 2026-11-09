@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Message timestamps: every chat message header shows the local HH:MM time the message was created, next to the author name, for both your messages and the agent's.
+- Soft-wrapped message input: long text wraps to the next line instead of scrolling past the right edge, the input area grows up to three quarters of the window height while you type, and the caret stays visible on the wrapped row. Enter still sends, Shift+Enter and Alt+Enter still insert a newline.
+
+### Fixed
+
+- Long chat names in the sidebar truncate with an ellipsis at the panel edge instead of being clipped at the window border.
+
 ## [0.6.0] - 2026-11-08
 
 ### Added
