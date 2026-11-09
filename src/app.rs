@@ -2597,8 +2597,13 @@ impl App {
             // A new VISIBLE request starts in THIS chat: its previous turn's
             // reasoning leaves the view. Other chats' thoughts are untouched.
             chat.last_thoughts = None;
-            chat.messages.push(Message::user(submitted.prompt.clone()));
-            chat.messages.push(Message::assistant_pending());
+            // One event, one instant: the prompt bubble and its placeholder
+            // share the moment the request was sent, and the placeholder's
+            // stamp survives resolution (see `resolve_live_placeholder`).
+            let sent_at = crate::history::now_unix();
+            chat.messages
+                .push(Message::user(submitted.prompt.clone()).at(sent_at));
+            chat.messages.push(Message::assistant_pending().at(sent_at));
             chat.lifecycle = ChatLifecycle::Awaiting {
                 request_id: submitted.request_id.clone(),
             };
@@ -2644,11 +2649,14 @@ impl App {
         };
         // The user bubble was appended at enqueue time; swap the oldest
         // remaining queued marker for the real pending placeholder (display
-        // order == FIFO order).
+        // order == FIFO order). The swap happens IN PLACE so the pending row
+        // inherits the marker's creation stamp: a prompt keeps the clock it
+        // was queued with, never the moment it left the queue.
         if let Some(marker) = chat.messages.iter_mut().find(|m| is_queued_marker(m)) {
-            *marker = Message::assistant_pending();
+            marker.markdown.clear();
         } else {
-            chat.messages.push(Message::assistant_pending());
+            chat.messages
+                .push(Message::assistant_pending().at(crate::history::now_unix()));
         }
         chat.lifecycle = ChatLifecycle::Awaiting {
             request_id: submitted.request_id.clone(),
@@ -3680,7 +3688,9 @@ impl App {
                 Some(label) => Message::assistant_with_model(markdown, label.clone()),
                 None => Message::assistant(markdown),
             };
-            chat.messages.push(message);
+            // An out-of-band continuation is a message in its own right: it
+            // appears now, so it is stamped now.
+            chat.messages.push(message.at(crate::history::now_unix()));
             // Per-chat thoughts: a visible answer of the owning chat
             // carrying reasoning is a legitimate writer of its block.
             // Continuation reasoning is a CHAIN member, not a replacement:
@@ -3722,8 +3732,11 @@ impl App {
                 // The fallback is honest, not silent: surface the raw
                 // exchange the user actually caused with ^M.
                 let chat = &mut self.chats[chat_index];
-                chat.messages.push(Message::user(MODEL_LISTING_PROMPT));
-                chat.messages.push(Message::assistant(markdown));
+                let surfaced_at = crate::history::now_unix();
+                chat.messages
+                    .push(Message::user(MODEL_LISTING_PROMPT).at(surfaced_at));
+                chat.messages
+                    .push(Message::assistant(markdown).at(surfaced_at));
                 self.scroll = 0;
             }
             return;
@@ -3913,10 +3926,14 @@ impl App {
 /// is swapped for the real pending answer when the prompt leaves the queue
 /// (see [`App::dequeue_next_for`]).
 fn enqueue_prompt(chat: &mut Chat, prompt: String) {
-    chat.messages.push(Message::user(prompt.clone()));
+    // The queue holds prompts, not clocks: the user bubble and its position
+    // marker share the moment the prompt was written.
+    let queued_at = crate::history::now_unix();
+    chat.messages
+        .push(Message::user(prompt.clone()).at(queued_at));
     chat.queue.push_back(prompt);
     chat.messages
-        .push(Message::assistant_queued(chat.queue.len()));
+        .push(Message::assistant_queued(chat.queue.len()).at(queued_at));
 }
 
 /// Marker predicate for the visible "⏳ queued (#n)" placeholder rows.
@@ -4000,6 +4017,11 @@ pub fn collect_search_matches<'a>(
 /// `model` is stamped ONLY onto this one message at
 /// result-resolution time: replies are labelled per-message, so future
 /// per-message model switching can never mislabel an earlier answer.
+///
+/// The creation stamp is NOT re-taken here: the row already carries the
+/// instant its bubble appeared (the request start), and a reply must never
+/// change its clock while it is being answered. Only a placeholder that
+/// carries none is stamped now.
 fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<String>) {
     if let Some(row) = chat
         .messages
@@ -4010,6 +4032,7 @@ fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<Str
         row.pending = false;
         row.markdown = markdown;
         row.model = model;
+        row.created_at.get_or_insert_with(crate::history::now_unix);
     }
 }
 
@@ -4032,6 +4055,8 @@ fn resolve_live_placeholder_with_error(chat: &mut Chat, message: &str) {
             format!("{partial}\n\n**Error:** {message}")
         };
         row.pending = false;
+        // Same rule as a successful resolution: the clock is the request's.
+        row.created_at.get_or_insert_with(crate::history::now_unix);
     }
 }
 /// is this answer content invisible-by-contract?

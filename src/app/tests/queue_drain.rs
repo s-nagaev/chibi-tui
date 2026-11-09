@@ -149,3 +149,49 @@ fn spinner_reflects_active_chat_only() {
 }
 
 // ---- cancel semantics -------------------------------------------------
+
+/// Creation-stamp identity through the queued → pending → resolved chain:
+/// a prompt keeps the instant it was queued with across both handoffs (the
+/// dequeue swap and the result resolution), never re-dating itself at
+/// either step.
+#[test]
+fn queued_prompt_keeps_its_stamp_through_dequeue_and_resolution() {
+    let mut app = app_with_chats(1);
+    submit_text(&mut app, "one");
+    type_in(&mut app, "two");
+    assert!(app.take_input().is_none(), "the second prompt is queued");
+
+    // The queued user bubble and its position marker share one instant,
+    // captured at enqueue time.
+    let msgs = &app.chats[0].messages;
+    assert_eq!(msgs.len(), 4, "user+pending, then user+queued-marker");
+    let queued_at = msgs[2].created_at.expect("the queued prompt is stamped");
+    assert_eq!(
+        msgs[3].created_at,
+        Some(queued_at),
+        "the queued marker shares the queued prompt's instant"
+    );
+
+    // Terminal event #1 resolves "one" and dequeues "two": the marker is
+    // swapped IN PLACE for the pending placeholder, so it must inherit
+    // the marker's stamp, not a fresh one taken at dequeue time.
+    finish_chat(&mut app, 0);
+    let thread = app.chats[0].id.clone();
+    let next = app.dequeue_next_for(&thread).expect("queued prompt drains");
+    assert_eq!(next.prompt, "two");
+    assert_eq!(
+        app.chats[0].messages[3].created_at,
+        Some(queued_at),
+        "the pending placeholder keeps the queued marker's stamp after the swap"
+    );
+
+    // Terminal event #2 resolves "two": the answer's clock must still be
+    // the moment the prompt was queued, not the moment it was answered.
+    finish_chat(&mut app, 0);
+    assert_eq!(
+        app.chats[0].messages[3].created_at,
+        Some(queued_at),
+        "resolution preserves the stamp instead of re-dating the answer"
+    );
+    assert!(!app.chats[0].messages[3].pending);
+}

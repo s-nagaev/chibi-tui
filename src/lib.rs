@@ -21,6 +21,7 @@ pub mod diag;
 pub mod history;
 pub mod input;
 pub mod live;
+pub mod localtime;
 pub mod markdown;
 pub mod md_cache;
 pub mod mock;

@@ -442,10 +442,18 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 /// own label — restored pre-label history, fieldless frames — stay plain;
 /// the thread's last-known model lives in the status strip, not here.
 ///
+/// The `created_at` stamp renders as a trailing DIM `HH:MM` in the reader's
+/// local time — the messenger convention — and is simply absent for rows
+/// restored from a pre-timestamp snapshot.
+///
 /// Returns a single logical line: a long model name simply wraps within it,
 /// and the row-accurate scroll math counts display rows, so nothing else
 /// has to change.
-fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::MdLine {
+fn assistant_header_line(
+    model_label: Option<&str>,
+    created_at: Option<u64>,
+    theme: &Theme,
+) -> markdown::MdLine {
     let mut spans = vec![Span::styled(
         "\u{25cf} Chibi",
         Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
@@ -457,7 +465,26 @@ fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::
             Style::new().fg(theme.dim),
         ));
     }
+    spans.extend(timestamp_span(created_at, theme));
     Line::from(spans)
+}
+
+/// Dim ` HH:MM` suffix carrying the message's creation instant, or `None`
+/// for an unstamped row.
+///
+/// Both role headers share it so the two author lines read alike. The stamp
+/// is the row's own (persisted with the snapshot): a reloaded transcript
+/// shows when each bubble was sent, and a pre-timestamp row shows nothing
+/// rather than a made-up time. Never panics — an instant the platform
+/// cannot convert renders the `--:--` placeholder (see
+/// [`crate::localtime::fmt_hhmm`]).
+fn timestamp_span(created_at: Option<u64>, theme: &Theme) -> Option<Span<'static>> {
+    created_at.map(|secs| {
+        Span::styled(
+            format!("  {}", crate::localtime::fmt_hhmm(secs)),
+            Style::new().fg(theme.dim),
+        )
+    })
 }
 
 /// how many trailing lines of the raw reasoning trace the
@@ -590,17 +617,23 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         }
         match msg.role {
             Role::User => {
-                lines.push(Line::from(Span::styled(
+                let mut spans = vec![Span::styled(
                     "\u{25cf} You",
                     Style::new().fg(theme.orange).add_modifier(Modifier::BOLD),
-                )));
+                )];
+                spans.extend(timestamp_span(msg.created_at, theme));
+                lines.push(Line::from(spans));
             }
             Role::Assistant => {
                 // Each answer renders ONLY the label captured when it was
                 // produced (persisted with the snapshot): no fallback to the
                 // thread's current model — a mid-chat switch must never
                 // re-label past answers.
-                lines.push(assistant_header_line(msg.model_label(), theme));
+                lines.push(assistant_header_line(
+                    msg.model_label(),
+                    msg.created_at,
+                    theme,
+                ));
             }
         }
         if Some(msg_index) == streaming_row {

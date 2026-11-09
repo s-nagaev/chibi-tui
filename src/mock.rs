@@ -16,6 +16,15 @@ fn chat(name: &str, messages: Vec<Message>) -> crate::app::Chat {
     let seq = STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base = crate::history::now_unix();
     let updated_at = base.saturating_sub(seq);
+    // Believable demo transcript: the messages of a chat land a minute
+    // apart, the newest one right before "now" — the demo shows timestamps
+    // like any live thread.
+    let count = messages.len() as u64;
+    let messages = messages
+        .into_iter()
+        .enumerate()
+        .map(|(position, message)| message.at(base.saturating_sub(60 * (count - position as u64))))
+        .collect();
     crate::app::Chat {
         name: name.to_string(),
         id: crate::history::new_thread_id(),
