@@ -199,3 +199,92 @@ fn unread_background_thread_renders_yellow_dot_bold_name_no_highlight() {
     let (_, buf3) = render_grid_with_buffer(&mut app);
     assert_eq!(buf3[(1, 1)].fg, theme.unread_activity, "survives scrolling");
 }
+
+// name overflow -------------------------------------
+
+/// Visible text of the sidebar's name cell on buffer row `y`: the columns
+/// between the outline's left border + dot cell (x=0,1 and the space at 2)
+/// and the outline's right border (x=25). A double-width glyph occupies two
+/// cells, so the walk advances by the glyph's display width and skips the
+/// continuation column; trailing blanks from unused columns are trimmed.
+fn name_cell(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+    let mut out = String::new();
+    let mut x = 3u16;
+    while x < 25 {
+        let ch = buf[(x, y)].symbol().chars().next().unwrap_or(' ');
+        out.push(ch);
+        x += unicode_width::UnicodeWidthChar::width(ch)
+            .unwrap_or(1)
+            .max(1) as u16;
+    }
+    out.trim_end().to_owned()
+}
+
+/// Sidebar name budget @120: the fixed 26-wide sidebar block leaves 24
+/// inner columns, the `dot + space` cell takes 2 of them, so 22 columns
+/// remain for a name. At exactly that budget the title is shown whole;
+/// one column more and the head is dropped behind a `…`.
+#[test]
+fn sidebar_name_at_the_row_budget_is_kept_whole_and_wider_is_ellipsized() {
+    let exact = "a".repeat(22);
+    let over = "b".repeat(23);
+    let mut app = App::new(vec![Chat::new(exact.clone()), Chat::new(over.clone())]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    assert_eq!(
+        name_cell(&buf, 1),
+        exact,
+        "a name at the budget stays whole"
+    );
+    assert_eq!(
+        name_cell(&buf, 2),
+        format!("…{}", &over[2..]),
+        "one column over the budget ellipsizes instead of clipping flush"
+    );
+}
+
+#[test]
+fn sidebar_long_ascii_name_ends_behind_a_leading_ellipsis() {
+    // 39 display columns; the last 21 columns survive behind the `…`.
+    let mut app = App::new(vec![Chat::new("abcdefghijklmnopqrstuvwxyz0123456789XYZ")]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    assert_eq!(name_cell(&buf, 1), "…stuvwxyz0123456789XYZ");
+    // The 22-column name cell stops at the inner edge: the sidebar's right
+    // border and the chat pane's left border both survive.
+    assert_eq!(buf[(25, 1)].symbol(), "│");
+    assert_eq!(buf[(26, 1)].symbol(), "│");
+}
+
+#[test]
+fn sidebar_wide_cjk_name_is_cut_by_display_width_not_char_count() {
+    // 20 CJK glyphs = 40 display columns. Counted in CHARACTERS the title
+    // would fit the 22-column budget untouched and get clipped flush by the
+    // List widget; counted in display columns only the last 20 columns fit.
+    let mut app = App::new(vec![Chat::new("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸")]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    // Ellipsis at the name's first column, then ten whole wide glyphs
+    // (columns 4..=23). The 22nd column stays blank because the next glyph
+    // needs two and cannot straddle the edge — no half glyph, no clipping.
+    assert_eq!(name_cell(&buf, 1), "…甲乙丙丁戊己庚辛壬癸");
+    assert_eq!(buf[(22, 1)].symbol(), "癸");
+    assert_eq!(buf[(24, 1)].symbol(), " ");
+    assert_eq!(buf[(25, 1)].symbol(), "│");
+}
+/// Multi-line titles (Shift+Enter allows `\n` in a name) collapse to spaces
+/// on their single sidebar row BEFORE the budget applies, so an over-long
+/// one is ellipsized as a one-liner instead of spilling onto the row of the
+/// chat below.
+#[test]
+fn sidebar_multiline_name_collapses_to_spaces_before_the_budget_applies() {
+    let short = "first\nsecond";
+    let long = format!("{}\n{}", "x".repeat(30), "y".repeat(30));
+    let mut app = App::new(vec![Chat::new(short), Chat::new(long)]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    assert_eq!(name_cell(&buf, 1), "first second");
+    // 61 collapsed columns: the last 21 survive behind the `…`.
+    assert_eq!(name_cell(&buf, 2), format!("…{}", "y".repeat(21)));
+    assert!(name_cell(&buf, 3).is_empty(), "no second row for one chat");
+}

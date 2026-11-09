@@ -264,6 +264,10 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     );
 }
 
+/// Columns consumed by the per-row lifecycle dot cell at the head of a
+/// sidebar list row: the dot glyph itself plus its trailing space.
+const SIDEBAR_DOT_CELL_WIDTH: usize = 2;
+
 /// Sidebar list rows carry a per-chat lifecycle dot at column 0:
 /// `\u{25cb}` idle (dim) · `\u{25c6}` awaiting/queued (yellow) ·
 /// `\u{25cf}` running (green). The ACTIVE chat additionally keeps its name
@@ -285,8 +289,44 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// corners) rendered inside the existing sidebar rect — the former divider
 /// column is the right border, the frame edge column hosts the left one —
 /// so the outer frame dimensions and the hit-test rects are unchanged.
+///
+/// A chat name wider than the row's name budget is head-truncated by the
+/// shared display-width helper [`left_truncate_ellipsis`] (the tail
+/// survives), so an over-long title starts with a `…` instead of being
+/// silently cut flush against the outline by the List widget.
 fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let sidebar_focused = app.focus == Focus::Sidebar;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if sidebar_focused {
+            // Emphasis: the focused sidebar's outline lifts to blue.
+            theme.blue
+        } else {
+            theme.selection
+        }))
+        .title(Span::styled(
+            " Chats ",
+            Style::new()
+                .fg(if sidebar_focused {
+                    // Emphasis: title switches from blue to cyan.
+                    theme.cyan
+                } else {
+                    theme.blue
+                })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(theme.panel));
+    // The hit-test inner rect: the block's top border row and side
+    // columns are NOT list rows, so clicks there must not select.
+    let inner = block.inner(area);
+
+    // Name budget of a list row: the lifecycle dot glyph plus its trailing
+    // space occupy the first two inner columns, so a name wider than the
+    // remaining columns is truncated with an ellipsis instead of being
+    // clipped flush against the outline by the List widget.
+    let name_width = (inner.width as usize).saturating_sub(SIDEBAR_DOT_CELL_WIDTH);
     let items: Vec<ListItem> = app
         .chats
         .iter()
@@ -329,43 +369,18 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 // inactive color, no highlight rides along.
                 Style::new().fg(theme.dim).add_modifier(Modifier::BOLD)
             } else {
-                // Multi-line titles collapse to spaces inside the one-row
-                // sidebar entry (Shift+Enter allows `\n` in
-                // names).
                 Style::new().fg(theme.dim)
             };
-            let name = chat.name.replace('\n', " ");
+            // Multi-line titles collapse to spaces inside the one-row
+            // sidebar entry (Shift+Enter allows `\n` in names); the row's
+            // name budget then ellipsizes a wider title.
+            let name = left_truncate_ellipsis(&chat.name.replace('\n', " "), name_width);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{dot_glyph} "), Style::new().fg(dot_color)),
                 Span::styled(name, name_style),
             ]))
         })
         .collect();
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if sidebar_focused {
-            // Emphasis: the focused sidebar's outline lifts to blue.
-            theme.blue
-        } else {
-            theme.selection
-        }))
-        .title(Span::styled(
-            " Chats ",
-            Style::new()
-                .fg(if sidebar_focused {
-                    // Emphasis: title switches from blue to cyan.
-                    theme.cyan
-                } else {
-                    theme.blue
-                })
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::new().bg(theme.panel));
-    // The hit-test inner rect: the block's top border row and side
-    // columns are NOT list rows, so clicks there must not select.
-    let inner = block.inner(area);
 
     let list = List::new(items)
         .block(block)
