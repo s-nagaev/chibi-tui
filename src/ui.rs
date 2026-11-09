@@ -20,6 +20,10 @@ use crate::theme::Theme;
 const PROMPT_MARKER: &str = "\u{276f} ";
 const PROMPT_MARKER_WIDTH: u16 = 2;
 
+/// Sidebar pane width: the 26-column left column of the main area (the chat
+/// pane starts right of it, the divider cell included in the chat pane).
+const SIDEBAR_WIDTH: u16 = 26;
+
 /// Compute how many lines must be hidden from the TOP of the message list.
 ///
 /// Scroll semantics: `scroll` counts lines scrolled UP FROM THE BOTTOM
@@ -66,19 +70,34 @@ impl LayoutRects {
     }
 }
 
+/// Largest editor-block height a frame of `frame_height` rows may give the
+/// input: 3/4 of the frame, never past the tiny-frame guard that keeps the
+/// spinner row, the hints row and a sliver of chat alive (`frame_height` − 4),
+/// and never below one row (saturating math keeps ≤4-row frames safe).
+///
+/// The single place the growth cap is defined: the producer
+/// (`App::input_lines_height`) and the shared geometry seam
+/// ([`layout_rects`]) both apply it, so a raw height handed to the layout by
+/// the mouse router can never outgrow the frame the renderer would paint.
+pub fn max_input_block_height(frame_height: u16) -> u16 {
+    let tiny_frame_guard = frame_height.saturating_sub(4);
+    let three_quarters = (frame_height as u32 * 3 / 4) as u16;
+    tiny_frame_guard.min(three_quarters).max(1)
+}
+
 /// Split `area` exactly like [`draw`] does: the root vertical stack (main
 /// area / spinner line / growing input block / hotkey-hints line) plus the
 /// sidebar+chat horizontal split of the main area. `input_height` is the
-/// RAW editor-block height (see `App::input_lines_height`); the tiny-frame
-/// clamp is applied here, shared by the renderer and the mouse router.
+/// RAW editor-block height (see `App::input_lines_height`); the frame cap
+/// ([`max_input_block_height`]) is re-applied here, shared by the renderer
+/// and the mouse router.
 pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
-    // the editor block grows per frame from 1 row up to
-    // MAX_INPUT_LINES rows with the multiline draft (chat pane shrinks
-    // correspondingly: Min(0) absorbs the rest). On tiny terminals the
-    // block is additionally clamped so spinner + hints + a sliver of chat
-    // always survive; saturating math everywhere keeps ≤4-row frames safe.
-    let max_block_height = area.height.saturating_sub(4).max(1);
-    let input_height = input_height.min(max_block_height);
+    // the editor block grows per frame from 1 row with the soft-wrapped
+    // draft (chat pane shrinks correspondingly: Min(0) absorbs the rest) up
+    // to 3/4 of the frame height. On tiny terminals the block is
+    // additionally clamped so spinner + hints + a sliver of chat always
+    // survive; saturating math everywhere keeps ≤4-row frames safe.
+    let input_height = input_height.min(max_input_block_height(area.height));
     let root = Layout::vertical([
         Constraint::Min(0),               // main area
         Constraint::Length(1),            // spinner / status line (above input)
@@ -88,8 +107,8 @@ pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
     .split(area);
 
     let main = Layout::horizontal([
-        Constraint::Length(26), // sidebar
-        Constraint::Min(20),    // chat view
+        Constraint::Length(SIDEBAR_WIDTH), // sidebar
+        Constraint::Min(20),               // chat view
     ])
     .split(root[0]);
 
@@ -98,6 +117,16 @@ pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
         chat: main[1],
         root: [root[0], root[1], root[2], root[3]],
     }
+}
+
+/// Display columns the editor text gets inside the chat column of a frame
+/// with this `area`: the frame minus the sidebar, the divider cell and the
+/// `❯ ` prompt marker. Derived from the FRAME, never from
+/// [`LayoutRects::chat_column`] — the layout needs the editor height to size
+/// that column, so the width must be known from the frame alone.
+pub fn input_text_width(area: Rect) -> u16 {
+    area.width
+        .saturating_sub(SIDEBAR_WIDTH + 1 + PROMPT_MARKER_WIDTH)
 }
 
 /// Which on-screen panel a point falls into — the shared hit-test seam for
@@ -128,7 +157,7 @@ pub fn panel_region(rects: &LayoutRects, column: u16, row: u16) -> PanelRegion {
 
 /// Draw one full frame.
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
-    let rects = layout_rects(f.area(), app.input_lines_height());
+    let rects = layout_rects(f.area(), app.input_lines_height(f.area()));
     let chat_column = rects.chat_column();
 
     render_sidebar(f, app, theme, rects.sidebar);
@@ -903,10 +932,11 @@ fn render_scroll_hint(f: &mut Frame, at_bottom: bool, theme: &Theme, spinner_lin
 /// the editor block is tinted with the
 /// input-panel background across EVERY of its rows and carries a cyan `❯`
 /// marker on its FIRST row. The typed text renders INSIDE the remaining
-/// columns over the full block height — the editor keeps the cursor
-/// visible inside that viewport automatically, scrolling the LAST visible
-/// row toward the caret once the buffer exceeds
-/// [`MAX_INPUT_LINES`](crate::app::MAX_INPUT_LINES) lines.
+/// columns over the full block height — the editor keeps the caret
+/// visible inside that viewport automatically, scrolling the VISUAL
+/// (soft-wrapped) rows toward the caret once the draft outgrows the block,
+/// and `⏎ send` is repeated flush right on the block's first row when the
+/// draft wraps onto more than one.
 fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) {
     // Panel tint confined to the CHAT COLUMN (cols 26..width @120): the
     // divider cell and the sidebar strip keep `theme.panel` (approved

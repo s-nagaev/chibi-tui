@@ -259,27 +259,62 @@ pub fn find_match_ranges(line: &str, pattern: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// Display columns one char advances: unicode width, so a wide (CJK, emoji)
+/// glyph counts two and a combining mark counts none.
+///
+/// The ONE width rule the character wrap and every consumer of it share —
+/// [`wrap_line_ranges`], [`wrap_line`], the log viewer's rows and the input
+/// editor's paint pass all advance by exactly this, which is what keeps a
+/// row's planned extent and the cells actually written in lockstep.
+pub(crate) fn char_cols(ch: char) -> usize {
+    ch.width().unwrap_or(0)
+}
+
+/// Split one logical line into the half-open CHAR range of each `width`-wide
+/// row chunk (character-level, display width via unicode-width, so the row
+/// math matches what the renderer shows exactly). `width` 0 is treated as 1:
+/// a degenerate viewport must not divide by zero or loop forever.
+///
+/// `first_row_reserve` columns are withheld from the FIRST of those rows only
+/// (the editor's `⏎ send` chip lane); pass 0 for a plain full-width wrap.
+/// Ranges are contiguous and cover every char of the line, so a caller can
+/// map a char offset back onto the exact row it is painted on — which is how
+/// the editor keeps its caret on the right soft-wrapped row.
+pub fn wrap_line_ranges(line: &str, width: usize, first_row_reserve: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let first_capacity = width.saturating_sub(first_row_reserve).max(1);
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut current_w = 0usize;
+    let mut chars = 0usize;
+    for (col, ch) in line.chars().enumerate() {
+        chars = col + 1;
+        let capacity = if rows.is_empty() {
+            first_capacity
+        } else {
+            width
+        };
+        let ch_w = char_cols(ch);
+        if current_w + ch_w > capacity && col > start {
+            rows.push((start, col));
+            start = col;
+            current_w = 0;
+        }
+        current_w += ch_w;
+    }
+    rows.push((start, chars));
+    rows
+}
+
 /// Split one logical line into `width`-wide row chunks (character-level,
 /// display width via unicode-width, so the row math matches what the
 /// renderer shows exactly). `width` 0 is treated as 1: a degenerate
 /// viewport must not divide by zero or loop forever.
 pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    let mut current = String::new();
-    let mut current_w = 0usize;
-    for ch in line.chars() {
-        let ch_w = ch.width().unwrap_or(0);
-        if current_w + ch_w > width && !current.is_empty() {
-            rows.push(std::mem::take(&mut current));
-            current_w = 0;
-        }
-        current.push(ch);
-        current_w += ch_w;
-    }
-    rows.push(current);
-    rows
+    wrap_line_ranges(line, width, 0)
+        .into_iter()
+        .map(|(start, end)| line.chars().skip(start).take(end - start).collect())
+        .collect()
 }
 
 /// Row count of a wrapped logical line (see [`wrap_line`]).
@@ -1038,12 +1073,6 @@ const SPINNER: [&str; 10] = [
     "\u{2807}", "\u{280F}",
 ];
 
-/// hard cap on how many terminal rows the ACTIVE editor
-/// block (message draft OR rename draft) may occupy. Beyond this the
-/// textarea view auto-scrolls inside the capped window so the caret always
-/// stays on screen.
-pub const MAX_INPUT_LINES: usize = 20;
-
 /// how many 100 ms spinner ticks a transient status
 /// toast stays visible (~2.5 s).
 pub const STATUS_MSG_TICKS: u8 = 25;
@@ -1413,16 +1442,28 @@ impl App {
         }
     }
 
-    /// terminal rows the ACTIVE editor block needs right
-    /// now — visible buffer lines clamped to `1..=MAX_INPUT_LINES`.
-    ///
-    /// Normal mode counts the multiline message draft (`Shift+Enter`);
-    /// rename mode counts its own draft (modified Enters / paste insert
-    /// `\n` into the title too). Recomputed per frame by `ui::draw` and fed
-    /// to the root vertical layout; a cleared input collapses back to
+    /// terminal rows the ACTIVE editor block needs
+    /// right now for a frame with `area`: the VISUAL (soft-wrapped) row count
+    /// of the active draft at the frame's editor width, capped at
+    /// [`ui::max_input_block_height`](crate::ui::max_input_block_height) — 3/4
+    /// of the frame height, never past the tiny-frame guard that keeps the
+    /// spinner row, the hints row and a sliver of chat alive — and floored at
     /// exactly one row.
-    pub fn input_lines_height(&self) -> u16 {
-        let buffer_lines = match &self.mode {
+    ///
+    /// Normal mode counts the wrapped multiline message draft (`Shift+Enter`
+    /// and pastes insert `\n`, over-long lines soft-wrap); rename mode counts
+    /// its own draft, which the rename renderer draws one logical line per row
+    /// (it never wraps). Recomputed per frame by `ui::draw` and fed to the
+    /// root vertical layout; a cleared input collapses back to exactly one
+    /// row.
+    ///
+    /// The wrap width is derived from the FRAME rectangle
+    /// (`ui::input_text_width`) and never from the laid-out chat column: the
+    /// layout needs this height to size that column, so reading the column
+    /// back here would close the circle.
+    pub fn input_lines_height(&self, area: Rect) -> u16 {
+        let text_width = crate::ui::input_text_width(area);
+        let wrapped = match &self.mode {
             Mode::Renaming { buf } => buf.split('\n').count(),
             // The delete-confirm, search and log-viewer popups overlay the
             // normal editor: their height derives from the message draft,
@@ -1435,9 +1476,14 @@ impl App {
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
             | Mode::HelpViewing { .. }
-            | Mode::ConfigEditor { .. } => self.input.lines().len(),
+            | Mode::ConfigEditor { .. } => self.input.wrapped_lines(text_width),
         };
-        buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
+        // the growth cap: 3/4 of the frame, never past the tiny-frame guard,
+        // never below one row. `ui::layout_rects` re-applies the SAME cap
+        // (idempotent) so a raw height handed to it by the mouse router can
+        // never outgrow the frame this producer sized.
+        let cap = crate::ui::max_input_block_height(area.height) as usize;
+        wrapped.clamp(1, cap.max(1)) as u16
     }
 
     /// Commit the ACTIVE chat's rename: trims whitespace; empty/whitespace-only

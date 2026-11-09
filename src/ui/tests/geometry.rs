@@ -32,6 +32,34 @@ fn layout_rects_clamps_the_input_block_on_tiny_frames() {
     assert_eq!(rects.root[2].height, 1);
 }
 
+/// The growth cap is `min(frame_height - 4, 3/4 * frame_height)`, floored at
+/// one row. Tall frames are limited by the 3/4 rule, frames at or below 16
+/// rows by the tiny-frame guard.
+#[test]
+fn max_input_block_height_applies_the_three_quarters_cap() {
+    // Tall frame: 3/4 wins (40*3/4 = 30 < 40-4 = 36).
+    assert_eq!(max_input_block_height(40), 30);
+    assert_eq!(max_input_block_height(34), 25);
+    // The exact crossover: at 16 both rules agree on 12.
+    assert_eq!(max_input_block_height(16), 12);
+    // Below the crossover the tiny-frame guard (h-4) wins.
+    assert_eq!(max_input_block_height(12), 8);
+    assert_eq!(max_input_block_height(8), 4);
+    // Saturating floor: tiny frames never underflow below one row.
+    assert_eq!(max_input_block_height(4), 1);
+    assert_eq!(max_input_block_height(1), 1);
+}
+
+/// `LayoutRects::input` re-applies the same cap, so a RAW height handed in
+/// by the mouse router (which never sees a clamped value) can never outgrow
+/// the frame the renderer would paint.
+#[test]
+fn layout_rects_reapplies_the_frame_cap_to_a_raw_height() {
+    // A tall draft at a 20-row frame caps at min(16, 15) = 15.
+    let rects = layout_rects(Rect::new(0, 0, 120, 20), 30);
+    assert_eq!(rects.root[2].height, 15);
+}
+
 #[test]
 fn chat_column_excludes_the_right_margin_and_matches_the_input_row() {
     let rects = layout_rects(Rect::new(0, 0, 120, 40), 1);

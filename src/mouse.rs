@@ -154,7 +154,7 @@ pub fn handle_mouse_with_copy(
             }
         }
         WheelSurface::Panels => {
-            let rects = ui::layout_rects(area, app.input_lines_height());
+            let rects = ui::layout_rects(area, app.input_lines_height(area));
             // Selection presses/drags/releases AND the click targets
             // (sidebar thread clicks, click-to-focus chat/input) are
             // Normal-mode-only and popup-free: popups (confirm dialogs,
