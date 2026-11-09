@@ -200,7 +200,7 @@ fn unread_background_thread_renders_yellow_dot_bold_name_no_highlight() {
     assert_eq!(buf3[(1, 1)].fg, theme.unread_activity, "survives scrolling");
 }
 
-// name overflow -------------------------------------
+// name wrap -----------------------------------------
 
 /// Visible text of the sidebar's name cell on buffer row `y`: the columns
 /// between the outline's left border + dot cell (x=0,1 and the space at 2)
@@ -221,11 +221,11 @@ fn name_cell(buf: &ratatui::buffer::Buffer, y: u16) -> String {
 }
 
 /// Sidebar name budget @120: the fixed 26-wide sidebar block leaves 24
-/// inner columns, the `dot + space` cell takes 2 of them, so 22 columns
-/// remain for a name. At exactly that budget the title is shown whole;
-/// one column more and the head is dropped behind a `…`.
+/// inner columns, the `dot + space` cell takes 2 of them, so 22 columns are
+/// the wrap width. At exactly that budget the title stays on one row; one
+/// column more wraps at the last space that fits.
 #[test]
-fn sidebar_name_at_the_row_budget_is_kept_whole_and_wider_is_ellipsized() {
+fn sidebar_name_at_the_row_budget_is_kept_whole_and_wider_wraps() {
     let exact = "a".repeat(22);
     let over = "b".repeat(23);
     let mut app = App::new(vec![Chat::new(exact.clone()), Chat::new(over.clone())]);
@@ -236,55 +236,124 @@ fn sidebar_name_at_the_row_budget_is_kept_whole_and_wider_is_ellipsized() {
         exact,
         "a name at the budget stays whole"
     );
+    // No space to break at → a hard break at the wrap width.
+    assert_eq!(name_cell(&buf, 2), "b".repeat(22));
+    assert_eq!(name_cell(&buf, 3), "b", "the tail wraps onto the next row");
+}
+
+/// A name with spaces wraps at the LAST space that fits, and the break space
+/// is dropped: `"aaaa bbbb"` at 4 columns reads `aaaa` / `bbbb`, never
+/// `aaaa` / ` bbb`.
+#[test]
+fn sidebar_name_wraps_at_word_boundaries_and_drops_the_break_space() {
+    let mut app = App::new(vec![Chat::new("aaaa bbbb cccc dddd eeee")]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    // 22 columns ⇒ `aaaa bbbb cccc dddd` then `eeee`.
+    assert_eq!(name_cell(&buf, 1), "aaaa bbbb cccc dddd");
+    assert_eq!(name_cell(&buf, 2), "eeee", "second row carries the tail");
+    assert_eq!(name_cell(&buf, 3), "", "no third row needed");
+}
+
+/// A name longer than three rows caps at three: the first two rows are full
+/// wraps and the third is cut to the budget minus the ellipsis with a
+/// trailing `…`, so overflow is visible instead of silently vanishing.
+#[test]
+fn sidebar_name_past_three_rows_caps_with_a_trailing_ellipsis() {
+    // 100 chars → five hard-wrapped rows of 22; capped to 2 full + ellipsis.
+    let mut app = App::new(vec![Chat::new("z".repeat(100))]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    assert_eq!(name_cell(&buf, 1), "z".repeat(22));
+    assert_eq!(name_cell(&buf, 2), "z".repeat(22));
     assert_eq!(
-        name_cell(&buf, 2),
-        format!("…{}", &over[2..]),
-        "one column over the budget ellipsizes instead of clipping flush"
+        name_cell(&buf, 3),
+        format!("{}\u{2026}", "z".repeat(21)),
+        "row 3 is cut to 21 columns plus the ellipsis"
     );
+    assert_eq!(name_cell(&buf, 4), "", "nothing spills onto a fourth row");
 }
 
-#[test]
-fn sidebar_long_ascii_name_ends_behind_a_leading_ellipsis() {
-    // 39 display columns; the last 21 columns survive behind the `…`.
-    let mut app = App::new(vec![Chat::new("abcdefghijklmnopqrstuvwxyz0123456789XYZ")]);
-    let (_, buf) = render_grid_with_buffer(&mut app);
-
-    assert_eq!(name_cell(&buf, 1), "…stuvwxyz0123456789XYZ");
-    // The 22-column name cell stops at the inner edge: the sidebar's right
-    // border and the chat pane's left border both survive.
-    assert_eq!(buf[(25, 1)].symbol(), "│");
-    assert_eq!(buf[(26, 1)].symbol(), "│");
-}
-
-#[test]
-fn sidebar_wide_cjk_name_is_cut_by_display_width_not_char_count() {
-    // 20 CJK glyphs = 40 display columns. Counted in CHARACTERS the title
-    // would fit the 22-column budget untouched and get clipped flush by the
-    // List widget; counted in display columns only the last 20 columns fit.
-    let mut app = App::new(vec![Chat::new("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸")]);
-    let (_, buf) = render_grid_with_buffer(&mut app);
-
-    // Ellipsis at the name's first column, then ten whole wide glyphs
-    // (columns 4..=23). The 22nd column stays blank because the next glyph
-    // needs two and cannot straddle the edge — no half glyph, no clipping.
-    assert_eq!(name_cell(&buf, 1), "…甲乙丙丁戊己庚辛壬癸");
-    assert_eq!(buf[(22, 1)].symbol(), "癸");
-    assert_eq!(buf[(24, 1)].symbol(), " ");
-    assert_eq!(buf[(25, 1)].symbol(), "│");
-}
 /// Multi-line titles (Shift+Enter allows `\n` in a name) collapse to spaces
-/// on their single sidebar row BEFORE the budget applies, so an over-long
-/// one is ellipsized as a one-liner instead of spilling onto the row of the
-/// chat below.
+/// BEFORE wrapping, so a name with a newline is one wrapped stream instead
+/// of a hard row break.
 #[test]
-fn sidebar_multiline_name_collapses_to_spaces_before_the_budget_applies() {
+fn sidebar_multiline_name_collapses_to_spaces_before_wrapping() {
     let short = "first\nsecond";
     let long = format!("{}\n{}", "x".repeat(30), "y".repeat(30));
     let mut app = App::new(vec![Chat::new(short), Chat::new(long)]);
     let (_, buf) = render_grid_with_buffer(&mut app);
 
     assert_eq!(name_cell(&buf, 1), "first second");
-    // 61 collapsed columns: the last 21 survive behind the `…`.
-    assert_eq!(name_cell(&buf, 2), format!("…{}", "y".repeat(21)));
-    assert!(name_cell(&buf, 3).is_empty(), "no second row for one chat");
+    // The long name is one 61-char stream: four wrapped rows, so the cap
+    // applies and the last kept row is cut to 21 columns + `…`.
+    assert_eq!(name_cell(&buf, 2), "x".repeat(22));
+    assert_eq!(
+        name_cell(&buf, 3),
+        "x".repeat(8),
+        "the collapsed space joins"
+    );
+    assert_eq!(
+        name_cell(&buf, 4),
+        format!("{}\u{2026}", "y".repeat(21)),
+        "the overflow `y` half is capped and ellipsized"
+    );
+}
+
+/// A wide (CJK) name wraps by DISPLAY width, not char count: 2-column glyphs
+/// fill the 22-column budget eleven at a time, and the ellipsis consumes the
+/// 21 remaining columns of the capped third row.
+#[test]
+fn sidebar_wide_cjk_name_wraps_by_display_width_not_char_count() {
+    // 40 glyphs = 80 display columns → four 11-glyph rows, capped to 3.
+    let name: String = "\u{4e00}".repeat(40);
+    let mut app = App::new(vec![Chat::new(name)]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    let glyph = "\u{4e00}";
+    assert_eq!(name_cell(&buf, 1), glyph.repeat(11));
+    assert_eq!(name_cell(&buf, 2), glyph.repeat(11));
+    // Row 3 is the capped row: cut to 21 columns, which holds ten whole
+    // glyphs (20 columns) plus the single-column `…`; the 22nd column can
+    // hold no whole wide glyph, so it stays blank rather than half-drawn.
+    assert_eq!(name_cell(&buf, 3), format!("{}\u{2026}", glyph.repeat(10)));
+    assert_eq!(
+        buf[(24, 3)].symbol(),
+        " ",
+        "the leftover second column stays blank, no half glyph"
+    );
+}
+
+/// The sidebar's right border and the chat pane's left border survive a wrap:
+/// the name never spills past the inner edge.
+#[test]
+fn sidebar_wrapped_name_keeps_the_outlines_intact() {
+    let mut app = App::new(vec![Chat::new("abcdefghijklmnopqrstuvwxyz0123456789XYZ")]);
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    for y in 1..=3 {
+        assert_eq!(buf[(25, y)].symbol(), "\u{2502}", "sidebar right border");
+        assert_eq!(buf[(26, y)].symbol(), "\u{2502}", "chat pane left border");
+    }
+}
+
+/// Selection highlight covers EVERY row of a multi-row wrapped item, not
+/// just the first one (ratatui's `List` applies `highlight_style` to the
+/// whole item area, which is why the item is a multi-line `Text`).
+#[test]
+fn sidebar_selected_wrapped_name_highlights_all_rows() {
+    let theme = Theme::tokyo_night();
+    let mut app = App::new(vec![Chat::new("z".repeat(60)), Chat::new("other")]);
+    app.active = 0;
+    let (_, buf) = render_grid_with_buffer(&mut app);
+
+    for y in 1..=3 {
+        assert_eq!(
+            buf[(3, y)].bg,
+            theme.selection,
+            "row {y} of the selected wrapped item is highlighted"
+        );
+    }
+    // The next chat starts below the three wrapped rows, unhighlighted.
+    assert_ne!(buf[(3, 4)].bg, theme.selection);
 }

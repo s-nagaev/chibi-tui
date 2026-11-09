@@ -297,6 +297,10 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// sidebar list row: the dot glyph itself plus its trailing space.
 const SIDEBAR_DOT_CELL_WIDTH: usize = 2;
 
+/// Rows a chat name may occupy in the sidebar before it is capped: rows past
+/// the second are dropped and the third row carries a trailing `…`.
+const SIDEBAR_NAME_MAX_ROWS: usize = 3;
+
 /// Sidebar list rows carry a per-chat lifecycle dot at column 0:
 /// `\u{25cb}` idle (dim) · `\u{25c6}` awaiting/queued (yellow) ·
 /// `\u{25cf}` running (green). The ACTIVE chat additionally keeps its name
@@ -319,10 +323,13 @@ const SIDEBAR_DOT_CELL_WIDTH: usize = 2;
 /// column is the right border, the frame edge column hosts the left one —
 /// so the outer frame dimensions and the hit-test rects are unchanged.
 ///
-/// A chat name wider than the row's name budget is head-truncated by the
-/// shared display-width helper [`left_truncate_ellipsis`] (the tail
-/// survives), so an over-long title starts with a `…` instead of being
-/// silently cut flush against the outline by the List widget.
+/// A chat name wider than the row's name budget is WRAPPED onto the rows
+/// below it (word-wrap, the same rule the editor's soft wrap uses), up to
+/// [`SIDEBAR_NAME_MAX_ROWS`] rows: rows past the second are dropped and the
+/// third ends in a `…`. The row count of every item is recomputed here each
+/// frame and mirrored into [`crate::app::SidebarGeometry`], which is what
+/// the mouse router maps clicks through — so a click on the second or third
+/// row of a wrapped name still selects the right chat.
 fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let sidebar_focused = app.focus == Focus::Sidebar;
 
@@ -352,10 +359,14 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let inner = block.inner(area);
 
     // Name budget of a list row: the lifecycle dot glyph plus its trailing
-    // space occupy the first two inner columns, so a name wider than the
-    // remaining columns is truncated with an ellipsis instead of being
-    // clipped flush against the outline by the List widget.
+    // space occupy the first two inner columns; the remaining columns are the
+    // width a name wraps into.
     let name_width = (inner.width as usize).saturating_sub(SIDEBAR_DOT_CELL_WIDTH);
+    // Per-visible-row chat index, and the terminal row each chat's block
+    // starts on: the two halves of the multi-row hit-test seam. `inner.y` is
+    // added to the tops so the router can pass an absolute frame row.
+    let mut row_chats: Vec<usize> = Vec::new();
+    let mut block_tops: Vec<usize> = Vec::new();
     let items: Vec<ListItem> = app
         .chats
         .iter()
@@ -400,14 +411,29 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             } else {
                 Style::new().fg(theme.dim)
             };
-            // Multi-line titles collapse to spaces inside the one-row
-            // sidebar entry (Shift+Enter allows `\n` in names); the row's
-            // name budget then ellipsizes a wider title.
-            let name = left_truncate_ellipsis(&chat.name.replace('\n', " "), name_width);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{dot_glyph} "), Style::new().fg(dot_color)),
-                Span::styled(name, name_style),
-            ]))
+            // Multi-line titles collapse to spaces before wrapping
+            // (Shift+Enter allows `\n` in names): a name is one wrapped
+            // stream, never a hard row break.
+            let collapsed = chat.name.replace('\n', " ");
+            let rows = sidebar_name_rows(&collapsed, name_width);
+            block_tops.push(inner.y as usize + row_chats.len());
+            row_chats.extend(std::iter::repeat_n(i, rows.len()));
+            // Row 0 carries the lifecycle dot; continuation rows indent by
+            // the dot cell so the name reads as one block.
+            let indent = " ".repeat(SIDEBAR_DOT_CELL_WIDTH);
+            let lines: Vec<Line> = rows
+                .into_iter()
+                .enumerate()
+                .map(|(r, text)| {
+                    let head = if r == 0 {
+                        Span::styled(format!("{dot_glyph} "), Style::new().fg(dot_color))
+                    } else {
+                        Span::raw(indent.clone())
+                    };
+                    Line::from(vec![head, Span::styled(text, name_style)])
+                })
+                .collect();
+            ListItem::new(Text::from(lines))
         })
         .collect();
 
@@ -421,13 +447,20 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
     // Render-fed geometry seam for the mouse router (same pattern as
     // chat_geometry): the list's inner rect plus the ListState offset
-    // AFTER the render: ratatui scrolls the list internally when threads
-    // overflow, so the offset is read from the state object, not
-    // recomputed from app.active. Refreshed every frame like
-    // chat_geometry; no explicit reset path anywhere.
+    // AFTER the render, plus the per-item heights and their first rows —
+    // ratatui scrolls the list internally when threads overflow, so the
+    // offset and the row model are read from the state object and THIS
+    // frame's layout, never recomputed from app.active. Refreshed every
+    // frame like chat_geometry; no explicit reset path anywhere.
+    //
+    // `row_chats` covers the FULL list (offset 0), so the router indexes it
+    // with `offset + (y - inner.y)`: a click on the second or third row of a
+    // wrapped name resolves to that name's chat.
     app.sidebar_geometry = Some(crate::app::SidebarGeometry {
         inner,
         offset: state.offset(),
+        row_chats,
+        row_tops: block_tops,
     });
 
     // Extend the sidebar's right rounded border down through EVERY bottom
@@ -867,6 +900,43 @@ fn status_strip_title<'a>(
     // Alignment rides on the Line itself (ratatui groups top titles by the
     // line's own alignment; the old `block::Title` struct is gone in 0.30).
     Some(Line::from(Span::styled(text, Style::new().fg(theme.dim))).alignment(Alignment::Right))
+}
+
+/// Wrap one sidebar chat name into the display rows it occupies at
+/// `name_width` columns: word-boundary greedy wrap through the shared
+/// [`crate::app::wrap_line`] seam, capped at [`SIDEBAR_NAME_MAX_ROWS`]. Rows
+/// past the cap are dropped and the last kept row is re-cut to `name_width -
+/// 1` columns with a trailing `…`, so a very long title reads as truncated
+/// instead of silently disappearing. Always at least one row (an empty name
+/// still paints its dot row).
+fn sidebar_name_rows(name: &str, name_width: usize) -> Vec<String> {
+    let width = name_width.max(1);
+    let mut rows = crate::app::wrap_line(name, width);
+    if rows.len() > SIDEBAR_NAME_MAX_ROWS {
+        rows.truncate(SIDEBAR_NAME_MAX_ROWS);
+        let last = rows.last_mut().expect("truncate keeps max-rows rows");
+        *last = format!(
+            "{}\u{2026}",
+            truncate_to_width(last, width.saturating_sub(1))
+        );
+    }
+    rows
+}
+
+/// Longest char prefix of `text` within `max` display columns (unicode-width,
+/// so a wide glyph is dropped whole rather than straddling the cut).
+fn truncate_to_width(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > max {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out
 }
 
 /// left-truncate to at most `max` display columns,

@@ -204,22 +204,33 @@ pub fn handle_mouse_with_copy(
                             // the same live switching as the sidebar's
                             // arrow keys, but without requiring focus.
                             // Border/divider rows are not list rows: a
-                            // click there changes nothing at all.
-                            let hit = app.sidebar_geometry.as_ref().and_then(|geo| {
-                                geo.inner
-                                    .contains(Position {
-                                        x: mouse.column,
-                                        y: mouse.row,
-                                    })
-                                    .then(|| geo.offset + (mouse.row - geo.inner.y) as usize)
+                            // click there changes nothing at all. The seam
+                            // carries one entry per VISIBLE ROW, so a click
+                            // on the second or third row of a wrapped name
+                            // resolves to that name's chat (rather than to
+                            // whichever chat happens to sit that many rows
+                            // down the list).
+                            let geo = app.sidebar_geometry.as_ref();
+                            let inside = geo.is_some_and(|geo| {
+                                geo.inner.contains(Position {
+                                    x: mouse.column,
+                                    y: mouse.row,
+                                })
                             });
+                            let hit = inside
+                                .then(|| geo.and_then(|geo| geo.chat_at(mouse.row)))
+                                .flatten();
                             if let Some(idx) = hit {
                                 if idx < app.chats.len() {
                                     app.select_chat(idx);
                                 }
-                                // Below the last thread the click only
-                                // moves focus (no selection change); on a
-                                // thread row it also switches threads.
+                            }
+                            if inside {
+                                // On a thread row the click switches threads;
+                                // inside the block but below the last thread
+                                // (or past a short list) it only moves focus.
+                                // Border/divider rows are OUTSIDE the block
+                                // and change nothing at all.
                                 app.focus = Focus::Sidebar;
                                 // A sidebar press is a click, never the
                                 // start of a drag selection, and like

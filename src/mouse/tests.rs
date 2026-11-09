@@ -307,6 +307,64 @@ fn press_drag_release_selects_and_copies_through_the_seam() {
     );
 }
 
+/// A click on the SECOND row of a wrapped sidebar name selects that name's
+/// chat: the geometry seam carries one entry per visible row, so a
+/// continuation row resolves to its own thread instead of to whichever
+/// thread sits that many single-row slots further down the list.
+#[test]
+fn click_on_the_second_row_of_a_wrapped_name_selects_that_chat() {
+    let mut app = app_with_chats(2);
+    app.chats[0].name = "one".to_string();
+    // 34 display columns in a 22-column name cell: the name wraps and the
+    // block of chat 1 occupies two list rows.
+    app.chats[1].name = format!("{} tail", "wrap ".repeat(6).trim_end());
+    render_for_geometry(&mut app);
+
+    let geo = app
+        .sidebar_geometry
+        .clone()
+        .expect("render fed the sidebar geometry");
+    let second_row = (geo.row_tops[1] + 1) as u16;
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            second_row,
+        ),
+        WHEEL_AREA,
+        &|_: &str| {},
+    );
+    assert_eq!(app.active, 1, "the continuation row belongs to chat 1");
+    assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+}
+
+/// A click inside the sidebar but BELOW the last thread moves focus only:
+/// no chat block owns that row, so the selection stays where it was.
+#[test]
+fn click_below_the_last_thread_only_moves_focus() {
+    let mut app = app_with_chats(2);
+    render_for_geometry(&mut app);
+
+    let geo = app
+        .sidebar_geometry
+        .clone()
+        .expect("render fed the sidebar geometry");
+    let below = geo.inner.y + geo.inner.height - 1;
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            below,
+        ),
+        WHEEL_AREA,
+        &|_: &str| {},
+    );
+    assert_eq!(app.active, 0, "no chat block owns the empty tail row");
+    assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+}
+
 /// A press+release without drag is a plain click: the selection clears
 /// and nothing is copied.
 #[test]

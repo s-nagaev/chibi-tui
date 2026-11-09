@@ -270,46 +270,94 @@ pub(crate) fn char_cols(ch: char) -> usize {
     ch.width().unwrap_or(0)
 }
 
-/// Split one logical line into the half-open CHAR range of each `width`-wide
-/// row chunk (character-level, display width via unicode-width, so the row
+/// Split one logical line into the half-open CHAR range of each display row
+/// (word-boundary greedy wrap, display width via unicode-width, so the row
 /// math matches what the renderer shows exactly). `width` 0 is treated as 1:
 /// a degenerate viewport must not divide by zero or loop forever.
 ///
-/// `first_row_reserve` columns are withheld from the FIRST of those rows only
-/// (the editor's `⏎ send` chip lane); pass 0 for a plain full-width wrap.
-/// Ranges are contiguous and cover every char of the line, so a caller can
-/// map a char offset back onto the exact row it is painted on — which is how
-/// the editor keeps its caret on the right soft-wrapped row.
+/// `first_row_reserve` columns are withheld from the FIRST row only (the
+/// editor's `⏎ send` chip lane); pass 0 for a plain full-width wrap.
+///
+/// Rows break at the LAST space that fits, and the break space itself is
+/// dropped — so, unlike the earlier character chunker, the ranges may have
+/// GAPS and no longer cover every char of the line. A single token wider
+/// than the row is hard-broken at the row width (at least one char per row,
+/// so the scan always makes progress and can never loop). An empty line is
+/// one empty range, matching an empty `Paragraph`.
 pub fn wrap_line_ranges(line: &str, width: usize, first_row_reserve: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
     let first_capacity = width.saturating_sub(first_row_reserve).max(1);
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![(0, 0)];
+    }
+
     let mut rows: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    let mut current_w = 0usize;
-    let mut chars = 0usize;
-    for (col, ch) in line.chars().enumerate() {
-        chars = col + 1;
+    let mut row_start = 0usize;
+    let mut w = 0usize;
+    // Char index of the last space seen in the row being built (a candidate
+    // break point), or `None` while the row has no space to break at.
+    let mut break_at: Option<usize> = None;
+    let mut i = 0usize;
+    // Spaces at the head of a fresh row are dropped, never echoed: a break
+    // leaves no leading whitespace behind (and a hard break that lands ON a
+    // space does not re-emit it).
+    let skip_leading_spaces = |from: usize| -> usize {
+        let mut next = from;
+        while next < chars.len() && chars[next] == ' ' {
+            next += 1;
+        }
+        next
+    };
+    while i < chars.len() {
         let capacity = if rows.is_empty() {
             first_capacity
         } else {
             width
         };
-        let ch_w = char_cols(ch);
-        if current_w + ch_w > capacity && col > start {
-            rows.push((start, col));
-            start = col;
-            current_w = 0;
+        let ch_w = char_cols(chars[i]);
+        // Overflow: the char does not fit AND the row already holds one.
+        if w + ch_w > capacity && i > row_start {
+            match break_at {
+                // Break at the last space: the space is dropped, so the next
+                // row starts right after it (a gap in the ranges).
+                Some(space) if space > row_start => {
+                    rows.push((row_start, space));
+                    row_start = skip_leading_spaces(space + 1);
+                    i = row_start;
+                    w = 0;
+                    break_at = None;
+                    continue;
+                }
+                // No usable space: hard-break the maximal prefix that fits.
+                // `i > row_start` guarantees at least one char is emitted.
+                _ => {
+                    rows.push((row_start, i));
+                    row_start = skip_leading_spaces(i);
+                    i = row_start;
+                    w = 0;
+                    break_at = None;
+                    continue;
+                }
+            }
         }
-        current_w += ch_w;
+        if chars[i] == ' ' {
+            break_at = Some(i);
+        }
+        w += ch_w;
+        i += 1;
     }
-    rows.push((start, chars));
+    if row_start < chars.len() || rows.is_empty() {
+        rows.push((row_start, chars.len()));
+    }
     rows
 }
 
-/// Split one logical line into `width`-wide row chunks (character-level,
-/// display width via unicode-width, so the row math matches what the
-/// renderer shows exactly). `width` 0 is treated as 1: a degenerate
-/// viewport must not divide by zero or loop forever.
+/// Split one logical line into `width`-wide row chunks (word-boundary greedy
+/// wrap, display width via unicode-width, so the row math matches what the
+/// renderer shows exactly). `width` 0 is treated as 1: a degenerate viewport
+/// must not divide by zero or loop forever. Break spaces are dropped (see
+/// [`wrap_line_ranges`]).
 pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
     wrap_line_ranges(line, width, 0)
         .into_iter()
@@ -749,6 +797,34 @@ pub struct SidebarGeometry {
     pub inner: Rect,
     /// First visible thread row at snapshot time (post-render list offset).
     pub offset: usize,
+    /// Chat index of every row of the FULL list, in paint order, WITHOUT
+    /// the list offset applied (the router adds it): a wrapped name
+    /// occupies as many entries as it has rows, so a click on row 2 or 3
+    /// of a name resolves to that name's chat. Empty when no chat has ever
+    /// been rendered.
+    pub row_chats: Vec<usize>,
+    /// Terminal row of the first row of each chat's block, indexed by chat
+    /// index (absolute frame rows, i.e. `inner.y` already added, offset not
+    /// applied). A locate/verify seam for tests and callers that need to
+    /// know where a chat's block starts on screen.
+    pub row_tops: Vec<usize>,
+}
+
+impl SidebarGeometry {
+    /// Chat index painted on terminal row `row`, or `None` when the row is
+    /// outside one of the currently visible chat blocks (below the last
+    /// thread, past a short list, or off the top after an internal scroll).
+    pub fn chat_at(&self, row: u16) -> Option<usize> {
+        let y = row as usize;
+        if y < self.inner.y as usize {
+            return None;
+        }
+        // The click's full-list row: the viewport-local row plus the list's
+        // internal scroll at render time (the same mapping the arithmetic
+        // seam used for single-row items).
+        let idx = self.offset.checked_add(y - self.inner.y as usize)?;
+        self.row_chats.get(idx).copied()
+    }
 }
 
 impl ChatGeometry {
