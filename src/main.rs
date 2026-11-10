@@ -239,6 +239,14 @@ async fn main() -> io::Result<()> {
         }
     };
 
+    // Sidebar width: restore the persisted choice (corrupt/missing file →
+    // the default), clamped to the live frame so a wide value saved on a
+    // big monitor can never starve the chat pane on a small one. Saved
+    // again only on drag end (best-effort, in the mouse router).
+    let frame_w = terminal.size().map(|s| s.width).unwrap_or(u16::MAX);
+    app.sidebar_width =
+        chibi_tui::ui::clamp_sidebar_width(chibi_tui::ui_store::load_sidebar_width(), frame_w);
+
     // wire the strip's cwd source for BOTH backends (the
     // CLI flag defaults to the process cwd, so mock mode has it too). Read
     // reactively by the renderer each frame; the workspace is CLI-only

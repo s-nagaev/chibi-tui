@@ -2,7 +2,7 @@ use super::support::*;
 use crate::app::*;
 use ratatui::layout::Rect;
 
-/// A standard 120×34 frame: text width `120-26-1-2 = 91` columns and a
+/// A standard 120×34 frame: text width `120-30-1-2 = 87` columns and a
 /// growth cap of `min(34-4, 34*3/4) = 25` rows. Wide enough that the short
 /// draft lines below each occupy exactly one visual row.
 const FRAME: Rect = Rect {

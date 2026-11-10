@@ -101,9 +101,9 @@ fn assistant_header_ignores_blank_model_labels() {
 fn long_model_name_wrap_is_absorbed_by_row_math() {
     const FRAME_W: u16 = 60;
     const FRAME_H: u16 = 24;
-    // Chat pane inner width = frame - sidebar(26) - the pane's two
+    // Chat pane inner width = frame - DEFAULT_SIDEBAR_WIDTH - the pane's two
     // rounded border columns.
-    let pane_width = (FRAME_W - 26 - 2) as usize;
+    let pane_width = (FRAME_W - DEFAULT_SIDEBAR_WIDTH - 2) as usize;
 
     let model_name = "super-long-model-name-ultra-extended-edition-v42";
     let tail_word = "tail42";

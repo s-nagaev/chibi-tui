@@ -12,22 +12,22 @@ fn sidebar_border_emphasis_differs_between_focuses() {
     let theme = Theme::tokyo_night();
     let mut app = App::new(vec![Chat::new("one"), Chat::new("two")]);
 
-    // Divider column: x=25 (sidebar width 26, right border col), any
+    // Divider column: x=29 (sidebar width 30, right border col), any
     // main-area row inside both renders.
     let (_, chat_focused_buf) = render_grid_with_buffer(&mut app);
-    assert_eq!(chat_focused_buf[(25, 5)].fg, theme.selection);
+    assert_eq!(chat_focused_buf[(29, 5)].fg, theme.selection);
 
     app.focus = Focus::Sidebar;
     let (_, sidebar_focused_buf) = render_grid_with_buffer(&mut app);
-    assert_eq!(sidebar_focused_buf[(25, 5)].fg, theme.blue);
+    assert_eq!(sidebar_focused_buf[(29, 5)].fg, theme.blue);
 
     // Bottom-extended divider (below the block, e.g. the input band)
     // follows the same emphasis: row 33 of 34 @120×34 is status-ish;
     // check row just below the sidebar block too. Use row 30.
-    assert_eq!(sidebar_focused_buf[(25, 30)].fg, theme.blue);
+    assert_eq!(sidebar_focused_buf[(29, 30)].fg, theme.blue);
     assert_ne!(
-        chat_focused_buf[(25, 5)].fg,
-        sidebar_focused_buf[(25, 5)].fg,
+        chat_focused_buf[(29, 5)].fg,
+        sidebar_focused_buf[(29, 5)].fg,
         "border color must visibly differ between focuses"
     );
 }
@@ -85,7 +85,7 @@ fn prompt_marker_dims_while_sidebar_focused() {
     let mut app = App::new(vec![Chat::new("one")]);
     type_text_into_input(&mut app, "draft");
 
-    let marker_fg = |app: &mut App| render_grid_at_with_buffer(app, 120, 34).1[(26, 32)].fg;
+    let marker_fg = |app: &mut App| render_grid_at_with_buffer(app, 120, 34).1[(30, 32)].fg;
 
     assert_eq!(marker_fg(&mut app), theme.cyan, "Chat focus → cyan");
     app.focus = Focus::Sidebar;
@@ -204,13 +204,13 @@ fn unread_background_thread_renders_yellow_dot_bold_name_no_highlight() {
 
 /// Visible text of the sidebar's name cell on buffer row `y`: the columns
 /// between the outline's left border + dot cell (x=0,1 and the space at 2)
-/// and the outline's right border (x=25). A double-width glyph occupies two
+/// and the outline's right border (x=29). A double-width glyph occupies two
 /// cells, so the walk advances by the glyph's display width and skips the
 /// continuation column; trailing blanks from unused columns are trimmed.
 fn name_cell(buf: &ratatui::buffer::Buffer, y: u16) -> String {
     let mut out = String::new();
     let mut x = 3u16;
-    while x < 25 {
+    while x < 29 {
         let ch = buf[(x, y)].symbol().chars().next().unwrap_or(' ');
         out.push(ch);
         x += unicode_width::UnicodeWidthChar::width(ch)
@@ -220,14 +220,14 @@ fn name_cell(buf: &ratatui::buffer::Buffer, y: u16) -> String {
     out.trim_end().to_owned()
 }
 
-/// Sidebar name budget @120: the fixed 26-wide sidebar block leaves 24
-/// inner columns, the `dot + space` cell takes 2 of them, so 22 columns are
+/// Sidebar name budget @120: the 30-wide sidebar block leaves 28
+/// inner columns, the `dot + space` cell takes 2 of them, so 26 columns are
 /// the wrap width. At exactly that budget the title stays on one row; one
 /// column more wraps at the last space that fits.
 #[test]
 fn sidebar_name_at_the_row_budget_is_kept_whole_and_wider_wraps() {
-    let exact = "a".repeat(22);
-    let over = "b".repeat(23);
+    let exact = "a".repeat(26);
+    let over = "b".repeat(27);
     let mut app = App::new(vec![Chat::new(exact.clone()), Chat::new(over.clone())]);
     let (_, buf) = render_grid_with_buffer(&mut app);
 
@@ -237,7 +237,7 @@ fn sidebar_name_at_the_row_budget_is_kept_whole_and_wider_wraps() {
         "a name at the budget stays whole"
     );
     // No space to break at → a hard break at the wrap width.
-    assert_eq!(name_cell(&buf, 2), "b".repeat(22));
+    assert_eq!(name_cell(&buf, 2), "b".repeat(26));
     assert_eq!(name_cell(&buf, 3), "b", "the tail wraps onto the next row");
 }
 
@@ -246,12 +246,12 @@ fn sidebar_name_at_the_row_budget_is_kept_whole_and_wider_wraps() {
 /// `aaaa` / ` bbb`.
 #[test]
 fn sidebar_name_wraps_at_word_boundaries_and_drops_the_break_space() {
-    let mut app = App::new(vec![Chat::new("aaaa bbbb cccc dddd eeee")]);
+    let mut app = App::new(vec![Chat::new("aaaa bbbb cccc dddd eeee ffff")]);
     let (_, buf) = render_grid_with_buffer(&mut app);
 
-    // 22 columns ⇒ `aaaa bbbb cccc dddd` then `eeee`.
-    assert_eq!(name_cell(&buf, 1), "aaaa bbbb cccc dddd");
-    assert_eq!(name_cell(&buf, 2), "eeee", "second row carries the tail");
+    // 26 columns ⇒ `aaaa bbbb cccc dddd eeee` then `ffff`.
+    assert_eq!(name_cell(&buf, 1), "aaaa bbbb cccc dddd eeee");
+    assert_eq!(name_cell(&buf, 2), "ffff", "second row carries the tail");
     assert_eq!(name_cell(&buf, 3), "", "no third row needed");
 }
 
@@ -260,16 +260,16 @@ fn sidebar_name_wraps_at_word_boundaries_and_drops_the_break_space() {
 /// trailing `…`, so overflow is visible instead of silently vanishing.
 #[test]
 fn sidebar_name_past_three_rows_caps_with_a_trailing_ellipsis() {
-    // 100 chars → five hard-wrapped rows of 22; capped to 2 full + ellipsis.
+    // 100 chars → five hard-wrapped rows of 26; capped to 2 full + ellipsis.
     let mut app = App::new(vec![Chat::new("z".repeat(100))]);
     let (_, buf) = render_grid_with_buffer(&mut app);
 
-    assert_eq!(name_cell(&buf, 1), "z".repeat(22));
-    assert_eq!(name_cell(&buf, 2), "z".repeat(22));
+    assert_eq!(name_cell(&buf, 1), "z".repeat(26));
+    assert_eq!(name_cell(&buf, 2), "z".repeat(26));
     assert_eq!(
         name_cell(&buf, 3),
-        format!("{}\u{2026}", "z".repeat(21)),
-        "row 3 is cut to 21 columns plus the ellipsis"
+        format!("{}\u{2026}", "z".repeat(25)),
+        "row 3 is cut to 25 columns plus the ellipsis"
     );
     assert_eq!(name_cell(&buf, 4), "", "nothing spills onto a fourth row");
 }
@@ -285,40 +285,43 @@ fn sidebar_multiline_name_collapses_to_spaces_before_wrapping() {
     let (_, buf) = render_grid_with_buffer(&mut app);
 
     assert_eq!(name_cell(&buf, 1), "first second");
-    // The long name is one 61-char stream: four wrapped rows, so the cap
-    // applies and the last kept row is cut to 21 columns + `…`.
-    assert_eq!(name_cell(&buf, 2), "x".repeat(22));
+    // The long name is one 61-char stream: the first row is a full 26-col
+    // hard wrap of the `x` word, the second carries its 4-char tail (the
+    // collapsed space + the 30-col `y` word never fit after it), and the
+    // cap cuts the `y` overflow row to 25 columns + `…`.
+    assert_eq!(name_cell(&buf, 2), "x".repeat(26));
     assert_eq!(
         name_cell(&buf, 3),
-        "x".repeat(8),
-        "the collapsed space joins"
+        "x".repeat(4),
+        "the `x` word tail before the break"
     );
     assert_eq!(
         name_cell(&buf, 4),
-        format!("{}\u{2026}", "y".repeat(21)),
+        format!("{}\u{2026}", "y".repeat(25)),
         "the overflow `y` half is capped and ellipsized"
     );
 }
 
 /// A wide (CJK) name wraps by DISPLAY width, not char count: 2-column glyphs
-/// fill the 22-column budget eleven at a time, and the ellipsis consumes the
-/// 21 remaining columns of the capped third row.
+/// fill the 26-column budget thirteen at a time, and the ellipsis consumes the
+/// 25 remaining columns of the capped third row.
 #[test]
 fn sidebar_wide_cjk_name_wraps_by_display_width_not_char_count() {
-    // 40 glyphs = 80 display columns → four 11-glyph rows, capped to 3.
+    // 40 glyphs = 80 display columns → three 13-glyph rows + 10 left over,
+    // capped to 3.
     let name: String = "\u{4e00}".repeat(40);
     let mut app = App::new(vec![Chat::new(name)]);
     let (_, buf) = render_grid_with_buffer(&mut app);
 
     let glyph = "\u{4e00}";
-    assert_eq!(name_cell(&buf, 1), glyph.repeat(11));
-    assert_eq!(name_cell(&buf, 2), glyph.repeat(11));
-    // Row 3 is the capped row: cut to 21 columns, which holds ten whole
-    // glyphs (20 columns) plus the single-column `…`; the 22nd column can
+    assert_eq!(name_cell(&buf, 1), glyph.repeat(13));
+    assert_eq!(name_cell(&buf, 2), glyph.repeat(13));
+    // Row 3 is the capped row: cut to 25 columns, which holds twelve whole
+    // glyphs (24 columns) plus the single-column `…`; the 26th column can
     // hold no whole wide glyph, so it stays blank rather than half-drawn.
-    assert_eq!(name_cell(&buf, 3), format!("{}\u{2026}", glyph.repeat(10)));
+    assert_eq!(name_cell(&buf, 3), format!("{}\u{2026}", glyph.repeat(12)));
     assert_eq!(
-        buf[(24, 3)].symbol(),
+        buf[(28, 3)].symbol(),
         " ",
         "the leftover second column stays blank, no half glyph"
     );
@@ -332,8 +335,8 @@ fn sidebar_wrapped_name_keeps_the_outlines_intact() {
     let (_, buf) = render_grid_with_buffer(&mut app);
 
     for y in 1..=3 {
-        assert_eq!(buf[(25, y)].symbol(), "\u{2502}", "sidebar right border");
-        assert_eq!(buf[(26, y)].symbol(), "\u{2502}", "chat pane left border");
+        assert_eq!(buf[(29, y)].symbol(), "\u{2502}", "sidebar right border");
+        assert_eq!(buf[(30, y)].symbol(), "\u{2502}", "chat pane left border");
     }
 }
 

@@ -61,6 +61,13 @@ pub enum WheelSurface {
 ///   sidebar; below the last thread only the focus moves; a click on the
 ///   block's border/divider rows changes nothing. A sidebar press is
 ///   never the start of a drag selection;
+/// - a left PRESS on the two divider columns around the sidebar/chat
+///   boundary starts a sidebar drag-resize instead (it takes precedence
+///   over the focus/selection arms): DRAG re-sizes the sidebar live
+///   (clamped by `ui::clamp_sidebar_width`, the same helper the renderer
+///   applies) and the RELEASE ends the drag and persists the final width
+///   to `ui.json` (best-effort). A divider press never moves focus nor
+///   clears the selection;
 /// - a left PRESS anywhere else on the base surface (input block,
 ///   spinner, hints) keeps the plain-click selection semantics and moves
 ///   focus to the chat, so typing goes to the prompt;
@@ -84,12 +91,30 @@ pub fn handle_mouse(app: &mut chibi_tui::app::App, mouse: MouseEvent, area: Rect
 /// Testable form of [`handle_mouse`]: the clipboard write arrives as a
 /// closure (production passes [`chibi_tui::clipboard::copy_text`], tests
 /// capture into a buffer), so the dispatch flow can assert the copy
-/// without touching a real clipboard.
+/// without touching a real clipboard. Sidebar drag-end persistence uses
+/// the production best-effort save; the `*_at` seams in `ui_store` cover
+/// the storage itself.
 pub fn handle_mouse_with_copy(
     app: &mut chibi_tui::app::App,
     mouse: MouseEvent,
     area: Rect,
     copy: &dyn Fn(&str),
+) {
+    handle_mouse_with_copy_and_persist(app, mouse, area, copy, &|width| {
+        chibi_tui::ui_store::save_sidebar_width(width);
+    });
+}
+
+/// Fully injectable form of [`handle_mouse`]: the clipboard write AND the
+/// drag-end sidebar-width persist arrive as closures, so tests can assert
+/// both effects without touching the real clipboard or the real `ui.json`
+/// under the user's data dir.
+pub fn handle_mouse_with_copy_and_persist(
+    app: &mut chibi_tui::app::App,
+    mouse: MouseEvent,
+    area: Rect,
+    copy: &dyn Fn(&str),
+    persist: &dyn Fn(u16),
 ) {
     let surface = match &app.mode {
         Mode::LogViewer { .. } => WheelSurface::LogViewer,
@@ -154,7 +179,12 @@ pub fn handle_mouse_with_copy(
             }
         }
         WheelSurface::Panels => {
-            let rects = ui::layout_rects(area, app.input_lines_height(area));
+            let rects = ui::layout_rects(area, app.input_lines_height(area), app.sidebar_width);
+            // The two divider columns around the sidebar/chat boundary:
+            // the sidebar's right border col and the chat pane's left
+            // border col. A press on either starts a sidebar drag-resize.
+            let boundary = rects.chat.x;
+            let on_divider = mouse.column == boundary || mouse.column == boundary.saturating_sub(1);
             // Selection presses/drags/releases AND the click targets
             // (sidebar thread clicks, click-to-focus chat/input) are
             // Normal-mode-only and popup-free: popups (confirm dialogs,
@@ -187,6 +217,35 @@ pub fn handle_mouse_with_copy(
                         }
                         _ => {}
                     }
+                }
+                // Sidebar drag-resize lives BEFORE the selection arms: a
+                // press on the divider columns starts the resize (it must
+                // NOT move focus to the chat nor clear the selection), a
+                // Drag while the grab is held re-sizes live (clamped by the
+                // SAME helper the renderer applies, so the two can never
+                // disagree), and the release ends the drag and persists the
+                // final width (best-effort). No event-loop changes: the
+                // capture-enabled terminal already delivers Drag/Up here.
+                MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                    if selectable && on_divider =>
+                {
+                    // Grab offset relative to the boundary col: negative
+                    // when the grab landed on the sidebar-side border col,
+                    // so the width tracks the cursor 1:1 from press time.
+                    app.sidebar_drag = Some(mouse.column as i32 - boundary as i32);
+                }
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                    if app.sidebar_drag.is_some() =>
+                {
+                    let grab = app.sidebar_drag.unwrap_or(0);
+                    let raw = (mouse.column as i32 - grab).max(0) as u16;
+                    app.sidebar_width = ui::clamp_sidebar_width(raw, area.width);
+                }
+                MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                    if app.sidebar_drag.is_some() =>
+                {
+                    app.sidebar_drag = None;
+                    persist(app.sidebar_width);
                 }
                 // Finalize the drag anywhere in the base surface (before
                 // the region hit-test: the release point may have left the

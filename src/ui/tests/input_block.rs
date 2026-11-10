@@ -65,7 +65,7 @@ fn input_block_grows_to_three_rows_and_collapses_back() {
     );
 }
 
-/// Sidebar divider (`│`, col 25) runs unbroken through spinner + grown
+/// Sidebar divider (`│`, col 29) runs unbroken through spinner + grown
 /// editor block + status line for EVERY height 2..=20; the margin cell
 /// past the chat column stays empty on each band row.
 #[test]
@@ -80,7 +80,7 @@ fn sidebar_divider_unbroken_at_every_growth_height() {
 
         let (_, buf) = render_grid_with_buffer(&mut app);
         for y in input_band(h, buf.area.height) {
-            let cell = &buf[(25, y)];
+            let cell = &buf[(29, y)];
             assert_eq!(
                 cell.symbol(),
                 "\u{2502}",
@@ -141,14 +141,14 @@ fn grown_block_tints_each_row_inside_chat_column_only() {
 
     let (_, buf) = render_grid_with_buffer(&mut app);
     for y in input_band(3, buf.area.height) {
-        for x in [26u16, 60, 100, 118] {
+        for x in [30u16, 60, 100, 118] {
             assert_eq!(
                 buf[(x, y)].bg,
                 theme.input_panel_bg,
                 "tint missing at ({x},{y})"
             );
         }
-        assert_ne!(buf[(25, y)].bg, theme.input_panel_bg, "divider tinted");
+        assert_ne!(buf[(29, y)].bg, theme.input_panel_bg, "divider tinted");
         assert_ne!(buf[(0, y)].bg, theme.input_panel_bg, "sidebar tinted");
         assert_ne!(buf[(119, y)].bg, theme.input_panel_bg, "margin tinted");
     }
@@ -167,13 +167,13 @@ fn chat_surface_tints_full_column_with_theme_bg() {
     let mut app = App::new(vec![Chat::new("chat")]);
 
     let (_, buf) = render_grid_with_buffer(&mut app);
-    // Pane spans x 26..=119; the 1-row editor block puts the pane at
+    // Pane spans x 30..=119; the 1-row editor block puts the pane at
     // rows 0..=30 (row 31 spinner, 32 input, 33 hints).
     for (x, y) in [
-        (26u16, 0u16),
+        (30u16, 0u16),
         (60, 0),
         (119, 0),
-        (26, 15),
+        (30, 15),
         (60, 15),
         (119, 15),
         (118, 30),
@@ -187,7 +187,7 @@ fn chat_surface_tints_full_column_with_theme_bg() {
     // Neighbors keep their own surfaces: sidebar + divider panel, input
     // zone panel tint, input-band margin cell untouched by either fill.
     assert_eq!(buf[(10, 15)].bg, theme.panel, "sidebar must stay panel");
-    assert_eq!(buf[(25, 15)].bg, theme.panel, "divider must stay panel");
+    assert_eq!(buf[(29, 15)].bg, theme.panel, "divider must stay panel");
     assert_eq!(
         buf[(60, 32)].bg,
         theme.input_panel_bg,
@@ -247,7 +247,7 @@ fn grown_input_never_panics_on_tiny_terminal() {
     // Block clamped to 12-4 = 8 rows: band top lands at H-1-8 = 3.
     for y in 4..=10 {
         assert_eq!(
-            buf[(26, y)].bg,
+            buf[(30, y)].bg,
             theme.input_panel_bg,
             "clamped band row {y} must still be tinted"
         );
@@ -288,14 +288,14 @@ fn rename_editor_grows_and_renders_multiline_draft() {
 }
 
 /// Soft wrap: a single logical line wider than the editor text column
-/// (91 columns at the 120-wide demo frame) wraps onto successive visual
+/// (87 columns at the 120-wide demo frame) wraps onto successive visual
 /// rows instead of scrolling horizontally — the head lands on the first
 /// band row and the tail on the row below, on the same block.
 #[test]
 fn over_long_line_soft_wraps_onto_the_next_row() {
     let mut app = App::new(vec![Chat::new("chat")]);
-    // 100 distinct markers, wider than the 91-column text lane.
-    let line: String = "x".repeat(91) + "TAIL";
+    // 100 distinct markers, wider than the 87-column text lane.
+    let line: String = "x".repeat(87) + "TAIL";
     app.input.insert_str(&line);
     assert_eq!(app.input.lines().len(), 1, "one logical line");
     assert_eq!(
@@ -306,7 +306,7 @@ fn over_long_line_soft_wraps_onto_the_next_row() {
 
     let rows = render_grid(&mut app);
     let band = input_band(2, rows.len() as u16).collect::<Vec<_>>();
-    // Head row carries the prompt marker and the first 91 columns.
+    // Head row carries the prompt marker and the first 87 columns.
     assert!(
         rows[band[0] as usize].contains("❯"),
         "first visual row keeps the marker: {:?}",
@@ -330,7 +330,7 @@ fn over_long_line_soft_wraps_onto_the_next_row() {
 #[test]
 fn caret_paints_on_the_wrapped_visual_row() {
     let mut app = App::new(vec![Chat::new("chat")]);
-    // 95 chars: wraps to two rows (91 head + 4 tail); caret is at the end.
+    // 95 chars: wraps to two rows (87 head + 8 tail); caret is at the end.
     app.input.insert_str(&"y".repeat(95));
     assert_eq!(app.input_lines_height(demo_frame()), 2);
 
@@ -341,7 +341,7 @@ fn caret_paints_on_the_wrapped_visual_row() {
     let second = band.last().unwrap();
 
     // No reversed cell on the head row…
-    let head_reversed = (26..119u16).any(|x| {
+    let head_reversed = (30..119u16).any(|x| {
         buf[(x, first)]
             .style()
             .add_modifier
@@ -349,7 +349,7 @@ fn caret_paints_on_the_wrapped_visual_row() {
     });
     assert!(!head_reversed, "caret must not sit on the head row");
     // …and a reversed cell on the second (wrapped) row.
-    let tail_reversed = (26..119u16).any(|x| {
+    let tail_reversed = (30..119u16).any(|x| {
         buf[(x, second)]
             .style()
             .add_modifier
@@ -365,9 +365,9 @@ fn caret_paints_on_the_wrapped_visual_row() {
 #[test]
 fn first_row_reserves_the_send_chip_lane() {
     let mut app = App::new(vec![Chat::new("chat")]);
-    // A line that fills the 91-column lane exactly: the head row must yield
+    // A line that fills the 87-column lane exactly: the head row must yield
     // the FIRST_ROW_RESERVE (8) columns to the chip, so the head holds
-    // 91-8 = 83 chars and the rest wraps below.
+    // 87-8 = 79 chars and the rest wraps below.
     app.input.insert_str(&"z".repeat(100));
     assert_eq!(app.input_lines_height(demo_frame()), 2);
 

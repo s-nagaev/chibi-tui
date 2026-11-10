@@ -1079,6 +1079,18 @@ pub struct App {
     /// [`App::chat_geometry`]: written by `ui::render_sidebar` each frame,
     /// read by the mouse router, never persisted.
     pub sidebar_geometry: Option<SidebarGeometry>,
+    /// Runtime sidebar width in columns (`ui::DEFAULT_SIDEBAR_WIDTH` on a
+    /// fresh app; restored + clamped at startup from `ui.json`). The single
+    /// source of truth both the renderer (`ui::layout_rects`) and the input
+    /// soft-wrap (`App::input_lines_height` → `ui::input_text_width`) read,
+    /// so the editor's wrap width can never drift from the painted layout.
+    pub sidebar_width: u16,
+    /// Live sidebar drag-resize state: the grab offset between the press
+    /// column and the divider's boundary column (negative when the grab
+    /// landed on the sidebar-side border col), `Some` only while a press on
+    /// the two divider columns is held. Session-only: never persisted, and
+    /// the drag-end save goes through `ui_store` on release.
+    pub sidebar_drag: Option<i32>,
     /// Content-keyed cache of rendered markdown lines
     /// ([`MarkdownCache`], plan D1): a finalized message renders exactly
     /// once per `(content, theme)` pair instead of being re-parsed and
@@ -1253,6 +1265,8 @@ impl App {
             selection: None,
             chat_geometry: None,
             sidebar_geometry: None,
+            sidebar_width: crate::ui::DEFAULT_SIDEBAR_WIDTH,
+            sidebar_drag: None,
             config_restart_when_idle: false,
             config_apply_pending: false,
             mock_session: false,
@@ -1538,7 +1552,7 @@ impl App {
     /// layout needs this height to size that column, so reading the column
     /// back here would close the circle.
     pub fn input_lines_height(&self, area: Rect) -> u16 {
-        let text_width = crate::ui::input_text_width(area);
+        let text_width = crate::ui::input_text_width(area, self.sidebar_width);
         let wrapped = match &self.mode {
             Mode::Renaming { buf } => buf.split('\n').count(),
             // The delete-confirm, search and log-viewer popups overlay the

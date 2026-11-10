@@ -20,9 +20,16 @@ use crate::theme::Theme;
 const PROMPT_MARKER: &str = "\u{276f} ";
 const PROMPT_MARKER_WIDTH: u16 = 2;
 
-/// Sidebar pane width: the 26-column left column of the main area (the chat
+/// Default sidebar pane width: the left column of the main area (the chat
 /// pane starts right of it, the divider cell included in the chat pane).
-const SIDEBAR_WIDTH: u16 = 26;
+/// The RUNTIME width lives on [`App::sidebar_width`] (mouse-drag resizable,
+/// persisted across runs); this constant only seeds a fresh app and the
+/// `ui.json` fallback.
+pub const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
+
+/// Widest a sidebar may ever be: half the frame, so neither pane can be
+/// starved past usefulness on a narrow terminal.
+const SIDEBAR_MIN_WIDTH: u16 = 20;
 
 /// Compute how many lines must be hidden from the TOP of the message list.
 ///
@@ -59,8 +66,8 @@ pub struct LayoutRects {
 impl LayoutRects {
     /// Chat text column: starts at the chat pane's left edge and excludes
     /// the 1-column right margin, so the prompt, tint and hints stay
-    /// inside e.g. cols 26..=118 @120 and never spill onto the divider
-    /// (col 25) or the margins.
+    /// inside e.g. cols 30..=118 @120 and never spill onto the divider
+    /// (col 29) or the margins.
     pub fn chat_column(&self) -> Rect {
         Rect {
             x: self.chat.x,
@@ -85,19 +92,34 @@ pub fn max_input_block_height(frame_height: u16) -> u16 {
     tiny_frame_guard.min(three_quarters).max(1)
 }
 
+/// Effective sidebar width for a frame of `frame_w` columns: never below
+/// 20, never past half the frame, and never so wide the
+/// chat pane's `Min(20)` constraint stops being satisfiable with slack
+/// (the chat area keeps a hard floor of `frame_w - 24` columns). The single
+/// place the clamp is defined: [`layout_rects`] and [`input_text_width`]
+/// both apply it, so a raw width handed in by the mouse drag router can
+/// never disagree with the geometry the renderer paints.
+pub fn clamp_sidebar_width(w: u16, frame_w: u16) -> u16 {
+    let max = (frame_w / 2).min(frame_w.saturating_sub(24));
+    w.clamp(SIDEBAR_MIN_WIDTH, max.max(SIDEBAR_MIN_WIDTH))
+}
+
 /// Split `area` exactly like [`draw`] does: the root vertical stack (main
 /// area / spinner line / growing input block / hotkey-hints line) plus the
 /// sidebar+chat horizontal split of the main area. `input_height` is the
 /// RAW editor-block height (see `App::input_lines_height`); the frame cap
 /// ([`max_input_block_height`]) is re-applied here, shared by the renderer
 /// and the mouse router.
-pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
+pub fn layout_rects(area: Rect, input_height: u16, sidebar_width: u16) -> LayoutRects {
     // the editor block grows per frame from 1 row with the soft-wrapped
     // draft (chat pane shrinks correspondingly: Min(0) absorbs the rest) up
     // to 3/4 of the frame height. On tiny terminals the block is
     // additionally clamped so spinner + hints + a sliver of chat always
-    // survive; saturating math everywhere keeps ≤4-row frames safe.
+    // survive; saturating math everywhere keeps ≤4-row frames safe. The
+    // sidebar width is clamped by the SAME helper the mouse drag applies,
+    // so a stale persisted width can never starve the chat pane.
     let input_height = input_height.min(max_input_block_height(area.height));
+    let sidebar_width = clamp_sidebar_width(sidebar_width, area.width);
     let root = Layout::vertical([
         Constraint::Min(0),               // main area
         Constraint::Length(1),            // spinner / status line (above input)
@@ -107,7 +129,7 @@ pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
     .split(area);
 
     let main = Layout::horizontal([
-        Constraint::Length(SIDEBAR_WIDTH), // sidebar
+        Constraint::Length(sidebar_width), // sidebar
         Constraint::Min(20),               // chat view
     ])
     .split(root[0]);
@@ -120,13 +142,14 @@ pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
 }
 
 /// Display columns the editor text gets inside the chat column of a frame
-/// with this `area`: the frame minus the sidebar, the divider cell and the
-/// `❯ ` prompt marker. Derived from the FRAME, never from
-/// [`LayoutRects::chat_column`] — the layout needs the editor height to size
-/// that column, so the width must be known from the frame alone.
-pub fn input_text_width(area: Rect) -> u16 {
+/// with this `area` and sidebar width: the frame minus the (clamped)
+/// sidebar, the divider cell and the `❯ ` prompt marker. Derived from the
+/// FRAME, never from [`LayoutRects::chat_column`] — the layout needs the
+/// editor height to size that column, so the width must be known from the
+/// frame alone.
+pub fn input_text_width(area: Rect, sidebar_width: u16) -> u16 {
     area.width
-        .saturating_sub(SIDEBAR_WIDTH + 1 + PROMPT_MARKER_WIDTH)
+        .saturating_sub(clamp_sidebar_width(sidebar_width, area.width) + 1 + PROMPT_MARKER_WIDTH)
 }
 
 /// Which on-screen panel a point falls into — the shared hit-test seam for
@@ -157,7 +180,11 @@ pub fn panel_region(rects: &LayoutRects, column: u16, row: u16) -> PanelRegion {
 
 /// Draw one full frame.
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
-    let rects = layout_rects(f.area(), app.input_lines_height(f.area()));
+    let rects = layout_rects(
+        f.area(),
+        app.input_lines_height(f.area()),
+        app.sidebar_width,
+    );
     let chat_column = rects.chat_column();
 
     render_sidebar(f, app, theme, rects.sidebar);
@@ -1008,7 +1035,7 @@ fn render_scroll_hint(f: &mut Frame, at_bottom: bool, theme: &Theme, spinner_lin
 /// and `⏎ send` is repeated flush right on the block's first row when the
 /// draft wraps onto more than one.
 fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) {
-    // Panel tint confined to the CHAT COLUMN (cols 26..width @120): the
+    // Panel tint confined to the CHAT COLUMN (cols 30..width @120): the
     // divider cell and the sidebar strip keep `theme.panel` (approved
     // geometry).
     f.buffer_mut()
