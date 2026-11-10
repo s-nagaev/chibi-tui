@@ -388,6 +388,11 @@ async fn connect_live(
             // refresh the advertised commands after a
             // reconnect too, the new session re-handshakes.
             app.set_backend_commands(live.backend_commands().to_vec());
+            // Fresh backend session: no subagents of the old one survive a
+            // reconnect, so sweep every thread's counters (the disconnect
+            // sweep usually already did; this is idempotent defense-in-depth
+            // for paths that reach a reconnect without a Disconnected event).
+            app.clear_all_subagent_counts();
             app.dismiss_error();
             // Session-scoped continuation answers ride the new connection's
             // own pump; the old pump retired with its closed channel.

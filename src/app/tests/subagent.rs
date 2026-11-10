@@ -204,4 +204,141 @@ fn subagent_counter_with_zero_active_renders_nothing() {
     );
 }
 
+/// A confirmed `/stop` clears the stopped thread's counters, even though
+/// the counter was still live when the stop was staged — the backend's
+/// kill-flush frame may never arrive, so the TUI must not wait for it.
+#[test]
+fn stop_confirm_clears_the_subagent_counter() {
+    let mut app = app_with_chats(1);
+    submit_text(&mut app, "spawn helpers");
+    agent_event(&mut app, 0, AgentEventKind::Started, 2, 4);
+    assert_eq!(app.active_chat_subagents(), Some(2), "precondition");
+
+    // Stage and confirm a /stop control request exactly as ^L does.
+    app.set_backend_commands(vec![App::STOP_COMMAND.to_owned()]);
+    app.begin_stop_confirm();
+    app.confirm_stop_reset();
+    let (ctrl_request_id, ctrl_thread_id) = {
+        let pending = app.pending_control.as_ref().expect("stop staged");
+        (pending.request_id.clone(), pending.thread_id.clone())
+    };
+
+    // The control's own terminal result frame resolves the stop.
+    app.apply_backend_event(BackendEvent::Result {
+        request_id: event_id_of(&ctrl_request_id),
+        markdown: "Everything stopped.".into(),
+        thread_id: ctrl_thread_id,
+        model: None,
+        usage: None,
+        thoughts: None,
+    });
+    assert!(app.pending_control.is_none(), "stop resolved");
+    assert!(
+        app.chats[0].subagent_counts.is_empty(),
+        "the stopped thread's counters must be cleared"
+    );
+    assert_eq!(
+        app.active_chat_subagents(),
+        None,
+        "no counter after the stop"
+    );
+}
+
+/// A connection-level Disconnected wipes every chat's counters: all
+/// threads' subagents lived in the backend process that just went away.
+#[test]
+fn disconnect_clears_all_chats_subagent_counters() {
+    let mut app = app_with_chats(2);
+    submit_text(&mut app, "work");
+    app.active = 1;
+    submit_text(&mut app, "more work");
+    let a = idx(&app, "chat-0");
+    let b = idx(&app, "chat-1");
+    agent_event(&mut app, a, AgentEventKind::Started, 2, 4);
+    agent_event(&mut app, b, AgentEventKind::Started, 1, 4);
+
+    app.apply_backend_event(BackendEvent::Disconnected);
+
+    app.active = a;
+    assert_eq!(
+        app.active_chat_subagents(),
+        None,
+        "chat-0's counters died with the transport"
+    );
+    app.active = b;
+    assert_eq!(
+        app.active_chat_subagents(),
+        None,
+        "chat-1's counters died with the transport"
+    );
+    assert!(app.chats[a].subagent_counts.is_empty());
+    assert!(app.chats[b].subagent_counts.is_empty());
+}
+
+/// A transport-level error frame clears the affected chat's counters (the
+/// thread's agent frames ride the link that just failed) while OTHER
+/// chats' counters — fed by the still-alive backend from earlier turns —
+/// stay untouched. A non-transport error keeps the counters: the request's
+/// agent pump survives an application error and the backend still owns
+/// the subagents' lifecycle.
+#[test]
+fn transport_error_clears_only_the_affected_chats_counters() {
+    let mut app = app_with_chats(2);
+    let first = submit_text(&mut app, "work");
+    app.active = 1;
+    let second = submit_text(&mut app, "background work");
+    let a = idx(&app, "chat-0");
+    let b = idx(&app, "chat-1");
+    agent_event(&mut app, a, AgentEventKind::Started, 2, 4);
+    agent_event(&mut app, b, AgentEventKind::Started, 1, 4);
+
+    app.apply_backend_event(BackendEvent::Error {
+        request_id: event_id_of(&first.request_id),
+        message: "backend connection lost".into(),
+        thread_id: Some(app.chats[a].id.clone()),
+    });
+
+    // The inline failure lifts the failed thread to the sidebar top:
+    // re-resolve both positions by name before asserting.
+    let a = idx(&app, "chat-0");
+    let b = idx(&app, "chat-1");
+    assert!(
+        app.chats[a].subagent_counts.is_empty(),
+        "the failed thread's counters must be cleared"
+    );
+    assert_eq!(
+        app.chats[b]
+            .subagent_counts
+            .get(&event_id_of(&second.request_id)),
+        Some(&(1, 4)),
+        "another thread's live counter stays untouched"
+    );
+    assert_eq!(app.chats[b].running_subagents(), Some(1));
+}
+
+/// A late `finished(active == 0)` kill-flush arriving after a defensive
+/// clear is an idempotent no-op: no panic, no resurrection.
+#[test]
+fn late_kill_flush_after_a_clear_is_an_idempotent_noop() {
+    let mut app = app_with_chats(1);
+    let first = submit_text(&mut app, "spawn helpers");
+    agent_event(&mut app, 0, AgentEventKind::Started, 2, 4);
+    app.chats[0].clear_subagent_counts();
+    assert_eq!(app.active_chat_subagents(), None, "cleared");
+
+    agent_frame(
+        &mut app,
+        0,
+        event_id_of(&first.request_id),
+        AgentEventKind::Finished,
+        0,
+        4,
+    );
+    assert!(
+        app.chats[0].subagent_counts.is_empty(),
+        "the flush must not resurrect anything"
+    );
+    assert_eq!(app.active_chat_subagents(), None);
+}
+
 // creation / switching --------------------------------

@@ -656,12 +656,31 @@ impl Chat {
         (running > 0).then_some(running)
     }
 
+    /// Defensive TUI-side clear of this thread's subagent counters.
+    ///
+    /// The authoritative retirement of a counter is the backend's own
+    /// `agent_event` frame reporting `active == 0` (its kill-flush), but
+    /// that frame rides the same transport that justifies the clear and
+    /// may never arrive. Idempotent by construction: a kill-flush that
+    /// arrives after the clear removes an absent entry (no-op).
+    pub fn clear_subagent_counts(&mut self) {
+        self.subagent_counts.clear();
+    }
+
     /// Fold one mid-turn `agent_event` frame into this thread's subagent
     /// counters. `started` inserts/updates the frame request's entry from
     /// the frame values; `finished` updates it and removes the entry once
     /// the frame reports `active == 0` (all subagents of that request are
     /// done). The frame is non-terminal: the request lifecycle is never
     /// touched here.
+    ///
+    /// A `started` for an already-retired request id deliberately re-inserts
+    /// (no tombstone): every attempt carries a fresh client-generated UUID,
+    /// so its numeric event id is unique per attempt, and the live glue
+    /// retires a request's agent pump exactly at its `finished(active == 0)`
+    /// frame — no `started` for that id can follow on the wire. A re-insert
+    /// after a defensive clear is therefore only reachable from a protocol
+    /// violation, and the next defensive clear sweeps it.
     pub fn apply_subagent_event(
         &mut self,
         request_id: u64,
@@ -2676,6 +2695,19 @@ impl App {
             .get(self.active)
             .and_then(Chat::running_subagents)
     }
+    /// Clear every chat's subagent counters in one sweep.
+    ///
+    /// Used where the transport (or the whole backend session) died as a
+    /// unit: per-thread subagents live inside the backend process, so a
+    /// dead link means every thread's counters are dead with it. The
+    /// backend's own per-request kill-flush frames are still honored when
+    /// they do arrive — the sweep is idempotent defense-in-depth against
+    /// the lost-flush leak (a stale non-zero count persisting forever).
+    pub fn clear_all_subagent_counts(&mut self) {
+        for chat in &mut self.chats {
+            chat.clear_subagent_counts();
+        }
+    }
 
     // ---- submission ------------------------------------------------------
 
@@ -3145,6 +3177,16 @@ impl App {
                     if self.active_thread_id() == Some(pending.thread_id.as_str()) {
                         self.scroll = 0;
                     }
+                } else {
+                    // /stop: the backend kills the thread's subagents and
+                    // sends its counter kill-flush, but that frame rides the
+                    // same link the stop just acted on and may never arrive —
+                    // clear the stopped thread's counters defensively so a
+                    // lost flush cannot pin a stale non-zero count forever
+                    // (idempotent against the flush itself).
+                    if let Some(chat) = self.chats.iter_mut().find(|c| c.id == pending.thread_id) {
+                        chat.clear_subagent_counts();
+                    }
                 }
                 self.show_status(markdown.trim());
                 true
@@ -3409,7 +3451,12 @@ impl App {
     /// unconditionally — it carries no request.
     pub fn apply_backend_event(&mut self, event: BackendEvent) {
         if let BackendEvent::Disconnected = event {
-            // The event source itself reported the link down.
+            // The event source itself reported the link down. Every
+            // thread's subagents lived in the backend process that just
+            // went away: sweep all counters so a lost per-request
+            // kill-flush cannot leave a stale non-zero count behind
+            // (idempotent against any flush frame that still arrives).
+            self.clear_all_subagent_counts();
             self.connection = Connection::Disconnected;
             return;
         }
@@ -3652,6 +3699,11 @@ impl App {
                     self.chats[chat_index].lifecycle = ChatLifecycle::Idle;
                     if purpose.is_some() {
                         if is_transport_failure(&message) {
+                            // Same transport-dead rationale as the inline
+                            // error path below: this thread's agent frames
+                            // ride the link that just failed, so its
+                            // counters are gone with it.
+                            self.chats[chat_index].clear_subagent_counts();
                             self.connection = Connection::Disconnected;
                         }
                         // fire-and-forget: a failed rename push
@@ -3687,6 +3739,17 @@ impl App {
                     // Per-request errors (bad prompt, refused request) stay
                     // inline.
                     if is_transport_failure(&message) {
+                        // The transport that carried this thread's agent
+                        // frames is gone: drop its counters here (the
+                        // connection-level Disconnected sweep, when it
+                        // arrives, covers the other threads). A non-transport
+                        // error deliberately KEEPS the counters: the backend
+                        // and the request's agent pump survive an application
+                        // error, the subagents outlive the failed request
+                        // exactly as they outlive a successful result frame,
+                        // and the backend's own zero-active flush retires
+                        // them — clearing here would drop a still-live count.
+                        self.chats[chat_index].clear_subagent_counts();
                         self.connection = Connection::Disconnected;
                         self.show_error(message);
                     }
