@@ -259,27 +259,110 @@ pub fn find_match_ranges(line: &str, pattern: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/// Split one logical line into `width`-wide row chunks (character-level,
-/// display width via unicode-width, so the row math matches what the
-/// renderer shows exactly). `width` 0 is treated as 1: a degenerate
-/// viewport must not divide by zero or loop forever.
-pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
+/// Display columns one char advances: unicode width, so a wide (CJK, emoji)
+/// glyph counts two and a combining mark counts none.
+///
+/// The ONE width rule the character wrap and every consumer of it share —
+/// [`wrap_line_ranges`], [`wrap_line`], the log viewer's rows and the input
+/// editor's paint pass all advance by exactly this, which is what keeps a
+/// row's planned extent and the cells actually written in lockstep.
+pub(crate) fn char_cols(ch: char) -> usize {
+    ch.width().unwrap_or(0)
+}
+
+/// Split one logical line into the half-open CHAR range of each display row
+/// (word-boundary greedy wrap, display width via unicode-width, so the row
+/// math matches what the renderer shows exactly). `width` 0 is treated as 1:
+/// a degenerate viewport must not divide by zero or loop forever.
+///
+/// `first_row_reserve` columns are withheld from the FIRST row only (the
+/// editor's `⏎ send` chip lane); pass 0 for a plain full-width wrap.
+///
+/// Rows break at the LAST space that fits, and the break space itself is
+/// dropped — so, unlike the earlier character chunker, the ranges may have
+/// GAPS and no longer cover every char of the line. A single token wider
+/// than the row is hard-broken at the row width (at least one char per row,
+/// so the scan always makes progress and can never loop). An empty line is
+/// one empty range, matching an empty `Paragraph`.
+pub fn wrap_line_ranges(line: &str, width: usize, first_row_reserve: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
-    let mut rows = Vec::new();
-    let mut current = String::new();
-    let mut current_w = 0usize;
-    for ch in line.chars() {
-        let ch_w = ch.width().unwrap_or(0);
-        if current_w + ch_w > width && !current.is_empty() {
-            rows.push(std::mem::take(&mut current));
-            current_w = 0;
-        }
-        current.push(ch);
-        current_w += ch_w;
+    let first_capacity = width.saturating_sub(first_row_reserve).max(1);
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![(0, 0)];
     }
-    rows.push(current);
+
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    let mut row_start = 0usize;
+    let mut w = 0usize;
+    // Char index of the last space seen in the row being built (a candidate
+    // break point), or `None` while the row has no space to break at.
+    let mut break_at: Option<usize> = None;
+    let mut i = 0usize;
+    // Spaces at the head of a fresh row are dropped, never echoed: a break
+    // leaves no leading whitespace behind (and a hard break that lands ON a
+    // space does not re-emit it).
+    let skip_leading_spaces = |from: usize| -> usize {
+        let mut next = from;
+        while next < chars.len() && chars[next] == ' ' {
+            next += 1;
+        }
+        next
+    };
+    while i < chars.len() {
+        let capacity = if rows.is_empty() {
+            first_capacity
+        } else {
+            width
+        };
+        let ch_w = char_cols(chars[i]);
+        // Overflow: the char does not fit AND the row already holds one.
+        if w + ch_w > capacity && i > row_start {
+            match break_at {
+                // Break at the last space: the space is dropped, so the next
+                // row starts right after it (a gap in the ranges).
+                Some(space) if space > row_start => {
+                    rows.push((row_start, space));
+                    row_start = skip_leading_spaces(space + 1);
+                    i = row_start;
+                    w = 0;
+                    break_at = None;
+                    continue;
+                }
+                // No usable space: hard-break the maximal prefix that fits.
+                // `i > row_start` guarantees at least one char is emitted.
+                _ => {
+                    rows.push((row_start, i));
+                    row_start = skip_leading_spaces(i);
+                    i = row_start;
+                    w = 0;
+                    break_at = None;
+                    continue;
+                }
+            }
+        }
+        if chars[i] == ' ' {
+            break_at = Some(i);
+        }
+        w += ch_w;
+        i += 1;
+    }
+    if row_start < chars.len() || rows.is_empty() {
+        rows.push((row_start, chars.len()));
+    }
     rows
+}
+
+/// Split one logical line into `width`-wide row chunks (word-boundary greedy
+/// wrap, display width via unicode-width, so the row math matches what the
+/// renderer shows exactly). `width` 0 is treated as 1: a degenerate viewport
+/// must not divide by zero or loop forever. Break spaces are dropped (see
+/// [`wrap_line_ranges`]).
+pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    wrap_line_ranges(line, width, 0)
+        .into_iter()
+        .map(|(start, end)| line.chars().skip(start).take(end - start).collect())
+        .collect()
 }
 
 /// Row count of a wrapped logical line (see [`wrap_line`]).
@@ -573,12 +656,31 @@ impl Chat {
         (running > 0).then_some(running)
     }
 
+    /// Defensive TUI-side clear of this thread's subagent counters.
+    ///
+    /// The authoritative retirement of a counter is the backend's own
+    /// `agent_event` frame reporting `active == 0` (its kill-flush), but
+    /// that frame rides the same transport that justifies the clear and
+    /// may never arrive. Idempotent by construction: a kill-flush that
+    /// arrives after the clear removes an absent entry (no-op).
+    pub fn clear_subagent_counts(&mut self) {
+        self.subagent_counts.clear();
+    }
+
     /// Fold one mid-turn `agent_event` frame into this thread's subagent
     /// counters. `started` inserts/updates the frame request's entry from
     /// the frame values; `finished` updates it and removes the entry once
     /// the frame reports `active == 0` (all subagents of that request are
     /// done). The frame is non-terminal: the request lifecycle is never
     /// touched here.
+    ///
+    /// A `started` for an already-retired request id deliberately re-inserts
+    /// (no tombstone): every attempt carries a fresh client-generated UUID,
+    /// so its numeric event id is unique per attempt, and the live glue
+    /// retires a request's agent pump exactly at its `finished(active == 0)`
+    /// frame — no `started` for that id can follow on the wire. A re-insert
+    /// after a defensive clear is therefore only reachable from a protocol
+    /// violation, and the next defensive clear sweeps it.
     pub fn apply_subagent_event(
         &mut self,
         request_id: u64,
@@ -714,6 +816,34 @@ pub struct SidebarGeometry {
     pub inner: Rect,
     /// First visible thread row at snapshot time (post-render list offset).
     pub offset: usize,
+    /// Chat index of every row of the FULL list, in paint order, WITHOUT
+    /// the list offset applied (the router adds it): a wrapped name
+    /// occupies as many entries as it has rows, so a click on row 2 or 3
+    /// of a name resolves to that name's chat. Empty when no chat has ever
+    /// been rendered.
+    pub row_chats: Vec<usize>,
+    /// Terminal row of the first row of each chat's block, indexed by chat
+    /// index (absolute frame rows, i.e. `inner.y` already added, offset not
+    /// applied). A locate/verify seam for tests and callers that need to
+    /// know where a chat's block starts on screen.
+    pub row_tops: Vec<usize>,
+}
+
+impl SidebarGeometry {
+    /// Chat index painted on terminal row `row`, or `None` when the row is
+    /// outside one of the currently visible chat blocks (below the last
+    /// thread, past a short list, or off the top after an internal scroll).
+    pub fn chat_at(&self, row: u16) -> Option<usize> {
+        let y = row as usize;
+        if y < self.inner.y as usize {
+            return None;
+        }
+        // The click's full-list row: the viewport-local row plus the list's
+        // internal scroll at render time (the same mapping the arithmetic
+        // seam used for single-row items).
+        let idx = self.offset.checked_add(y - self.inner.y as usize)?;
+        self.row_chats.get(idx).copied()
+    }
 }
 
 impl ChatGeometry {
@@ -968,6 +1098,18 @@ pub struct App {
     /// [`App::chat_geometry`]: written by `ui::render_sidebar` each frame,
     /// read by the mouse router, never persisted.
     pub sidebar_geometry: Option<SidebarGeometry>,
+    /// Runtime sidebar width in columns (`ui::DEFAULT_SIDEBAR_WIDTH` on a
+    /// fresh app; restored + clamped at startup from `ui.json`). The single
+    /// source of truth both the renderer (`ui::layout_rects`) and the input
+    /// soft-wrap (`App::input_lines_height` → `ui::input_text_width`) read,
+    /// so the editor's wrap width can never drift from the painted layout.
+    pub sidebar_width: u16,
+    /// Live sidebar drag-resize state: the grab offset between the press
+    /// column and the divider's boundary column (negative when the grab
+    /// landed on the sidebar-side border col), `Some` only while a press on
+    /// the two divider columns is held. Session-only: never persisted, and
+    /// the drag-end save goes through `ui_store` on release.
+    pub sidebar_drag: Option<i32>,
     /// Content-keyed cache of rendered markdown lines
     /// ([`MarkdownCache`], plan D1): a finalized message renders exactly
     /// once per `(content, theme)` pair instead of being re-parsed and
@@ -1037,12 +1179,6 @@ const SPINNER: [&str; 10] = [
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280F}",
 ];
-
-/// hard cap on how many terminal rows the ACTIVE editor
-/// block (message draft OR rename draft) may occupy. Beyond this the
-/// textarea view auto-scrolls inside the capped window so the caret always
-/// stays on screen.
-pub const MAX_INPUT_LINES: usize = 20;
 
 /// how many 100 ms spinner ticks a transient status
 /// toast stays visible (~2.5 s).
@@ -1148,6 +1284,8 @@ impl App {
             selection: None,
             chat_geometry: None,
             sidebar_geometry: None,
+            sidebar_width: crate::ui::DEFAULT_SIDEBAR_WIDTH,
+            sidebar_drag: None,
             config_restart_when_idle: false,
             config_apply_pending: false,
             mock_session: false,
@@ -1413,16 +1551,28 @@ impl App {
         }
     }
 
-    /// terminal rows the ACTIVE editor block needs right
-    /// now — visible buffer lines clamped to `1..=MAX_INPUT_LINES`.
-    ///
-    /// Normal mode counts the multiline message draft (`Shift+Enter`);
-    /// rename mode counts its own draft (modified Enters / paste insert
-    /// `\n` into the title too). Recomputed per frame by `ui::draw` and fed
-    /// to the root vertical layout; a cleared input collapses back to
+    /// terminal rows the ACTIVE editor block needs
+    /// right now for a frame with `area`: the VISUAL (soft-wrapped) row count
+    /// of the active draft at the frame's editor width, capped at
+    /// [`ui::max_input_block_height`](crate::ui::max_input_block_height) — 3/4
+    /// of the frame height, never past the tiny-frame guard that keeps the
+    /// spinner row, the hints row and a sliver of chat alive — and floored at
     /// exactly one row.
-    pub fn input_lines_height(&self) -> u16 {
-        let buffer_lines = match &self.mode {
+    ///
+    /// Normal mode counts the wrapped multiline message draft (`Shift+Enter`
+    /// and pastes insert `\n`, over-long lines soft-wrap); rename mode counts
+    /// its own draft, which the rename renderer draws one logical line per row
+    /// (it never wraps). Recomputed per frame by `ui::draw` and fed to the
+    /// root vertical layout; a cleared input collapses back to exactly one
+    /// row.
+    ///
+    /// The wrap width is derived from the FRAME rectangle
+    /// (`ui::input_text_width`) and never from the laid-out chat column: the
+    /// layout needs this height to size that column, so reading the column
+    /// back here would close the circle.
+    pub fn input_lines_height(&self, area: Rect) -> u16 {
+        let text_width = crate::ui::input_text_width(area, self.sidebar_width);
+        let wrapped = match &self.mode {
             Mode::Renaming { buf } => buf.split('\n').count(),
             // The delete-confirm, search and log-viewer popups overlay the
             // normal editor: their height derives from the message draft,
@@ -1435,9 +1585,14 @@ impl App {
             | Mode::LogViewer { .. }
             | Mode::ModelPicking { .. }
             | Mode::HelpViewing { .. }
-            | Mode::ConfigEditor { .. } => self.input.lines().len(),
+            | Mode::ConfigEditor { .. } => self.input.wrapped_lines(text_width),
         };
-        buffer_lines.clamp(1, MAX_INPUT_LINES) as u16
+        // the growth cap: 3/4 of the frame, never past the tiny-frame guard,
+        // never below one row. `ui::layout_rects` re-applies the SAME cap
+        // (idempotent) so a raw height handed to it by the mouse router can
+        // never outgrow the frame this producer sized.
+        let cap = crate::ui::max_input_block_height(area.height) as usize;
+        wrapped.clamp(1, cap.max(1)) as u16
     }
 
     /// Commit the ACTIVE chat's rename: trims whitespace; empty/whitespace-only
@@ -2540,6 +2695,19 @@ impl App {
             .get(self.active)
             .and_then(Chat::running_subagents)
     }
+    /// Clear every chat's subagent counters in one sweep.
+    ///
+    /// Used where the transport (or the whole backend session) died as a
+    /// unit: per-thread subagents live inside the backend process, so a
+    /// dead link means every thread's counters are dead with it. The
+    /// backend's own per-request kill-flush frames are still honored when
+    /// they do arrive — the sweep is idempotent defense-in-depth against
+    /// the lost-flush leak (a stale non-zero count persisting forever).
+    pub fn clear_all_subagent_counts(&mut self) {
+        for chat in &mut self.chats {
+            chat.clear_subagent_counts();
+        }
+    }
 
     // ---- submission ------------------------------------------------------
 
@@ -2597,8 +2765,13 @@ impl App {
             // A new VISIBLE request starts in THIS chat: its previous turn's
             // reasoning leaves the view. Other chats' thoughts are untouched.
             chat.last_thoughts = None;
-            chat.messages.push(Message::user(submitted.prompt.clone()));
-            chat.messages.push(Message::assistant_pending());
+            // One event, one instant: the prompt bubble and its placeholder
+            // share the moment the request was sent, and the placeholder's
+            // stamp survives resolution (see `resolve_live_placeholder`).
+            let sent_at = crate::history::now_unix();
+            chat.messages
+                .push(Message::user(submitted.prompt.clone()).at(sent_at));
+            chat.messages.push(Message::assistant_pending().at(sent_at));
             chat.lifecycle = ChatLifecycle::Awaiting {
                 request_id: submitted.request_id.clone(),
             };
@@ -2644,11 +2817,14 @@ impl App {
         };
         // The user bubble was appended at enqueue time; swap the oldest
         // remaining queued marker for the real pending placeholder (display
-        // order == FIFO order).
+        // order == FIFO order). The swap happens IN PLACE so the pending row
+        // inherits the marker's creation stamp: a prompt keeps the clock it
+        // was queued with, never the moment it left the queue.
         if let Some(marker) = chat.messages.iter_mut().find(|m| is_queued_marker(m)) {
-            *marker = Message::assistant_pending();
+            marker.markdown.clear();
         } else {
-            chat.messages.push(Message::assistant_pending());
+            chat.messages
+                .push(Message::assistant_pending().at(crate::history::now_unix()));
         }
         chat.lifecycle = ChatLifecycle::Awaiting {
             request_id: submitted.request_id.clone(),
@@ -3001,6 +3177,16 @@ impl App {
                     if self.active_thread_id() == Some(pending.thread_id.as_str()) {
                         self.scroll = 0;
                     }
+                } else {
+                    // /stop: the backend kills the thread's subagents and
+                    // sends its counter kill-flush, but that frame rides the
+                    // same link the stop just acted on and may never arrive —
+                    // clear the stopped thread's counters defensively so a
+                    // lost flush cannot pin a stale non-zero count forever
+                    // (idempotent against the flush itself).
+                    if let Some(chat) = self.chats.iter_mut().find(|c| c.id == pending.thread_id) {
+                        chat.clear_subagent_counts();
+                    }
                 }
                 self.show_status(markdown.trim());
                 true
@@ -3265,7 +3451,12 @@ impl App {
     /// unconditionally — it carries no request.
     pub fn apply_backend_event(&mut self, event: BackendEvent) {
         if let BackendEvent::Disconnected = event {
-            // The event source itself reported the link down.
+            // The event source itself reported the link down. Every
+            // thread's subagents lived in the backend process that just
+            // went away: sweep all counters so a lost per-request
+            // kill-flush cannot leave a stale non-zero count behind
+            // (idempotent against any flush frame that still arrives).
+            self.clear_all_subagent_counts();
             self.connection = Connection::Disconnected;
             return;
         }
@@ -3508,6 +3699,11 @@ impl App {
                     self.chats[chat_index].lifecycle = ChatLifecycle::Idle;
                     if purpose.is_some() {
                         if is_transport_failure(&message) {
+                            // Same transport-dead rationale as the inline
+                            // error path below: this thread's agent frames
+                            // ride the link that just failed, so its
+                            // counters are gone with it.
+                            self.chats[chat_index].clear_subagent_counts();
                             self.connection = Connection::Disconnected;
                         }
                         // fire-and-forget: a failed rename push
@@ -3543,6 +3739,17 @@ impl App {
                     // Per-request errors (bad prompt, refused request) stay
                     // inline.
                     if is_transport_failure(&message) {
+                        // The transport that carried this thread's agent
+                        // frames is gone: drop its counters here (the
+                        // connection-level Disconnected sweep, when it
+                        // arrives, covers the other threads). A non-transport
+                        // error deliberately KEEPS the counters: the backend
+                        // and the request's agent pump survive an application
+                        // error, the subagents outlive the failed request
+                        // exactly as they outlive a successful result frame,
+                        // and the backend's own zero-active flush retires
+                        // them — clearing here would drop a still-live count.
+                        self.chats[chat_index].clear_subagent_counts();
                         self.connection = Connection::Disconnected;
                         self.show_error(message);
                     }
@@ -3680,7 +3887,9 @@ impl App {
                 Some(label) => Message::assistant_with_model(markdown, label.clone()),
                 None => Message::assistant(markdown),
             };
-            chat.messages.push(message);
+            // An out-of-band continuation is a message in its own right: it
+            // appears now, so it is stamped now.
+            chat.messages.push(message.at(crate::history::now_unix()));
             // Per-chat thoughts: a visible answer of the owning chat
             // carrying reasoning is a legitimate writer of its block.
             // Continuation reasoning is a CHAIN member, not a replacement:
@@ -3722,8 +3931,11 @@ impl App {
                 // The fallback is honest, not silent: surface the raw
                 // exchange the user actually caused with ^M.
                 let chat = &mut self.chats[chat_index];
-                chat.messages.push(Message::user(MODEL_LISTING_PROMPT));
-                chat.messages.push(Message::assistant(markdown));
+                let surfaced_at = crate::history::now_unix();
+                chat.messages
+                    .push(Message::user(MODEL_LISTING_PROMPT).at(surfaced_at));
+                chat.messages
+                    .push(Message::assistant(markdown).at(surfaced_at));
                 self.scroll = 0;
             }
             return;
@@ -3913,10 +4125,14 @@ impl App {
 /// is swapped for the real pending answer when the prompt leaves the queue
 /// (see [`App::dequeue_next_for`]).
 fn enqueue_prompt(chat: &mut Chat, prompt: String) {
-    chat.messages.push(Message::user(prompt.clone()));
+    // The queue holds prompts, not clocks: the user bubble and its position
+    // marker share the moment the prompt was written.
+    let queued_at = crate::history::now_unix();
+    chat.messages
+        .push(Message::user(prompt.clone()).at(queued_at));
     chat.queue.push_back(prompt);
     chat.messages
-        .push(Message::assistant_queued(chat.queue.len()));
+        .push(Message::assistant_queued(chat.queue.len()).at(queued_at));
 }
 
 /// Marker predicate for the visible "⏳ queued (#n)" placeholder rows.
@@ -4000,6 +4216,11 @@ pub fn collect_search_matches<'a>(
 /// `model` is stamped ONLY onto this one message at
 /// result-resolution time: replies are labelled per-message, so future
 /// per-message model switching can never mislabel an earlier answer.
+///
+/// The creation stamp is NOT re-taken here: the row already carries the
+/// instant its bubble appeared (the request start), and a reply must never
+/// change its clock while it is being answered. Only a placeholder that
+/// carries none is stamped now.
 fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<String>) {
     if let Some(row) = chat
         .messages
@@ -4010,6 +4231,7 @@ fn resolve_live_placeholder(chat: &mut Chat, markdown: String, model: Option<Str
         row.pending = false;
         row.markdown = markdown;
         row.model = model;
+        row.created_at.get_or_insert_with(crate::history::now_unix);
     }
 }
 
@@ -4032,6 +4254,8 @@ fn resolve_live_placeholder_with_error(chat: &mut Chat, message: &str) {
             format!("{partial}\n\n**Error:** {message}")
         };
         row.pending = false;
+        // Same rule as a successful resolution: the clock is the request's.
+        row.created_at.get_or_insert_with(crate::history::now_unix);
     }
 }
 /// is this answer content invisible-by-contract?

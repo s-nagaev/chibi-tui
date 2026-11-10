@@ -255,6 +255,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures-util",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "serde",

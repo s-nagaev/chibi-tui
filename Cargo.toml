@@ -38,6 +38,12 @@ thiserror = "2"
 # System clipboard access for paste into the input field (Ctrl+V / Cmd+V).
 arboard = "3.6"
 
+# C library timezone conversion for the per-message HH:MM stamps
+# (`localtime_r` / `localtime_s`): the standard library ships no wall-clock
+# conversion, and this is the only place that needs one. Already linked
+# transitively; declared explicitly because the code calls it directly.
+libc = "0.2"
+
 # CLI parsing for the demo binary (`--workspace`).
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1.25.0", features = ["v4"] }

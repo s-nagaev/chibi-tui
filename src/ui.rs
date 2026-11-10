@@ -20,6 +20,17 @@ use crate::theme::Theme;
 const PROMPT_MARKER: &str = "\u{276f} ";
 const PROMPT_MARKER_WIDTH: u16 = 2;
 
+/// Default sidebar pane width: the left column of the main area (the chat
+/// pane starts right of it, the divider cell included in the chat pane).
+/// The RUNTIME width lives on [`App::sidebar_width`] (mouse-drag resizable,
+/// persisted across runs); this constant only seeds a fresh app and the
+/// `ui.json` fallback.
+pub const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
+
+/// Widest a sidebar may ever be: half the frame, so neither pane can be
+/// starved past usefulness on a narrow terminal.
+const SIDEBAR_MIN_WIDTH: u16 = 20;
+
 /// Compute how many lines must be hidden from the TOP of the message list.
 ///
 /// Scroll semantics: `scroll` counts lines scrolled UP FROM THE BOTTOM
@@ -55,8 +66,8 @@ pub struct LayoutRects {
 impl LayoutRects {
     /// Chat text column: starts at the chat pane's left edge and excludes
     /// the 1-column right margin, so the prompt, tint and hints stay
-    /// inside e.g. cols 26..=118 @120 and never spill onto the divider
-    /// (col 25) or the margins.
+    /// inside e.g. cols 30..=118 @120 and never spill onto the divider
+    /// (col 29) or the margins.
     pub fn chat_column(&self) -> Rect {
         Rect {
             x: self.chat.x,
@@ -66,19 +77,49 @@ impl LayoutRects {
     }
 }
 
+/// Largest editor-block height a frame of `frame_height` rows may give the
+/// input: 3/4 of the frame, never past the tiny-frame guard that keeps the
+/// spinner row, the hints row and a sliver of chat alive (`frame_height` − 4),
+/// and never below one row (saturating math keeps ≤4-row frames safe).
+///
+/// The single place the growth cap is defined: the producer
+/// (`App::input_lines_height`) and the shared geometry seam
+/// ([`layout_rects`]) both apply it, so a raw height handed to the layout by
+/// the mouse router can never outgrow the frame the renderer would paint.
+pub fn max_input_block_height(frame_height: u16) -> u16 {
+    let tiny_frame_guard = frame_height.saturating_sub(4);
+    let three_quarters = (frame_height as u32 * 3 / 4) as u16;
+    tiny_frame_guard.min(three_quarters).max(1)
+}
+
+/// Effective sidebar width for a frame of `frame_w` columns: never below
+/// 20, never past half the frame, and never so wide the
+/// chat pane's `Min(20)` constraint stops being satisfiable with slack
+/// (the chat area keeps a hard floor of `frame_w - 24` columns). The single
+/// place the clamp is defined: [`layout_rects`] and [`input_text_width`]
+/// both apply it, so a raw width handed in by the mouse drag router can
+/// never disagree with the geometry the renderer paints.
+pub fn clamp_sidebar_width(w: u16, frame_w: u16) -> u16 {
+    let max = (frame_w / 2).min(frame_w.saturating_sub(24));
+    w.clamp(SIDEBAR_MIN_WIDTH, max.max(SIDEBAR_MIN_WIDTH))
+}
+
 /// Split `area` exactly like [`draw`] does: the root vertical stack (main
 /// area / spinner line / growing input block / hotkey-hints line) plus the
 /// sidebar+chat horizontal split of the main area. `input_height` is the
-/// RAW editor-block height (see `App::input_lines_height`); the tiny-frame
-/// clamp is applied here, shared by the renderer and the mouse router.
-pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
-    // the editor block grows per frame from 1 row up to
-    // MAX_INPUT_LINES rows with the multiline draft (chat pane shrinks
-    // correspondingly: Min(0) absorbs the rest). On tiny terminals the
-    // block is additionally clamped so spinner + hints + a sliver of chat
-    // always survive; saturating math everywhere keeps ≤4-row frames safe.
-    let max_block_height = area.height.saturating_sub(4).max(1);
-    let input_height = input_height.min(max_block_height);
+/// RAW editor-block height (see `App::input_lines_height`); the frame cap
+/// ([`max_input_block_height`]) is re-applied here, shared by the renderer
+/// and the mouse router.
+pub fn layout_rects(area: Rect, input_height: u16, sidebar_width: u16) -> LayoutRects {
+    // the editor block grows per frame from 1 row with the soft-wrapped
+    // draft (chat pane shrinks correspondingly: Min(0) absorbs the rest) up
+    // to 3/4 of the frame height. On tiny terminals the block is
+    // additionally clamped so spinner + hints + a sliver of chat always
+    // survive; saturating math everywhere keeps ≤4-row frames safe. The
+    // sidebar width is clamped by the SAME helper the mouse drag applies,
+    // so a stale persisted width can never starve the chat pane.
+    let input_height = input_height.min(max_input_block_height(area.height));
+    let sidebar_width = clamp_sidebar_width(sidebar_width, area.width);
     let root = Layout::vertical([
         Constraint::Min(0),               // main area
         Constraint::Length(1),            // spinner / status line (above input)
@@ -88,8 +129,8 @@ pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
     .split(area);
 
     let main = Layout::horizontal([
-        Constraint::Length(26), // sidebar
-        Constraint::Min(20),    // chat view
+        Constraint::Length(sidebar_width), // sidebar
+        Constraint::Min(20),               // chat view
     ])
     .split(root[0]);
 
@@ -98,6 +139,17 @@ pub fn layout_rects(area: Rect, input_height: u16) -> LayoutRects {
         chat: main[1],
         root: [root[0], root[1], root[2], root[3]],
     }
+}
+
+/// Display columns the editor text gets inside the chat column of a frame
+/// with this `area` and sidebar width: the frame minus the (clamped)
+/// sidebar, the divider cell and the `❯ ` prompt marker. Derived from the
+/// FRAME, never from [`LayoutRects::chat_column`] — the layout needs the
+/// editor height to size that column, so the width must be known from the
+/// frame alone.
+pub fn input_text_width(area: Rect, sidebar_width: u16) -> u16 {
+    area.width
+        .saturating_sub(clamp_sidebar_width(sidebar_width, area.width) + 1 + PROMPT_MARKER_WIDTH)
 }
 
 /// Which on-screen panel a point falls into — the shared hit-test seam for
@@ -128,7 +180,11 @@ pub fn panel_region(rects: &LayoutRects, column: u16, row: u16) -> PanelRegion {
 
 /// Draw one full frame.
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
-    let rects = layout_rects(f.area(), app.input_lines_height());
+    let rects = layout_rects(
+        f.area(),
+        app.input_lines_height(f.area()),
+        app.sidebar_width,
+    );
     let chat_column = rects.chat_column();
 
     render_sidebar(f, app, theme, rects.sidebar);
@@ -264,6 +320,14 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     );
 }
 
+/// Columns consumed by the per-row lifecycle dot cell at the head of a
+/// sidebar list row: the dot glyph itself plus its trailing space.
+const SIDEBAR_DOT_CELL_WIDTH: usize = 2;
+
+/// Rows a chat name may occupy in the sidebar before it is capped: rows past
+/// the second are dropped and the third row carries a trailing `…`.
+const SIDEBAR_NAME_MAX_ROWS: usize = 3;
+
 /// Sidebar list rows carry a per-chat lifecycle dot at column 0:
 /// `\u{25cb}` idle (dim) · `\u{25c6}` awaiting/queued (yellow) ·
 /// `\u{25cf}` running (green). The ACTIVE chat additionally keeps its name
@@ -285,8 +349,51 @@ fn render_spinner_line(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 /// corners) rendered inside the existing sidebar rect — the former divider
 /// column is the right border, the frame edge column hosts the left one —
 /// so the outer frame dimensions and the hit-test rects are unchanged.
+///
+/// A chat name wider than the row's name budget is WRAPPED onto the rows
+/// below it (word-wrap, the same rule the editor's soft wrap uses), up to
+/// [`SIDEBAR_NAME_MAX_ROWS`] rows: rows past the second are dropped and the
+/// third ends in a `…`. The row count of every item is recomputed here each
+/// frame and mirrored into [`crate::app::SidebarGeometry`], which is what
+/// the mouse router maps clicks through — so a click on the second or third
+/// row of a wrapped name still selects the right chat.
 fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let sidebar_focused = app.focus == Focus::Sidebar;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if sidebar_focused {
+            // Emphasis: the focused sidebar's outline lifts to blue.
+            theme.blue
+        } else {
+            theme.selection
+        }))
+        .title(Span::styled(
+            " Chats ",
+            Style::new()
+                .fg(if sidebar_focused {
+                    // Emphasis: title switches from blue to cyan.
+                    theme.cyan
+                } else {
+                    theme.blue
+                })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(theme.panel));
+    // The hit-test inner rect: the block's top border row and side
+    // columns are NOT list rows, so clicks there must not select.
+    let inner = block.inner(area);
+
+    // Name budget of a list row: the lifecycle dot glyph plus its trailing
+    // space occupy the first two inner columns; the remaining columns are the
+    // width a name wraps into.
+    let name_width = (inner.width as usize).saturating_sub(SIDEBAR_DOT_CELL_WIDTH);
+    // Per-visible-row chat index, and the terminal row each chat's block
+    // starts on: the two halves of the multi-row hit-test seam. `inner.y` is
+    // added to the tops so the router can pass an absolute frame row.
+    let mut row_chats: Vec<usize> = Vec::new();
+    let mut block_tops: Vec<usize> = Vec::new();
     let items: Vec<ListItem> = app
         .chats
         .iter()
@@ -329,43 +436,33 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 // inactive color, no highlight rides along.
                 Style::new().fg(theme.dim).add_modifier(Modifier::BOLD)
             } else {
-                // Multi-line titles collapse to spaces inside the one-row
-                // sidebar entry (Shift+Enter allows `\n` in
-                // names).
                 Style::new().fg(theme.dim)
             };
-            let name = chat.name.replace('\n', " ");
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{dot_glyph} "), Style::new().fg(dot_color)),
-                Span::styled(name, name_style),
-            ]))
+            // Multi-line titles collapse to spaces before wrapping
+            // (Shift+Enter allows `\n` in names): a name is one wrapped
+            // stream, never a hard row break.
+            let collapsed = chat.name.replace('\n', " ");
+            let rows = sidebar_name_rows(&collapsed, name_width);
+            block_tops.push(inner.y as usize + row_chats.len());
+            row_chats.extend(std::iter::repeat_n(i, rows.len()));
+            // Row 0 carries the lifecycle dot; continuation rows indent by
+            // the dot cell so the name reads as one block.
+            let indent = " ".repeat(SIDEBAR_DOT_CELL_WIDTH);
+            let lines: Vec<Line> = rows
+                .into_iter()
+                .enumerate()
+                .map(|(r, text)| {
+                    let head = if r == 0 {
+                        Span::styled(format!("{dot_glyph} "), Style::new().fg(dot_color))
+                    } else {
+                        Span::raw(indent.clone())
+                    };
+                    Line::from(vec![head, Span::styled(text, name_style)])
+                })
+                .collect();
+            ListItem::new(Text::from(lines))
         })
         .collect();
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if sidebar_focused {
-            // Emphasis: the focused sidebar's outline lifts to blue.
-            theme.blue
-        } else {
-            theme.selection
-        }))
-        .title(Span::styled(
-            " Chats ",
-            Style::new()
-                .fg(if sidebar_focused {
-                    // Emphasis: title switches from blue to cyan.
-                    theme.cyan
-                } else {
-                    theme.blue
-                })
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::new().bg(theme.panel));
-    // The hit-test inner rect: the block's top border row and side
-    // columns are NOT list rows, so clicks there must not select.
-    let inner = block.inner(area);
 
     let list = List::new(items)
         .block(block)
@@ -377,13 +474,20 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
     // Render-fed geometry seam for the mouse router (same pattern as
     // chat_geometry): the list's inner rect plus the ListState offset
-    // AFTER the render: ratatui scrolls the list internally when threads
-    // overflow, so the offset is read from the state object, not
-    // recomputed from app.active. Refreshed every frame like
-    // chat_geometry; no explicit reset path anywhere.
+    // AFTER the render, plus the per-item heights and their first rows —
+    // ratatui scrolls the list internally when threads overflow, so the
+    // offset and the row model are read from the state object and THIS
+    // frame's layout, never recomputed from app.active. Refreshed every
+    // frame like chat_geometry; no explicit reset path anywhere.
+    //
+    // `row_chats` covers the FULL list (offset 0), so the router indexes it
+    // with `offset + (y - inner.y)`: a click on the second or third row of a
+    // wrapped name resolves to that name's chat.
     app.sidebar_geometry = Some(crate::app::SidebarGeometry {
         inner,
         offset: state.offset(),
+        row_chats,
+        row_tops: block_tops,
     });
 
     // Extend the sidebar's right rounded border down through EVERY bottom
@@ -427,10 +531,18 @@ fn render_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 /// own label — restored pre-label history, fieldless frames — stay plain;
 /// the thread's last-known model lives in the status strip, not here.
 ///
+/// The `created_at` stamp renders as a trailing DIM `HH:MM` in the reader's
+/// local time — the messenger convention — and is simply absent for rows
+/// restored from a pre-timestamp snapshot.
+///
 /// Returns a single logical line: a long model name simply wraps within it,
 /// and the row-accurate scroll math counts display rows, so nothing else
 /// has to change.
-fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::MdLine {
+fn assistant_header_line(
+    model_label: Option<&str>,
+    created_at: Option<u64>,
+    theme: &Theme,
+) -> markdown::MdLine {
     let mut spans = vec![Span::styled(
         "\u{25cf} Chibi",
         Style::new().fg(theme.blue).add_modifier(Modifier::BOLD),
@@ -442,7 +554,26 @@ fn assistant_header_line(model_label: Option<&str>, theme: &Theme) -> markdown::
             Style::new().fg(theme.dim),
         ));
     }
+    spans.extend(timestamp_span(created_at, theme));
     Line::from(spans)
+}
+
+/// Dim ` HH:MM` suffix carrying the message's creation instant, or `None`
+/// for an unstamped row.
+///
+/// Both role headers share it so the two author lines read alike. The stamp
+/// is the row's own (persisted with the snapshot): a reloaded transcript
+/// shows when each bubble was sent, and a pre-timestamp row shows nothing
+/// rather than a made-up time. Never panics — an instant the platform
+/// cannot convert renders the `--:--` placeholder (see
+/// [`crate::localtime::fmt_hhmm`]).
+fn timestamp_span(created_at: Option<u64>, theme: &Theme) -> Option<Span<'static>> {
+    created_at.map(|secs| {
+        Span::styled(
+            format!("  {}", crate::localtime::fmt_hhmm(secs)),
+            Style::new().fg(theme.dim),
+        )
+    })
 }
 
 /// how many trailing lines of the raw reasoning trace the
@@ -575,17 +706,23 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
         }
         match msg.role {
             Role::User => {
-                lines.push(Line::from(Span::styled(
+                let mut spans = vec![Span::styled(
                     "\u{25cf} You",
                     Style::new().fg(theme.orange).add_modifier(Modifier::BOLD),
-                )));
+                )];
+                spans.extend(timestamp_span(msg.created_at, theme));
+                lines.push(Line::from(spans));
             }
             Role::Assistant => {
                 // Each answer renders ONLY the label captured when it was
                 // produced (persisted with the snapshot): no fallback to the
                 // thread's current model — a mid-chat switch must never
                 // re-label past answers.
-                lines.push(assistant_header_line(msg.model_label(), theme));
+                lines.push(assistant_header_line(
+                    msg.model_label(),
+                    msg.created_at,
+                    theme,
+                ));
             }
         }
         if Some(msg_index) == streaming_row {
@@ -792,6 +929,43 @@ fn status_strip_title<'a>(
     Some(Line::from(Span::styled(text, Style::new().fg(theme.dim))).alignment(Alignment::Right))
 }
 
+/// Wrap one sidebar chat name into the display rows it occupies at
+/// `name_width` columns: word-boundary greedy wrap through the shared
+/// [`crate::app::wrap_line`] seam, capped at [`SIDEBAR_NAME_MAX_ROWS`]. Rows
+/// past the cap are dropped and the last kept row is re-cut to `name_width -
+/// 1` columns with a trailing `…`, so a very long title reads as truncated
+/// instead of silently disappearing. Always at least one row (an empty name
+/// still paints its dot row).
+fn sidebar_name_rows(name: &str, name_width: usize) -> Vec<String> {
+    let width = name_width.max(1);
+    let mut rows = crate::app::wrap_line(name, width);
+    if rows.len() > SIDEBAR_NAME_MAX_ROWS {
+        rows.truncate(SIDEBAR_NAME_MAX_ROWS);
+        let last = rows.last_mut().expect("truncate keeps max-rows rows");
+        *last = format!(
+            "{}\u{2026}",
+            truncate_to_width(last, width.saturating_sub(1))
+        );
+    }
+    rows
+}
+
+/// Longest char prefix of `text` within `max` display columns (unicode-width,
+/// so a wide glyph is dropped whole rather than straddling the cut).
+fn truncate_to_width(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > max {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out
+}
+
 /// left-truncate to at most `max` display columns,
 /// replacing the dropped head with a single-column ellipsis. The strip is
 /// right-aligned, so its TAIL (the working directory and the model) is
@@ -855,12 +1029,13 @@ fn render_scroll_hint(f: &mut Frame, at_bottom: bool, theme: &Theme, spinner_lin
 /// the editor block is tinted with the
 /// input-panel background across EVERY of its rows and carries a cyan `❯`
 /// marker on its FIRST row. The typed text renders INSIDE the remaining
-/// columns over the full block height — the editor keeps the cursor
-/// visible inside that viewport automatically, scrolling the LAST visible
-/// row toward the caret once the buffer exceeds
-/// [`MAX_INPUT_LINES`](crate::app::MAX_INPUT_LINES) lines.
+/// columns over the full block height — the editor keeps the caret
+/// visible inside that viewport automatically, scrolling the VISUAL
+/// (soft-wrapped) rows toward the caret once the draft outgrows the block,
+/// and `⏎ send` is repeated flush right on the block's first row when the
+/// draft wraps onto more than one.
 fn render_input(f: &mut Frame, app: &mut App, theme: &Theme, chat_column: Rect) {
-    // Panel tint confined to the CHAT COLUMN (cols 26..width @120): the
+    // Panel tint confined to the CHAT COLUMN (cols 30..width @120): the
     // divider cell and the sidebar strip keep `theme.panel` (approved
     // geometry).
     f.buffer_mut()

@@ -21,6 +21,7 @@ pub mod diag;
 pub mod history;
 pub mod input;
 pub mod live;
+pub mod localtime;
 pub mod markdown;
 pub mod md_cache;
 pub mod mock;
@@ -33,6 +34,7 @@ pub mod setup_screen;
 pub mod splash;
 pub mod theme;
 pub mod ui;
+pub mod ui_store;
 
 // Public re-exports: the protocol type surface consumed by `backend_client`
 // — keep stable.
@@ -63,6 +65,9 @@ pub use crate::backend_settings::{
 
 // Public re-exports: persisted backend binary path (installer handoff).
 pub use crate::backend_store::{load_backend_path, resolve_root, save_backend_path};
+
+// Public re-exports: persisted UI layout preferences (sidebar width).
+pub use crate::ui_store::{load_sidebar_width, save_sidebar_width};
 
 // Public re-exports: config-screen component surface (both shells).
 pub use crate::config_screen::{

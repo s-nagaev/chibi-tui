@@ -239,6 +239,14 @@ async fn main() -> io::Result<()> {
         }
     };
 
+    // Sidebar width: restore the persisted choice (corrupt/missing file →
+    // the default), clamped to the live frame so a wide value saved on a
+    // big monitor can never starve the chat pane on a small one. Saved
+    // again only on drag end (best-effort, in the mouse router).
+    let frame_w = terminal.size().map(|s| s.width).unwrap_or(u16::MAX);
+    app.sidebar_width =
+        chibi_tui::ui::clamp_sidebar_width(chibi_tui::ui_store::load_sidebar_width(), frame_w);
+
     // wire the strip's cwd source for BOTH backends (the
     // CLI flag defaults to the process cwd, so mock mode has it too). Read
     // reactively by the renderer each frame; the workspace is CLI-only
@@ -380,6 +388,11 @@ async fn connect_live(
             // refresh the advertised commands after a
             // reconnect too, the new session re-handshakes.
             app.set_backend_commands(live.backend_commands().to_vec());
+            // Fresh backend session: no subagents of the old one survive a
+            // reconnect, so sweep every thread's counters (the disconnect
+            // sweep usually already did; this is idempotent defense-in-depth
+            // for paths that reach a reconnect without a Disconnected event).
+            app.clear_all_subagent_counts();
             app.dismiss_error();
             // Session-scoped continuation answers ride the new connection's
             // own pump; the old pump retired with its closed channel.

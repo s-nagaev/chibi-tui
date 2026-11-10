@@ -125,8 +125,8 @@ fn rename_editor_renders_draft_with_right_aligned_hint() {
 }
 
 /// the input row carries the panel tint background —
-/// but ONLY inside the chat column (cols 26..=118 @120). The divider cell
-/// (col 25) and the sidebar strip (cols 0..=24) must NOT get the tint.
+/// but ONLY inside the chat column (cols 30..=118 @120). The divider cell
+/// (col 29) and the sidebar strip (cols 0..=28) must NOT get the tint.
 #[test]
 fn input_row_has_panel_tint_background() {
     let theme = Theme::tokyo_night();
@@ -140,7 +140,7 @@ fn input_row_has_panel_tint_background() {
         "sidebar strip must NOT get the input tint"
     );
     assert_eq!(
-        buf[(26, y)].bg,
+        buf[(30, y)].bg,
         theme.input_panel_bg,
         "empty input row must carry the panel tint from the chat-column start"
     );
@@ -150,7 +150,7 @@ fn input_row_has_panel_tint_background() {
         "tint must run to the chat column's right edge"
     );
     assert_ne!(
-        buf[(25, y)].bg,
+        buf[(29, y)].bg,
         theme.input_panel_bg,
         "divider cell must NOT get the input tint"
     );
@@ -168,7 +168,7 @@ fn input_row_has_panel_tint_background() {
 // restored canonical render-level checks ------
 
 /// Exactly ONE `│` glyph on the input row, at the sidebar-border column
-/// (col 25), keeping its own bg — NOT the input tint. Input tint confined
+/// (col 29), keeping its own bg — NOT the input tint. Input tint confined
 /// to sampled chat-column cells; nothing left of the divider is tinted.
 #[test]
 fn sidebar_divider_unbroken_through_input_row() {
@@ -180,16 +180,16 @@ fn sidebar_divider_unbroken_through_input_row() {
     let divider_cols: Vec<u16> = (0..buf.area.width)
         .filter(|&x| buf[(x, y)].symbol() == "\u{2502}")
         .collect();
-    assert_eq!(divider_cols, vec![25], "exactly one divider cell");
+    assert_eq!(divider_cols, vec![29], "exactly one divider cell");
 
-    let divider = &buf[(25, y)];
+    let divider = &buf[(29, y)];
     assert_eq!(divider.fg, theme.selection, "divider fg");
     assert_ne!(
         divider.bg, theme.input_panel_bg,
         "divider cell must NOT carry the input tint"
     );
 
-    for x in [26u16, 60, 100, 112] {
+    for x in [30u16, 60, 100, 112] {
         assert_eq!(
             buf[(x, y)].bg,
             theme.input_panel_bg,
@@ -216,7 +216,7 @@ fn rename_line_shares_marker_and_panel_tint() {
     let y = buf.area.height - 2;
 
     assert_eq!(
-        buf[(26, y)].symbol(),
+        buf[(30, y)].symbol(),
         "\u{276f}",
         "marker must sit at the chat-column start in rename mode too"
     );
@@ -226,7 +226,7 @@ fn rename_line_shares_marker_and_panel_tint() {
         "rename line must carry the input-panel tint mid-row"
     );
     assert_ne!(
-        buf[(25, y)].bg,
+        buf[(29, y)].bg,
         theme.input_panel_bg,
         "rename tint must not leak onto the divider cell"
     );
@@ -238,7 +238,7 @@ fn rename_line_shares_marker_and_panel_tint() {
 /// placeholder end and chip start, margin cell past the column untouched.
 #[test]
 fn send_chip_right_edge_and_baseline_math_with_marker() {
-    const CHAT_X0: u16 = 26;
+    const CHAT_X0: u16 = 30;
     let theme = Theme::tokyo_night();
     let chat_column_width = |buf_area_width: u16| -> u16 { buf_area_width - 1 - CHAT_X0 };
 

@@ -34,3 +34,4 @@ mod unread;
 mod usage_thoughts;
 mod viewer_ring;
 mod viewer_scroll;
+mod wrap_word;
