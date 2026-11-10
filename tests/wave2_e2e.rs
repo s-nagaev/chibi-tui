@@ -1188,6 +1188,13 @@ async fn streaming_md_deltas_render_completed_block_then_reconcile_to_golden() {
     );
 
     // ---- golden compare: streamed final render == non-streamed render ----
+    // The two renders below may happen on opposite sides of a minute
+    // boundary; drop the HH:MM stamps so the compare stays time-independent.
+    for chat in &mut app.chats {
+        for msg in &mut chat.messages {
+            msg.created_at = None;
+        }
+    }
     let streamed_rows = render_grid(&mut app);
     let _ = live.shutdown().await;
 
@@ -1199,6 +1206,11 @@ async fn streaming_md_deltas_render_completed_block_then_reconcile_to_golden() {
     fresh.chats[0].id = app.chats[0].id.clone();
     fresh.begin_request(&submitted);
     fresh.apply_backend_event(result_event.expect("terminal Result present"));
+    for chat in &mut fresh.chats {
+        for msg in &mut chat.messages {
+            msg.created_at = None;
+        }
+    }
     let fresh_rows = render_grid(&mut fresh);
 
     assert_eq!(
