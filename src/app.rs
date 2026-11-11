@@ -572,6 +572,17 @@ pub struct Chat {
     /// Prompts submitted while a request was already in flight; sent FIFO as
     /// soon as the current request reaches a terminal event.
     pub queue: VecDeque<String>,
+    /// Background continuations that completed while THIS chat's streaming
+    /// answer was still pending. Appending one straight to `messages` would
+    /// park it BELOW the live placeholder row, so the later stream answer
+    /// fills its row ABOVE the earlier continuation content. Instead the
+    /// continuation is held here (arrival order) and spliced in right below
+    /// the resolved stream row by the terminal-resolution helpers
+    /// (`resolve_live_placeholder`, `resolve_live_placeholder_with_error`,
+    /// `drop_live_pending_placeholder` — the single owners of the flush
+    /// decision). Session-only: never persisted (same lifecycle as
+    /// `streaming`).
+    pub pending_continuations: Vec<Message>,
     /// a visible reply (or an inline error)
     /// landed in this chat while it was NOT the selected one. Cleared the
     /// moment the chat is selected (see `App::select_chat`). Session-only:
@@ -630,6 +641,7 @@ impl Chat {
             messages: Vec::new(),
             lifecycle: ChatLifecycle::Idle,
             queue: VecDeque::new(),
+            pending_continuations: Vec::new(),
             unread: false,
             last_usage: None,
             last_model: None,
@@ -2800,7 +2812,9 @@ impl App {
     /// placeholder (the user bubble already exists from enqueue time), that
     /// chat's lifecycle → `Awaiting`. Returns the full [`Submitted`] bundle
     /// so the event loop can send it to the backend. `None` when nothing is
-    /// queued for that thread.
+    /// queued for that thread, or when the chat's request is still in flight
+    /// (the drain must never start a second request over a live stream; the
+    /// next terminal event re-triggers the drain).
     ///
     /// Note: unlike [`App::begin_request`] this works on ANY chat — the event
     /// loop uses it after terminal events, including for background chats.
@@ -2812,6 +2826,17 @@ impl App {
             self.touch_chat(index);
         }
         let chat = self.chats.iter_mut().find(|c| c.id == thread_id)?;
+        // Single owner of the swap decision: the FIFO may only advance when
+        // the chat's previous request has FULLY resolved. A drain that
+        // arrives while a stream is still pending (duplicate or reordered
+        // QueueDrain) must not pop a prompt, swap its queued marker into a
+        // second live placeholder or flip the lifecycle — the still-pending
+        // stream's own resolution would then target a displaced transcript
+        // and two requests would race for one chat. The next terminal event
+        // re-emits QueueDrain, so the prompt still drains afterwards.
+        if chat.lifecycle.is_busy() {
+            return None;
+        }
         let prompt = chat.queue.pop_front()?;
         // A dequeued prompt is a VISIBLE request start for THIS chat only:
         // its previous reasoning leaves the view, other chats keep theirs.
@@ -3181,6 +3206,9 @@ impl App {
                     if let Some(chat) = self.chats.iter_mut().find(|c| c.id == pending.thread_id) {
                         chat.messages.clear();
                         chat.queue.clear();
+                        // The transcript is gone: held continuations have
+                        // nothing to splice below any more.
+                        chat.pending_continuations.clear();
                         chat.last_thoughts = None;
                         chat.subagent_counts.clear();
                         chat.streaming = false;
@@ -4043,7 +4071,23 @@ impl App {
             message.thoughts = thoughts_payload.clone();
             // An out-of-band continuation is a message in its own right: it
             // appears now, so it is stamped now.
-            chat.messages.push(message.at(crate::history::now_unix()));
+            let message = message.at(crate::history::now_unix());
+            if chat
+                .messages
+                .iter()
+                .any(|m| m.pending && !is_queued_marker(m))
+            {
+                // A stream answer is still pending in this transcript: the
+                // live placeholder row sits ABOVE where a straight append
+                // would land, so the later stream answer would fill its row
+                // above this earlier continuation. Hold the continuation in
+                // arrival order; the terminal-resolution helpers splice it
+                // in below the resolved row (see
+                // `Chat::pending_continuations`).
+                chat.pending_continuations.push(message);
+            } else {
+                chat.messages.push(message);
+            }
             // Per-chat thoughts: a visible answer of the owning chat
             // carrying reasoning is a legitimate writer of its block.
             // Continuation reasoning is a CHAIN member, not a replacement:
@@ -4396,6 +4440,20 @@ fn find_live_placeholder_position(chat: &Chat, event_request_id: Option<u64>) ->
     }
 }
 
+/// Splice every continuation held while a stream was pending
+/// ([`Chat::pending_continuations`]) into the transcript directly below
+/// `below_pos`, in arrival order. `below_pos` is the index of the row that
+/// just resolved (`resolve_live_placeholder`,
+/// `resolve_live_placeholder_with_error`) or the slot of the row that was
+/// just dropped (`drop_live_pending_placeholder`), so the held content can
+/// never render above the answer the stream placed into that row.
+fn flush_held_continuations(chat: &mut Chat, below_pos: usize) {
+    let held = std::mem::take(&mut chat.pending_continuations);
+    for (offset, message) in held.into_iter().enumerate() {
+        chat.messages.insert(below_pos + offset, message);
+    }
+}
+
 /// Resolve the live pending placeholder of `chat` into a finished message.
 ///
 /// `event_request_id` keys the row (see
@@ -4426,6 +4484,9 @@ fn resolve_live_placeholder(
     row.model = model;
     row.thoughts = thoughts;
     row.created_at.get_or_insert_with(crate::history::now_unix);
+    // Continuations that completed while THIS answer was streaming land
+    // right below it, in arrival order (see `flush_held_continuations`).
+    flush_held_continuations(chat, pos + 1);
     true
 }
 
@@ -4453,6 +4514,8 @@ fn resolve_live_placeholder_with_error(
     row.pending = false;
     // Same rule as a successful resolution: the clock is the request's.
     row.created_at.get_or_insert_with(crate::history::now_unix);
+    // Continuations held behind this failed stream land below its row too.
+    flush_held_continuations(chat, pos + 1);
     true
 }
 /// is this answer content invisible-by-contract?
@@ -4484,6 +4547,10 @@ fn drop_live_pending_placeholder(chat: &mut Chat, event_request_id: Option<u64>)
     match find_live_placeholder_position(chat, event_request_id) {
         Some(pos) => {
             chat.messages.remove(pos);
+            // An absorbed result still ends the stream: continuations held
+            // behind it splice into the row's slot (see
+            // `flush_held_continuations`).
+            flush_held_continuations(chat, pos);
             true
         }
         None => false,

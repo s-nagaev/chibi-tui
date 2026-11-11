@@ -3,6 +3,7 @@ mod cancel;
 mod chat_lifecycle;
 mod chat_switch;
 mod clone;
+mod continuation_order;
 mod delete_confirm;
 mod error_popup;
 mod event_routing;

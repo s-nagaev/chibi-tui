@@ -149,6 +149,21 @@ fn queued_multiline_prompt_preserves_newlines_through_the_fifo() {
     );
 
     let thread = app.chats[0].id.clone();
+
+    // The terminal event for "in flight" precedes the drain signal in the
+    // UI channel (see `live::per_request_glue`), so the chat is Idle by the
+    // time the FIFO pump runs. A drain over a still-busy chat is refused
+    // (the queued-marker swap must never race a live stream).
+    let first_event_id = chibi_tui::live::wire_thread_id(&first.request_id) as u64;
+    app.apply_backend_event(BackendEvent::Result {
+        request_id: first_event_id,
+        markdown: "answer".into(),
+        thread_id: thread.clone(),
+        model: None,
+        usage: None,
+        thoughts: None,
+    });
+
     let drained = app
         .dequeue_next_for(&thread)
         .expect("queued prompt drained");
