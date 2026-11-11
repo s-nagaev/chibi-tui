@@ -581,9 +581,9 @@ fn timestamp_span(created_at: Option<u64>, theme: &Theme) -> Option<Span<'static
 /// relevant part, so the head is dropped, not the tail.
 const THOUGHTS_DISPLAY_LINES: usize = 10;
 
-/// the dim reasoning block rendered ABOVE the latest
-/// assistant answer, sourced from the active chat's session-only
-/// `Chat::last_thoughts`.
+/// the dim reasoning block rendered ABOVE the
+/// assistant answer that produced it, sourced from that message's
+/// session-only `Message::thoughts`.
 ///
 /// Static plain text (no streaming, no markdown interpretation, no
 /// interactivity, no scrolling UI): every line paints in the [`Theme::dim`]
@@ -668,15 +668,6 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     // the exact line this renderer paints.
     let mut lines: Vec<markdown::MdLine> = Vec::new();
     let mut msg_ranges: Vec<(usize, usize)> = Vec::new();
-    // the reasoning block belongs to the LATEST answer —
-    // it renders directly above that message's role header, inside its
-    // msg_range, so the search-jump row math stays consistent. Toggle OFF
-    // or absent/whitespace-only thoughts keep the transcript byte-identical
-    // to the earlier layout.
-    let last_assistant = chat
-        .messages
-        .iter()
-        .rposition(|m| m.role == Role::Assistant);
     // The actively-streaming row (incremental stream render): completed
     // top-level blocks paint as real markdown through the prefix cache
     // (stable anchor → cache hits between delta frames); only the
@@ -691,18 +682,25 @@ fn render_chat(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, spinner_
     } else {
         None
     };
-    let thoughts = app
-        .thoughts_visible
-        .then_some(chat.last_thoughts.as_deref())
-        .flatten()
-        .map(str::trim)
-        .filter(|t| !t.is_empty());
+    // The reasoning block is attached to the message that PRODUCED it
+    // (`Message::thoughts`, stamped by the terminal frame or the
+    // continuation that carried it): it renders directly above that
+    // message's role header, inside its msg_range, so the search-jump row
+    // math stays consistent — and a pending or queued row can never show a
+    // block (nor can a block survive the drop of its producing row as
+    // standalone content between assistant messages). Toggle OFF or
+    // absent/whitespace-only thoughts keep the transcript byte-identical to
+    // the no-thoughts layout.
     for (msg_index, msg) in chat.messages.iter().enumerate() {
         let start = lines.len();
-        if Some(msg_index) == last_assistant {
-            if let Some(t) = thoughts {
-                lines.extend(thoughts_block_lines(t, theme));
-            }
+        if let Some(t) = app
+            .thoughts_visible
+            .then_some(msg.thoughts.as_deref())
+            .flatten()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            lines.extend(thoughts_block_lines(t, theme));
         }
         match msg.role {
             Role::User => {

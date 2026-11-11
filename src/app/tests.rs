@@ -14,6 +14,7 @@ mod log_navigation;
 mod log_search_copy;
 mod log_viewer;
 mod log_wrap;
+mod message_lifecycle;
 mod model_label;
 mod model_picker;
 mod queue_drain;

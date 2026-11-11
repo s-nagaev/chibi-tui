@@ -42,6 +42,27 @@ pub struct Message {
     /// instead of inventing one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
+    /// Protocol request id this row belongs to (session-only; never
+    /// persisted).
+    ///
+    /// Pending placeholder rows are stamped with the id of the request that
+    /// created them, so a terminal frame resolves ITS OWN row exactly once,
+    /// wherever the row sits in the transcript and whenever the frame
+    /// arrives — including after the chat's lifecycle already moved on to a
+    /// newer request. Unstamped rows (legacy scaffolding) still resolve the
+    /// old newest-first way.
+    #[serde(skip)]
+    pub request_id: Option<String>,
+    /// Reasoning trace the producing request returned, attached to the
+    /// answer that produced it (session-only view state, like
+    /// [`crate::app::Chat::last_thoughts`]).
+    ///
+    /// Pending and queued rows never carry a block: it is stamped only when
+    /// a terminal frame resolves its row or a continuation message lands, so
+    /// the block can never render as standalone content between assistant
+    /// messages.
+    #[serde(skip)]
+    pub thoughts: Option<String>,
 }
 
 impl Message {
@@ -52,6 +73,8 @@ impl Message {
             pending: false,
             model: None,
             created_at: None,
+            request_id: None,
+            thoughts: None,
         }
     }
 
@@ -62,6 +85,8 @@ impl Message {
             pending: false,
             model: None,
             created_at: None,
+            request_id: None,
+            thoughts: None,
         }
     }
 
@@ -73,6 +98,8 @@ impl Message {
             pending: false,
             model: Some(model.into()),
             created_at: None,
+            request_id: None,
+            thoughts: None,
         }
     }
 
@@ -84,6 +111,8 @@ impl Message {
             pending: true,
             model: None,
             created_at: None,
+            request_id: None,
+            thoughts: None,
         }
     }
 
@@ -97,6 +126,8 @@ impl Message {
             pending: true,
             model: None,
             created_at: None,
+            request_id: None,
+            thoughts: None,
         }
     }
 
@@ -109,6 +140,17 @@ impl Message {
     /// one — restored pre-timestamp history — simply renders no time.
     pub fn at(mut self, created_at: u64) -> Self {
         self.created_at = Some(created_at);
+        self
+    }
+
+    /// Stamp the row with the protocol request id it belongs to.
+    ///
+    /// Pending placeholder rows carry the id of the request that created
+    /// them: a terminal frame (`result`, `error`) then resolves exactly that
+    /// row, never a newer request's placeholder that happens to sit after
+    /// it in the transcript.
+    pub fn for_request(mut self, request_id: &str) -> Self {
+        self.request_id = Some(request_id.to_owned());
         self
     }
 
