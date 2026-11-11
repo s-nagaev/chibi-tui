@@ -27,8 +27,8 @@ const PROMPT_MARKER_WIDTH: u16 = 2;
 /// `ui.json` fallback.
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
 
-/// Widest a sidebar may ever be: half the frame, so neither pane can be
-/// starved past usefulness on a narrow terminal.
+/// Narrowest a sidebar may ever shrink to, so it stays usable on a narrow
+/// terminal; the ceiling is half the frame (see `clamp_sidebar_width`).
 const SIDEBAR_MIN_WIDTH: u16 = 20;
 
 /// Compute how many lines must be hidden from the TOP of the message list.
