@@ -650,8 +650,27 @@ fn flush_code_block(out: &mut Vec<MdLine>, body: &str, lang: &str, theme: &Theme
     )));
 }
 
-/// Render a collected table with column borders, a bold header row and
-/// per-column alignment.
+/// Build one horizontal table border line: the `left` border, then per column
+/// a run of `w + 1` dashes separated by `junction`, closed by `right`.
+///
+/// The `w + 1` run is what makes every junction REPLACE the border slot of the
+/// rows above/below, so `┬`/`┼`/`┴` land exactly on the `│` columns. The top,
+/// header separator and bottom borders all share this construction.
+fn table_border_line(widths: &[usize], left: char, junction: char, right: char) -> String {
+    let mut s = String::new();
+    s.push(left);
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            s.push(junction);
+        }
+        s.push_str(&"\u{2500}".repeat(w + 1));
+    }
+    s.push(right);
+    s
+}
+
+/// Render a collected table with a full outer frame, column borders, a bold
+/// header row and per-column alignment.
 fn render_table(out: &mut Vec<MdLine>, rows: &[Vec<String>], aligns: &[Alignment], theme: &Theme) {
     if rows.is_empty() {
         return;
@@ -702,32 +721,30 @@ fn render_table(out: &mut Vec<MdLine>, rows: &[Vec<String>], aligns: &[Alignment
 
     // Junction alignment: in `make_row` each column spans `w + 2` cells
     // border-to-border (`w` content + 1 leading pad + 1 trailing pad), and
-    // the border/junction character occupies one of those slots. The
-    // separator must therefore emit `w + 1` dashes per segment, with `┼`
-    // REPLACING the next border. Emitting `w + 2` here added one extra dash
-    // per column, so drift accumulated left-to-right (+1, +2, …) and every
-    // subsequent `┼`/`┤` landed past the `│` above/below — the reported
-    // "table shift".
-    let separator = {
-        let mut s = String::from("\u{251c}");
-        for (i, w) in widths.iter().enumerate() {
-            if i > 0 {
-                s.push('\u{253c}');
-            }
-            s.push_str(&"\u{2500}".repeat(w + 1));
-        }
-        s.push('\u{2524}');
-        Span::styled(s, Style::new().fg(theme.dim))
+    // the border/junction character occupies one of those slots. Every
+    // horizontal border must therefore emit `w + 1` dashes per segment, with
+    // the junction REPLACING the next border. Emitting `w + 2` added one extra
+    // dash per column, so drift accumulated left-to-right (+1, +2, …) and every
+    // subsequent junction landed past the `│` above/below — the reported
+    // "table shift". Top, header separator and bottom borders share
+    // `table_border_line`, so all their junctions stay on the same columns.
+    let border = |left: char, junction: char, right: char| -> Line<'static> {
+        Line::from(Span::styled(
+            table_border_line(&widths, left, junction, right),
+            Style::new().fg(theme.dim),
+        ))
     };
 
     let mut iter = rows.iter();
+    out.push(border('\u{250c}', '\u{252c}', '\u{2510}')); // ┌ ┬ ┐
     if let Some(head) = iter.next() {
         out.push(make_row(head, true));
     }
-    out.push(Line::from(separator));
+    out.push(border('\u{251c}', '\u{253c}', '\u{2524}')); // ├ ┼ ┤
     for row in iter {
         out.push(make_row(row, false));
     }
+    out.push(border('\u{2514}', '\u{2534}', '\u{2518}')); // └ ┴ ┘
 }
 
 /// Map an RGB color to ratatui.
@@ -741,8 +758,11 @@ mod tests {
     use crate::theme::Theme;
     use unicode_width::UnicodeWidthChar;
 
-    /// Border/junction characters used by the table renderer.
-    const TABLE_BORDERS: &str = "|\u{2502}\u{251c}\u{2524}\u{252c}\u{2534}\u{253c}";
+    /// Border/junction characters used by the table renderer: row borders
+    /// (`\u{2502}`), the header separator (`\u{251c} \u{253c} \u{2524}`) and the outer frame
+    /// (`\u{250c} \u{252c} \u{2510} \u{2514} \u{2534} \u{2518}`).
+    const TABLE_BORDERS: &str =
+        "|\u{2502}\u{250c}\u{2510}\u{2514}\u{2518}\u{251c}\u{2524}\u{252c}\u{2534}\u{253c}";
 
     /// Extract the char positions of all border chars in a rendered line.
     fn border_positions(line: &MdLine) -> Vec<usize> {
@@ -990,9 +1010,15 @@ mod tests {
             .into_iter()
             .filter(|l| !border_positions(l).is_empty())
             .collect();
-        assert_eq!(lines.len(), 5, "header+sep+3 data rows expected");
+        assert_eq!(
+            lines.len(),
+            7,
+            "top border + header + sep + 3 data rows + bottom border expected"
+        );
 
-        let reference = border_positions(&lines[0]); // header row borders
+        // Row borders live on the header row (index 1); the outer frame and
+        // the separator must repeat those positions exactly.
+        let reference = border_positions(&lines[1]);
         for l in lines.iter() {
             assert_eq!(
                 border_positions(l),
@@ -1000,6 +1026,16 @@ mod tests {
                 "border/junction positions diverge between rows"
             );
         }
+        assert_eq!(
+            border_positions(&lines[0]),
+            reference,
+            "top border junctions must meet the row borders"
+        );
+        assert_eq!(
+            border_positions(&lines[6]),
+            reference,
+            "bottom border junctions must meet the row borders"
+        );
     }
 
     /// Wide characters must be measured in display columns, not bytes.
@@ -1014,14 +1050,157 @@ mod tests {
             .into_iter()
             .filter(|l| !border_positions(l).is_empty())
             .collect();
-        assert_eq!(lines.len(), 3, "header+sep+1 data row expected");
+        assert_eq!(
+            lines.len(),
+            5,
+            "top border + header + sep + 1 data row + bottom border expected"
+        );
 
-        let reference = display_border_positions(&lines[0]);
+        // Display columns from the header row (index 1): the outer frame and
+        // the separator must repeat those positions even with wide cells.
+        let reference = display_border_positions(&lines[1]);
         for l in lines.iter() {
             assert_eq!(
                 display_border_positions(l),
                 reference,
                 "display-column positions diverge between rows with wide chars"
+            );
+        }
+        assert_eq!(
+            display_border_positions(&lines[0]),
+            reference,
+            "top border junctions must align in display columns"
+        );
+        assert_eq!(
+            display_border_positions(&lines[4]),
+            reference,
+            "bottom border junctions must align in display columns"
+        );
+    }
+
+    /// The table must be a CLOSED frame: a `\u{250c}\u{2500}\u{252c}\u{2500}\u{2510}` line above the header
+    /// and a `\u{2514}\u{2500}\u{2534}\u{2500}\u{2518}` line below the last data row, with every outer
+    /// junction landing on the same display column as the `\u{2502}` of the rows.
+    #[test]
+    fn table_renders_a_closed_outer_frame() {
+        let theme = Theme::tokyo_night();
+        let md = "| Model | Context |\n|---|---:|\n| gpt-x | 128 |\n";
+        let lines: Vec<MdLine> = render(md, &theme)
+            .into_iter()
+            .filter(|l| !border_positions(l).is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            5,
+            "top + header + sep + 1 data row + bottom expected"
+        );
+
+        let top = to_plain(&lines[0..1]);
+        let bottom = to_plain(&lines[4..5]);
+        assert!(
+            top.starts_with('\u{250c}') && top.ends_with('\u{2510}'),
+            "top frame corners missing: {top:?}"
+        );
+        assert!(top.contains('\u{252c}'), "top junction missing: {top:?}");
+        assert!(
+            bottom.starts_with('\u{2514}') && bottom.ends_with('\u{2518}'),
+            "bottom frame corners missing: {bottom:?}"
+        );
+        assert!(
+            bottom.contains('\u{2534}'),
+            "bottom junction missing: {bottom:?}"
+        );
+
+        let reference = display_border_positions(&lines[1]);
+        assert_eq!(
+            display_border_positions(&lines[0]),
+            reference,
+            "top border junctions must meet the row borders"
+        );
+        assert_eq!(
+            display_border_positions(&lines[4]),
+            reference,
+            "bottom border junctions must meet the row borders"
+        );
+    }
+
+    /// A ragged table (a row with fewer cells than the widest row) still gets
+    /// a complete frame, and the frame junctions stay on the row borders.
+    #[test]
+    fn ragged_table_renders_a_closed_frame() {
+        let theme = Theme::tokyo_night();
+        // The last data row carries a single cell, the header three.
+        let md = "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n| 4 |\n";
+        let lines: Vec<MdLine> = render(md, &theme)
+            .into_iter()
+            .filter(|l| !border_positions(l).is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            6,
+            "top + header + sep + 2 data rows + bottom expected"
+        );
+
+        let reference = border_positions(&lines[1]);
+        for l in lines.iter() {
+            assert_eq!(
+                border_positions(l),
+                reference,
+                "ragged table: border positions must still agree"
+            );
+        }
+        assert!(
+            to_plain(&lines[0..1]).contains('\u{252c}'),
+            "ragged table top border must carry junctions"
+        );
+        assert!(
+            to_plain(&lines[5..6]).contains('\u{2534}'),
+            "ragged table bottom border must carry junctions"
+        );
+    }
+
+    /// A single-column table frames too, with no interior junction.
+    #[test]
+    fn single_column_table_renders_a_closed_frame() {
+        let theme = Theme::tokyo_night();
+        let md = "| only |\n|---|\n| row |\n";
+        let lines: Vec<MdLine> = render(md, &theme)
+            .into_iter()
+            .filter(|l| !border_positions(l).is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            5,
+            "top + header + sep + 1 data row + bottom expected"
+        );
+
+        let top = to_plain(&lines[0..1]);
+        let bottom = to_plain(&lines[4..5]);
+        assert!(
+            top.starts_with('\u{250c}') && top.ends_with('\u{2510}'),
+            "top frame corners missing: {top:?}"
+        );
+        assert_eq!(
+            top.matches('\u{252c}').count(),
+            0,
+            "single column has no interior top junction: {top:?}"
+        );
+        assert!(
+            bottom.starts_with('\u{2514}') && bottom.ends_with('\u{2518}'),
+            "bottom frame corners missing: {bottom:?}"
+        );
+        assert_eq!(
+            bottom.matches('\u{2534}').count(),
+            0,
+            "single column has no interior bottom junction: {bottom:?}"
+        );
+
+        let reference = display_border_positions(&lines[1]);
+        for l in lines.iter() {
+            assert_eq!(
+                display_border_positions(l),
+                reference,
+                "single-column frame must align with the row borders"
             );
         }
     }
