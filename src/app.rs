@@ -4287,8 +4287,13 @@ impl App {
         let (lo_row, hi_row) = (lo.row.min(last), hi.row.min(last));
         let mut out = String::new();
         let mut prev_end: Option<(usize, usize)> = None; // (logical, row end)
-        for r in lo_row..=hi_row {
-            let meta = &geom.rows[r];
+        for (r, meta) in geom
+            .rows
+            .iter()
+            .enumerate()
+            .skip(lo_row)
+            .take(hi_row - lo_row + 1)
+        {
             match prev_end {
                 // Newline at real line breaks only — never at wrap points.
                 Some((prev_logical, _)) if prev_logical != meta.logical => out.push('\n'),
