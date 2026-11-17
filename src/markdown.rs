@@ -113,6 +113,16 @@ pub fn stable_prefix(md: &str) -> Option<StablePrefix> {
     anchor
 }
 
+/// Marker glyph for an UNORDERED list item at `depth` (1-based nesting
+/// level), cycling `•` → `◦` → `▪` with the depth.
+fn unordered_bullet(depth: usize) -> &'static str {
+    match depth.saturating_sub(1) % 3 {
+        0 => "\u{2022}",
+        1 => "\u{25e6}",
+        _ => "\u{25aa}",
+    }
+}
+
 /// Map a closed tag to its top-level block kind (None for inline /
 /// untracked structures — those still participate in depth bookkeeping).
 fn block_kind_of(end: TagEnd) -> Option<BlockKind> {
@@ -222,7 +232,15 @@ pub fn render(md: &str, theme: &Theme) -> Vec<MdLine> {
     let mut code_lang = String::new();
     let mut code_buf = String::new();
 
-    let mut list_counters: Vec<u64> = Vec::new();
+    // One entry per OPEN list, innermost last: `Some(next)` for an ordered
+    // list (the number its next item prints, bumped per item) and `None` for
+    // an unordered one. The length is therefore the nesting depth of the item
+    // being started, which drives both the indent and the bullet glyph.
+    let mut list_counters: Vec<Option<u64>> = Vec::new();
+    // Depth (1-based) of every OPEN list item, innermost last: a
+    // SoftBreak/HardBreak inside an item re-indents the continuation line so
+    // it stays aligned under the item text.
+    let mut item_depths: Vec<usize> = Vec::new();
     let mut quote_depth: usize = 0;
     let mut inline_style = Style::new();
 
@@ -354,7 +372,7 @@ pub fn render(md: &str, theme: &Theme) -> Vec<MdLine> {
             // ---------- lists ----------
             Event::Start(Tag::List(start)) => {
                 flush_line!();
-                list_counters.push(start.unwrap_or(1));
+                list_counters.push(start);
             }
             Event::End(TagEnd::List(_)) => {
                 list_counters.pop();
@@ -364,20 +382,31 @@ pub fn render(md: &str, theme: &Theme) -> Vec<MdLine> {
             }
             Event::Start(Tag::Item) => {
                 flush_line!();
+                // Nesting depth: 2 spaces of indent per level beyond the
+                // first. Plain (unstyled) whitespace — the indent carries no
+                // glyph of its own, so the orange bullet stays the only
+                // visible marker.
+                let depth = list_counters.len();
+                if depth > 1 {
+                    spans.push(Span::raw("  ".repeat(depth - 1)));
+                }
                 let bullet = match list_counters.last_mut() {
-                    Some(n) => {
+                    Some(Some(n)) => {
                         let s = format!("{n}.");
                         *n += 1;
                         s
                     }
-                    None => "\u{2022}".to_string(),
+                    // Unordered list: a depth-cycling glyph, never a number.
+                    _ => unordered_bullet(depth).to_string(),
                 };
                 spans.push(Span::styled(
                     format!("{bullet} "),
                     Style::new().fg(theme.orange),
                 ));
+                item_depths.push(depth);
             }
             Event::End(TagEnd::Item) => {
+                item_depths.pop();
                 flush_line!();
             }
 
@@ -477,6 +506,11 @@ pub fn render(md: &str, theme: &Theme) -> Vec<MdLine> {
             }
             Event::SoftBreak | Event::HardBreak => {
                 flush_line!();
+                // A wrapped line INSIDE a list item keeps the item's indent
+                // (innermost open item), ahead of the quote gutter if any.
+                if let Some(depth) = item_depths.last().copied().filter(|d| *d > 1) {
+                    spans.push(Span::raw("  ".repeat(depth - 1)));
+                }
                 if quote_depth > 0 {
                     spans.push(Span::styled(
                         "\u{2502} ".repeat(quote_depth),
@@ -747,6 +781,110 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Non-empty rendered rows joined with `\n`: render blocks and items are
+    /// separated by blank rows, and list LAYOUT is asserted on content rows.
+    fn content_plain(md: &str, theme: &Theme) -> String {
+        to_plain(&render(md, theme))
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Depth 1 renders flush left, every level beyond adds 2 spaces of
+    /// indent, and the per-level ordered counters keep numbering.
+    #[test]
+    fn nested_ordered_items_indent_two_spaces_per_level() {
+        let theme = Theme::tokyo_night();
+        assert_eq!(
+            content_plain("1. one\n   1. one-a\n   2. one-b\n2. two\n", &theme),
+            "1. one\n  1. one-a\n  2. one-b\n2. two",
+            "ordered nesting must indent 2 spaces per level"
+        );
+    }
+
+    /// An unordered list used to push a numeric counter, so a NESTED
+    /// unordered list rendered as "1.", "2." instead of bullets.
+    #[test]
+    fn nested_unordered_inside_ordered_renders_bullets_with_indent() {
+        let theme = Theme::tokyo_night();
+        assert_eq!(
+            content_plain("1. one\n   - a\n   - b\n2. two\n", &theme),
+            "1. one\n  \u{25e6} a\n  \u{25e6} b\n2. two",
+            "an unordered list at depth 2 must render bullets, never numbers"
+        );
+    }
+
+    /// The mirror case: an ordered list nested in an unordered one keeps its
+    /// numbers and its indent.
+    #[test]
+    fn nested_ordered_inside_unordered_keeps_numbers_with_indent() {
+        let theme = Theme::tokyo_night();
+        assert_eq!(
+            content_plain("- one\n   1. a\n   2. b\n- two\n", &theme),
+            "\u{2022} one\n  1. a\n  2. b\n\u{2022} two",
+            "ordered nesting inside a bullet list must keep numbering + indent"
+        );
+    }
+
+    /// Bullet glyphs cycle with depth: • → ◦ → ▪ → •.
+    #[test]
+    fn unordered_nesting_cycles_bullet_glyphs_by_depth() {
+        let theme = Theme::tokyo_night();
+        assert_eq!(
+            content_plain("- one\n  - two\n    - three\n      - four\n", &theme),
+            "\u{2022} one\n  \u{25e6} two\n    \u{25aa} three\n      \u{2022} four",
+            "bullet glyph must follow the nesting level and cycle past three"
+        );
+    }
+
+    /// A soft-wrapped continuation line inside an item stays on the item's
+    /// indent instead of dropping back to column 0.
+    #[test]
+    fn continuation_lines_inside_an_item_keep_the_item_indent() {
+        let theme = Theme::tokyo_night();
+        assert_eq!(
+            content_plain(
+                "- outer\n  - inner line\n    wrapped inner\n- tail\n",
+                &theme
+            ),
+            "\u{2022} outer\n  \u{25e6} inner line\n  wrapped inner\n\u{2022} tail",
+            "the wrapped line must keep the item indent"
+        );
+    }
+
+    /// Quote and item nesting combine without losing either decoration: the
+    /// item indent comes first, the quote gutter follows it.
+    #[test]
+    fn quoted_nested_item_continuation_keeps_gutter_after_indent() {
+        let theme = Theme::tokyo_night();
+        assert_eq!(
+            content_plain("> - outer\n>   - inner\n>     wrapped\n", &theme),
+            "\u{2022} outer\n  \u{25e6} inner\n  \u{2502} wrapped",
+            "indent and quote gutter must both survive on a wrapped line"
+        );
+    }
+
+    /// The indent is a glyph-free whitespace span placed BEFORE the bullet,
+    /// while the bullet keeps its theme color.
+    #[test]
+    fn nested_item_indent_is_an_unstyled_leading_span() {
+        let theme = Theme::tokyo_night();
+        let lines = render("- one\n  - two\n", &theme);
+        let row = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains('\u{25e6}')))
+            .expect("nested bullet row present");
+        assert_eq!(row.spans[0].content, "  ", "indent span must lead the row");
+        assert_eq!(row.spans[0].style.fg, None, "indent must be unstyled");
+        assert_eq!(row.spans[1].content, "\u{25e6} ");
+        assert_eq!(
+            row.spans[1].style.fg,
+            Some(theme.orange),
+            "bullet must keep its color"
+        );
     }
 
     #[test]
