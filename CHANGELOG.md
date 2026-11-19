@@ -6,6 +6,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-19
+
 ### Added
 
 - Message timestamps: every chat message header shows the local HH:MM time the message was created, next to the author name, for both your messages and the agent's.
@@ -14,6 +16,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Long chat names in the sidebar truncate with an ellipsis at the panel edge instead of being clipped at the window border.
+- Stale reply races: pending placeholders are bound to their request id, so a reply, error or cancel finalizes exactly the message it answers even when several requests overlap or a retry reuses the transcript.
+- Background continuations keep their place in the transcript: a continuation arriving while an answer is still streaming is held and spliced in below it instead of landing at the bottom, and a queued prompt's answer can no longer render above an earlier continuation.
+- Nested lists render at their proper depth: unordered sub-items use the bullet markers at any nesting level and indent under their parent, and wrapped lines inside a deeply indented item align with its text instead of starting at column zero.
+- Rendered markdown tables get a full frame: top and bottom border lines with corner and junction characters now close the table, drawn in the dim theme color.
 
 ## [0.6.0] - 2026-11-08
 
