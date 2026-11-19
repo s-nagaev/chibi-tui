@@ -81,6 +81,34 @@ fn resolve_live_placeholder_skips_queued_markers() {
     );
 }
 
+/// The creation stamp is fixed when the bubble APPEARS: a resolution keeps
+/// the pending placeholder's instant (an answer never changes its clock),
+/// and only a hand-built stamp-less placeholder — e.g. a mid-request
+/// snapshot written by an older build — is stamped at resolution time.
+#[test]
+fn resolution_keeps_the_placeholder_stamp_and_fills_only_a_missing_one() {
+    let mut app = app_with_chats(1);
+    submit_text(&mut app, "stamped");
+    let sent_at = app.chats[0].messages[1].created_at;
+    assert!(sent_at.is_some(), "submit stamps the pending placeholder");
+    finish_chat(&mut app, 0);
+    assert_eq!(
+        app.chats[0].messages[1].created_at, sent_at,
+        "the resolved answer keeps the instant the request was sent"
+    );
+
+    // A snapshot from a pre-timestamp build carries no stamp: the
+    // resolution stamps it now instead of leaving the row undated forever.
+    let mut app = app_with_chats(1);
+    submit_text(&mut app, "legacy");
+    app.chats[0].messages[1].created_at = None;
+    finish_chat(&mut app, 0);
+    assert!(
+        app.chats[0].messages[1].created_at.is_some(),
+        "an unstamped placeholder is stamped at resolution time"
+    );
+}
+
 // per-message labelling --------------------
 
 /// THE per-message contract: two consecutive replies produced by

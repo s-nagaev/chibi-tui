@@ -125,9 +125,9 @@ fn search_all_jump_activates_non_active_thread_and_lands_wrapped_row() {
     // Narrow chat pane forces heavy wrapping of the long paragraph.
     const FRAME_W: u16 = 60;
     const FRAME_H: u16 = 24;
-    // Chat pane inner width = frame - sidebar(26) - the pane's two
+    // Chat pane inner width = frame - DEFAULT_SIDEBAR_WIDTH - the pane's two
     // rounded border columns.
-    let pane_width = FRAME_W - 26 - 2;
+    let pane_width = FRAME_W - DEFAULT_SIDEBAR_WIDTH - 2;
 
     let mut app = App::new(vec![Chat::new("target"), Chat::new("decoy")]);
     // The ACTIVE chat at search time: chat 0. Lots of filler so

@@ -67,3 +67,48 @@ fn requested_frame_is_consumed_once() {
     assert!(redraw.take());
     assert!(!redraw.take());
 }
+
+// ---- input growth cap (both frame regimes) --------------------
+
+use chibi_tui::ui::max_input_block_height;
+use ratatui::layout::Rect;
+
+/// The editor growth cap in the TALL regime (frame height > 16): 3/4 of the
+/// frame, always below the tiny-frame guard, and the raw draft height is
+/// clamped to it.
+#[test]
+fn input_growth_cap_uses_three_quarters_on_tall_frames() {
+    let frame = Rect::new(0, 0, 120, 40);
+    assert_eq!(max_input_block_height(40), 30);
+
+    let mut app = app_with_chats(1);
+    let lines: Vec<String> = (0..50).map(|i| format!("l{i:02}")).collect();
+    app.input.insert_str(&lines.join("\n"));
+    assert_eq!(
+        app.input_lines_height(frame),
+        30,
+        "50-line draft clamps to 3/4 of a 40-row frame"
+    );
+}
+
+/// The editor growth cap in the TINY regime (frame height <= 16): the
+/// tiny-frame guard (h - 4) wins, keeping the spinner row, the hints row and
+/// a sliver of chat alive; the floor is one row.
+#[test]
+fn input_growth_cap_uses_the_guard_on_tiny_frames() {
+    // h = 16: the guard and 3/4 agree on 12.
+    let frame_16 = Rect::new(0, 0, 120, 16);
+    assert_eq!(max_input_block_height(16), 12);
+    // h = 12: the guard (8) is below 3/4 (9), so it wins.
+    let frame_12 = Rect::new(0, 0, 120, 12);
+    assert_eq!(max_input_block_height(12), 8);
+
+    let mut app = app_with_chats(1);
+    for _ in 0..30 {
+        app.input.insert_str("x\n");
+    }
+    assert_eq!(app.input_lines_height(frame_16), 12);
+    assert_eq!(app.input_lines_height(frame_12), 8);
+    // Degenerate frames never drop below a single row.
+    assert_eq!(app.input_lines_height(Rect::new(0, 0, 120, 1)), 1);
+}

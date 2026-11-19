@@ -13,8 +13,11 @@
 //! * a kill ring of exactly ONE slot (`Ctrl+U`/`Ctrl+K`/`Ctrl+W`/`Alt+D` all
 //!   store, `Ctrl+Y` pastes back) — same as the old engine;
 //! * multi-line buffer keyed by `(row, col)` with `col` a CHAR index;
-//! * rendering paints the caret with `REVERSED` (the terminal cursor is never
-//!   moved) and scrolls only as needed to keep the caret visible;
+//! * rendering SOFT-WRAPS every over-long logical line onto as many VISUAL
+//!   rows as the given width demands (character wrap, never word wrap: an
+//!   editor must not move text the user is still typing), paints the caret
+//!   with `REVERSED` (the terminal cursor is never moved) and scrolls the
+//!   visual rows only as needed to keep the caret visible;
 //! * unknown keys are no-ops. `App` intercepts `Enter`, `Ctrl+U`, `Ctrl+L`,
 //!   `Ctrl+M`, `Ctrl+F`, `Ctrl+P`… BEFORE the editor sees them — the
 //!   readline fallbacks below exist for fidelity, not for the app's flows.
@@ -117,10 +120,10 @@ pub struct InputArea {
     placeholder: Option<String>,
     /// Single-slot kill ring: text stored by the last kill, pasted by Ctrl+Y.
     yank: Option<String>,
-    /// Caret-following scroll offsets, remembered across frames. `Cell`
-    /// because the `Widget` impl takes the editor by shared reference.
+    /// Caret-following scroll offset over VISUAL (soft-wrapped) rows,
+    /// remembered across frames. `Cell` because the `Widget` impl takes the
+    /// editor by shared reference.
     v_scroll: Cell<usize>,
-    h_scroll: Cell<usize>,
 }
 
 impl Default for InputArea {
@@ -132,10 +135,35 @@ impl Default for InputArea {
             placeholder: None,
             yank: None,
             v_scroll: Cell::new(0),
-            h_scroll: Cell::new(0),
         }
     }
 }
+
+/// One VISUAL row of the soft-wrapped buffer: the slice of logical line
+/// `row` covering chars `start..end` (CHAR indices), which is exactly what
+/// one terminal row paints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisualRow {
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The buffer laid out for a given width: the visual rows plus the number
+/// of columns the FIRST visual row keeps free for the send chip
+/// ([`FIRST_ROW_RESERVE`], or `0` while the draft still fits on a single
+/// row — the chip is only drawn on a grown block, so a one-row draft is
+/// free to use the whole width).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrappedBuffer {
+    pub rows: Vec<VisualRow>,
+    pub first_row_reserve: usize,
+}
+
+/// Columns the FIRST visual row of a GROWN block keeps free for the `⏎ send`
+/// chip painted by `ui::render_input`: the 7-column chip label plus one
+/// column of breathing room.
+pub const FIRST_ROW_RESERVE: usize = 8;
 
 impl InputArea {
     /// Insert text at the caret. `\n` splits lines (multi-line paste);
@@ -592,11 +620,94 @@ impl InputArea {
         }
     }
 
-    // ---- rendering ---------------------------------------------
+    // ---- soft wrap -----------------------------------------------------
 
-    /// Display-column offset of the caret within its line.
-    fn caret_col_width(&self) -> usize {
-        self.prefix_width(self.row, self.col)
+    /// Lay the buffer out at `width` display columns: one [`VisualRow`] per
+    /// terminal row, CHARACTER-wrapped (never word-wrapped — an editor must
+    /// not reflow text the user is still typing).
+    ///
+    /// A draft that fits on a single visual row comes back WITHOUT the chip
+    /// reserve: only a grown block paints the `⏎ send` chip, so only a
+    /// wrapped draft has to keep its first row clear of it. The layout height
+    /// ([`Self::wrapped_lines`]) and the renderer both read THIS seam, so the
+    /// number of rows the layout reserves and the rows actually painted can
+    /// never disagree.
+    pub fn wrapped(&self, width: u16) -> WrappedBuffer {
+        let width = (width as usize).max(1);
+        let unreserved = self.wrap(width, 0);
+        if unreserved.len() > 1 {
+            WrappedBuffer {
+                rows: self.wrap(width, FIRST_ROW_RESERVE),
+                first_row_reserve: FIRST_ROW_RESERVE,
+            }
+        } else {
+            WrappedBuffer {
+                rows: unreserved,
+                first_row_reserve: 0,
+            }
+        }
+    }
+
+    /// Terminal rows the buffer needs at `width` (never 0: an empty buffer
+    /// is one row, and so is every empty logical line).
+    pub fn wrapped_lines(&self, width: u16) -> usize {
+        self.wrapped(width).rows.len()
+    }
+
+    /// The bare wrap pass, delegated to the shared character wrap
+    /// ([`crate::app::wrap_line_ranges`]) so the editor and the chat/log
+    /// renderers chunk text by ONE display-width rule. `first_row_reserve`
+    /// columns are withheld from the very FIRST visual row of the buffer —
+    /// which is the first row of logical line 0 — and every later row uses
+    /// the full `width`.
+    fn wrap(&self, width: usize, first_row_reserve: usize) -> Vec<VisualRow> {
+        let width = width.max(1);
+        let mut rows: Vec<VisualRow> = Vec::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            let reserve = if row == 0 { first_row_reserve } else { 0 };
+            for (start, end) in crate::app::wrap_line_ranges(line, width, reserve) {
+                rows.push(VisualRow { row, start, end });
+            }
+        }
+        rows
+    }
+
+    /// Display width of the chars `[start, end)` of logical line `row`.
+    fn segment_width(&self, row: usize, start: usize, end: usize) -> usize {
+        self.lines[row]
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(crate::app::char_cols)
+            .sum()
+    }
+
+    /// Visual position of the caret at `width`: `(visual row index, display
+    /// column within that row)`. A caret sitting exactly on a wrap boundary
+    /// belongs to the HEAD of the following visual row, so it is never
+    /// painted under the send chip (or past the area edge).
+    fn caret_visual(&self, layout: &WrappedBuffer, width: usize) -> (usize, usize) {
+        let (row, col) = (self.row, self.col);
+        let mut picked = 0usize;
+        for (i, vr) in layout.rows.iter().enumerate() {
+            if vr.row == row && vr.start <= col {
+                picked = i;
+            }
+        }
+        let vr = layout.rows[picked];
+        let x = self.segment_width(row, vr.start, col.min(vr.end));
+        let caps = row_capacity(width, picked, layout.first_row_reserve);
+        (picked, x.min(caps.saturating_sub(1)))
+    }
+}
+
+/// Usable columns of visual row `visual`: the very first row of the buffer
+/// may have `first_row_reserve` columns withheld for the send chip.
+fn row_capacity(width: usize, visual: usize, first_row_reserve: usize) -> usize {
+    if visual == 0 {
+        width.saturating_sub(first_row_reserve).max(1)
+    } else {
+        width
     }
 }
 
@@ -606,65 +717,43 @@ impl Widget for &InputArea {
             return;
         }
 
-        // caret-following vertical scroll
-        let height = area.height as usize;
-        let v = self.v_scroll.get();
-        let v = if self.row < v {
-            self.row
-        } else if self.row >= v + height {
-            self.row + 1 - height
-        } else {
-            v
-        };
-        self.v_scroll.set(v);
-        // caret-following horizontal scroll (display columns)
         let width = area.width as usize;
-        let caret_col = self.caret_col_width();
-        let h = self.h_scroll.get();
-        let h = if caret_col < h {
-            caret_col
-        } else if caret_col >= h + width {
-            caret_col + 1 - width
-        } else {
-            h
-        };
-        self.h_scroll.set(h);
+        let height = area.height as usize;
+        // the soft-wrapped layout at THIS width — the same seam the root
+        // layout sizes the block from
+        let layout = self.wrapped(area.width);
+        let (caret_row, caret_x) = self.caret_visual(&layout, width);
+
+        // caret-following vertical scroll over VISUAL rows
+        let mut v = self.v_scroll.get().min(layout.rows.len() - 1);
+        if caret_row < v {
+            v = caret_row;
+        } else if caret_row >= v + height {
+            v = caret_row + 1 - height;
+        }
+        self.v_scroll.set(v);
 
         for (i, y) in (area.y..area.y + area.height).enumerate() {
-            let row = v + i;
-            if row >= self.lines.len() {
+            let Some(vr) = layout.rows.get(v + i) else {
                 break;
-            }
-            let line = &self.lines[row];
-            let mut col = 0usize; // display column of the next char
+            };
+            let line = &self.lines[vr.row];
             let mut x = 0usize; // cell offset within the area
-            for ch in line.chars() {
-                let w = ch.width().unwrap_or(0).max(1);
-                if col + w <= h {
-                    col += w;
-                    continue;
-                }
-                if col < h {
-                    // wide char straddling the scroll edge: skip whole char
-                    col += w;
-                    continue;
-                }
+            for ch in line.chars().skip(vr.start).take(vr.end - vr.start) {
+                let w = crate::app::char_cols(ch);
                 if x + w > width {
                     break;
                 }
                 buf[(area.x + x as u16, y)].set_char(ch);
-                col += w;
                 x += w;
             }
             // untouched cells keep whatever bg the panel already painted
         }
 
-        // the caret: REVERSED cell under the cursor (the terminal cursor is
-        // never moved); renders as a reversed blank at end-of-line
-        let caret_row = self.row - v;
-        let cx = area.x as usize + caret_col - h;
-        if caret_row < height && cx < area.x as usize + width {
-            buf[(cx as u16, area.y + caret_row as u16)]
+        // the caret: a REVERSED cell at its VISUAL position (the terminal
+        // cursor is never moved); renders as a reversed blank at end-of-line
+        if caret_row >= v && caret_row < v + height {
+            buf[(area.x + caret_x as u16, area.y + (caret_row - v) as u16)]
                 .set_style(Style::new().add_modifier(Modifier::REVERSED));
         }
     }
@@ -832,5 +921,123 @@ cd",
         press(&mut w, KeyCode::Char('j'), KeyModifiers::CONTROL);
         assert_eq!(w.lines(), ["abcd"]);
         assert_eq!(w.cursor(), (0, 2));
+    }
+
+    // ---- soft wrap ---------------------------------------------
+
+    #[test]
+    fn long_line_soft_wraps_and_keeps_the_chip_columns_free() {
+        let mut w = InputArea::default();
+        w.insert_str(&"x".repeat(20));
+        // width 10: the first visual row yields FIRST_ROW_RESERVE (8)
+        // columns to the send chip, so it holds 2 chars; later rows fill
+        // the full 10.
+        assert_eq!(w.wrapped_lines(10), 3);
+        let layout = w.wrapped(10);
+        assert_eq!(layout.first_row_reserve, FIRST_ROW_RESERVE);
+        assert_eq!(
+            layout.rows,
+            vec![
+                VisualRow {
+                    row: 0,
+                    start: 0,
+                    end: 2
+                },
+                VisualRow {
+                    row: 0,
+                    start: 2,
+                    end: 12
+                },
+                VisualRow {
+                    row: 0,
+                    start: 12,
+                    end: 20
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn single_row_draft_keeps_the_full_width() {
+        let mut w = InputArea::default();
+        w.insert_str(&"x".repeat(10));
+        // A 10-char draft is exactly ONE row, and a one-row block paints no
+        // send chip: nothing is withheld, so the draft is not wrapped at all.
+        assert_eq!(w.wrapped_lines(10), 1);
+        let layout = w.wrapped(10);
+        assert_eq!(layout.first_row_reserve, 0);
+        assert_eq!(
+            layout.rows,
+            vec![VisualRow {
+                row: 0,
+                start: 0,
+                end: 10
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_lines_each_occupy_one_visual_row() {
+        let w = InputArea::default();
+        assert_eq!(w.wrapped_lines(10), 1);
+        let mut w = InputArea::default();
+        w.insert_str("a\n\nb");
+        assert_eq!(w.wrapped_lines(10), 3);
+        assert_eq!(
+            w.wrapped(10).rows[1],
+            VisualRow {
+                row: 1,
+                start: 0,
+                end: 0
+            }
+        );
+    }
+
+    #[test]
+    fn wide_glyphs_wrap_on_display_columns_not_chars() {
+        let mut w = InputArea::default();
+        w.insert_str("你好世界"); // 4 chars, 8 display columns
+        assert_eq!(w.wrapped_lines(8), 1, "8 columns fit an unreserved row");
+        // Width 5 would split the glyphs across two rows by DISPLAY columns
+        // (2+2 = 4, then the third glyph); a multi-row draft re-wraps with
+        // the send-chip reserve, so assert on the bare wrap instead: the
+        // reserve is a UI lane, not part of the width rule under test.
+        let bare = w.wrap(5, 0);
+        assert_eq!(
+            bare,
+            vec![
+                VisualRow {
+                    row: 0,
+                    start: 0,
+                    end: 2
+                },
+                VisualRow {
+                    row: 0,
+                    start: 2,
+                    end: 4
+                },
+            ],
+            "two 2-column glyphs per 5-column row: wrapped by display width"
+        );
+    }
+
+    #[test]
+    fn caret_lands_at_the_head_of_the_row_after_a_wrap() {
+        let mut w = InputArea::default();
+        w.insert_str(&"x".repeat(12));
+        assert_eq!(w.wrapped(10).rows.len(), 2);
+        // col 2 is exactly the wrap boundary → head of the SECOND visual row
+        press(&mut w, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut w, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut w, KeyCode::Right, KeyModifiers::NONE);
+        let layout = w.wrapped(10);
+        assert_eq!(w.caret_visual(&layout, 10), (1, 0));
+        // the caret at the end of a PARTLY filled last row stays inside it
+        press(&mut w, KeyCode::End, KeyModifiers::NONE);
+        w.insert_str("xyz");
+        assert_eq!(w.lines(), ["xxxxxxxxxxxxxyz"]);
+        let layout = w.wrapped(10);
+        assert_eq!(layout.rows.len(), 3);
+        assert_eq!(w.caret_visual(&layout, 10), (2, 3));
     }
 }

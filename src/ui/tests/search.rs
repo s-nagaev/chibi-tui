@@ -115,11 +115,11 @@ fn search_jump_lands_wrapped_match_near_top() {
     // Narrow chat pane forces heavy wrapping of the long paragraph.
     const FRAME_W: u16 = 60;
     const FRAME_H: u16 = 24;
-    // Chat pane inner width = frame - sidebar(26) - the pane's two
+    // Chat pane inner width = frame - DEFAULT_SIDEBAR_WIDTH - the pane's two
     // rounded border columns; chat inner height =
     // frame - top border(1) - bottom border(1) - spinner(1) - input(1)
     // - status(1).
-    let pane_width = FRAME_W - 26 - 2;
+    let pane_width = FRAME_W - DEFAULT_SIDEBAR_WIDTH - 2;
 
     let mut app = App::new(vec![Chat::new("wrap")]);
     {

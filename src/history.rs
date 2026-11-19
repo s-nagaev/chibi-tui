@@ -142,6 +142,9 @@ impl From<StoredChat> for Chat {
             // has no live request to resume (see Message::normalized_for_storage).
             lifecycle: crate::model::ChatLifecycle::Idle,
             queue: std::collections::VecDeque::new(),
+            // continuations held behind a live stream are
+            // session-only — a restored thread has no stream to resume.
+            pending_continuations: Vec::new(),
             // the marker is session-only and
             // stays out of the persisted format entirely.
             unread: false,

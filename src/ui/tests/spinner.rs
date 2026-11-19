@@ -231,3 +231,31 @@ fn spinner_line_ignores_background_chat_subagents() {
         "background counter must not leak, got {line:?}"
     );
 }
+
+/// The defensive clear paths erase the counter segment from the spinner
+/// line: a per-chat clear and a connection-level Disconnected sweep both
+/// leave the line without the "subagents working" segment.
+#[test]
+fn spinner_line_drops_the_counter_after_the_clear_paths() {
+    // Per-chat clear (the /stop and transport-error path).
+    let mut app = App::new(vec![Chat::new("chat")]);
+    app.chats[0].apply_subagent_event(11, AgentEventKind::Started, 2, 5);
+    assert!(
+        spinner_line_of(&mut app).contains("subagents working: 2"),
+        "precondition: counter visible"
+    );
+    app.chats[0].clear_subagent_counts();
+    assert!(
+        !spinner_line_of(&mut app).contains("subagents"),
+        "per-chat clear must remove the counter segment"
+    );
+
+    // Connection-level sweep (the Disconnected / reconnect path).
+    app.chats[0].apply_subagent_event(11, AgentEventKind::Started, 2, 5);
+    assert!(spinner_line_of(&mut app).contains("subagents"));
+    app.apply_backend_event(crate::backend::BackendEvent::Disconnected);
+    assert!(
+        !spinner_line_of(&mut app).contains("subagents"),
+        "the Disconnected sweep must remove the counter segment"
+    );
+}

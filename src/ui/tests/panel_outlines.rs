@@ -6,11 +6,11 @@ use super::support::*;
 /// corners, never wrapped or clipped by the layout. The scan runs inside
 /// the chat pane's INNER area: the pane itself is a rounded rectangle
 /// now, so its own border glyphs (corners on rows 0/30, │ on cols
-/// 26/119) must not confuse the code-panel search.
+/// 30/119) must not confuse the code-panel search.
 #[test]
 fn full_ui_code_panels_are_closed_rectangles() {
     // Chat 1 has python panels, chat 2 the widest rust panel.
-    let rects = layout_rects(Rect::new(0, 0, 120, 34), 1);
+    let rects = layout_rects(Rect::new(0, 0, 120, 34), 1, DEFAULT_SIDEBAR_WIDTH);
     let inner_x = (rects.chat.x + 1) as usize;
     let inner_w = rects.chat.width.saturating_sub(2) as usize;
     for active in [0usize, 1] {
@@ -75,22 +75,22 @@ fn panel_outlines_render_rounded_borders_on_both_panels() {
     let mut app = App::new(vec![Chat::new("chat")]);
     let (rows, _) = render_grid_with_buffer(&mut app);
 
-    // Sidebar: cols 0..=25, rows 0..=30 at 120×34.
+    // Sidebar: cols 0..=29, rows 0..=30 at 120×34.
     assert_eq!(rows[0].chars().next(), Some('╭'), "sidebar top-left");
-    assert_eq!(rows[0].chars().nth(25), Some('╮'), "sidebar top-right");
+    assert_eq!(rows[0].chars().nth(29), Some('╮'), "sidebar top-right");
     assert_eq!(rows[30].chars().next(), Some('╰'), "sidebar bottom-left");
-    assert_eq!(rows[30].chars().nth(25), Some('╯'), "sidebar bottom-right");
-    // Chat pane: cols 26..=119, rows 0..=30.
-    assert_eq!(rows[0].chars().nth(26), Some('╭'), "chat top-left");
+    assert_eq!(rows[30].chars().nth(29), Some('╯'), "sidebar bottom-right");
+    // Chat pane: cols 30..=119, rows 0..=30.
+    assert_eq!(rows[0].chars().nth(30), Some('╭'), "chat top-left");
     assert_eq!(rows[0].chars().nth(119), Some('╮'), "chat top-right");
-    assert_eq!(rows[30].chars().nth(26), Some('╰'), "chat bottom-left");
+    assert_eq!(rows[30].chars().nth(30), Some('╰'), "chat bottom-left");
     assert_eq!(rows[30].chars().nth(119), Some('╯'), "chat bottom-right");
     // Vertical sides on every inner row of both panes.
     for (y, row) in rows.iter().enumerate().take(30).skip(1) {
         let col = |x: usize| row.chars().nth(x);
         assert_eq!(col(0), Some('│'), "sidebar left y{y}");
-        assert_eq!(col(25), Some('│'), "sidebar right y{y}");
-        assert_eq!(col(26), Some('│'), "chat left y{y}");
+        assert_eq!(col(29), Some('│'), "sidebar right y{y}");
+        assert_eq!(col(30), Some('│'), "chat left y{y}");
         assert_eq!(col(119), Some('│'), "chat right y{y}");
     }
     // Titles still embedded in the top border rows, unchanged.
@@ -107,17 +107,17 @@ fn panel_outlines_render_rounded_borders_on_both_panels() {
 fn panel_outlines_keep_the_hit_test_seam_consistent() {
     let mut app = App::new(vec![Chat::new("chat")]);
     let (_, buf) = render_grid_with_buffer(&mut app);
-    let rects = layout_rects(Rect::new(0, 0, 120, 34), 1);
+    let rects = layout_rects(Rect::new(0, 0, 120, 34), 1, DEFAULT_SIDEBAR_WIDTH);
 
     // The seam rects are byte-identical to the pre-outline geometry.
-    assert_eq!(rects.sidebar, Rect::new(0, 0, 26, 31));
-    assert_eq!(rects.chat, Rect::new(26, 0, 94, 31));
+    assert_eq!(rects.sidebar, Rect::new(0, 0, 30, 31));
+    assert_eq!(rects.chat, Rect::new(30, 0, 90, 31));
 
     // Every rendered border cell belongs to the panel its column
-    // hit-tests to: sidebar borders (cols 0/25) → Sidebar, chat borders
-    // (cols 26/119) → Chat — rendering and routing can never disagree.
+    // hit-tests to: sidebar borders (cols 0/29) → Sidebar, chat borders
+    // (cols 30/119) → Chat — rendering and routing can never disagree.
     for y in 1..30u16 {
-        for x in [0u16, 25] {
+        for x in [0u16, 29] {
             assert_eq!(buf[(x, y)].symbol(), "│", "sidebar border at ({x},{y})");
             assert_eq!(
                 panel_region(&rects, x, y),
@@ -125,7 +125,7 @@ fn panel_outlines_keep_the_hit_test_seam_consistent() {
                 "column {x} must route to the sidebar"
             );
         }
-        for x in [26u16, 119] {
+        for x in [30u16, 119] {
             assert_eq!(buf[(x, y)].symbol(), "│", "chat border at ({x},{y})");
             assert_eq!(
                 panel_region(&rects, x, y),

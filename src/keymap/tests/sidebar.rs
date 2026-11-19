@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 /// Plain ↑/↓ move the text cursor vertically inside the editor — never    /// Plain ↑/↓ move the text cursor vertically inside the editor — never
 /// switching threads. Column preserved across rows (readline-native
 /// mapping), clamped at the first/last row. This exercises the grown
-/// (MAX_INPUT_LINES-capped) block's caret navigation path.
+/// (height-capped) block's caret navigation path.
 #[test]
 fn plain_vertical_arrows_move_caret_not_thread() {
     let mut app = app_with_chats(3);

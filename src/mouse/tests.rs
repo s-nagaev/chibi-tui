@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
 
-use super::{handle_mouse, handle_mouse_with_copy, WHEEL_STEP};
+use super::{handle_mouse, handle_mouse_with_copy, handle_mouse_with_copy_and_persist, WHEEL_STEP};
 use crate::keymap::handle_key_with_copy;
 use crate::keymap::tests::log_viewer::log_viewer_state;
 use crate::tests::support::*;
@@ -20,7 +20,7 @@ fn wheel(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Mouse
 
 use crossterm::event::MouseEventKind;
 
-/// 120×40 frame: sidebar cols 0..=25, chat cols 26.., chrome rows 37..39.
+/// 120×40 frame: sidebar cols 0..=29, chat cols 30.., chrome rows 37..39.
 const WHEEL_AREA: Rect = Rect::new(0, 0, 120, 40);
 
 #[test]
@@ -266,7 +266,7 @@ fn press_drag_release_selects_and_copies_through_the_seam() {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                27,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -280,7 +280,7 @@ fn press_drag_release_selects_and_copies_through_the_seam() {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                38,
+                42,
                 2,
             ),
             WHEEL_AREA,
@@ -290,7 +290,7 @@ fn press_drag_release_selects_and_copies_through_the_seam() {
             &mut app,
             button(
                 MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                40,
+                44,
                 2,
             ),
             WHEEL_AREA,
@@ -305,6 +305,64 @@ fn press_drag_release_selects_and_copies_through_the_seam() {
         ["hello world"],
         "the release copied the selected plain text"
     );
+}
+
+/// A click on the SECOND row of a wrapped sidebar name selects that name's
+/// chat: the geometry seam carries one entry per visible row, so a
+/// continuation row resolves to its own thread instead of to whichever
+/// thread sits that many single-row slots further down the list.
+#[test]
+fn click_on_the_second_row_of_a_wrapped_name_selects_that_chat() {
+    let mut app = app_with_chats(2);
+    app.chats[0].name = "one".to_string();
+    // 34 display columns in a 26-column name cell: the name wraps and the
+    // block of chat 1 occupies two list rows.
+    app.chats[1].name = format!("{} tail", "wrap ".repeat(6).trim_end());
+    render_for_geometry(&mut app);
+
+    let geo = app
+        .sidebar_geometry
+        .clone()
+        .expect("render fed the sidebar geometry");
+    let second_row = (geo.row_tops[1] + 1) as u16;
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            second_row,
+        ),
+        WHEEL_AREA,
+        &|_: &str| {},
+    );
+    assert_eq!(app.active, 1, "the continuation row belongs to chat 1");
+    assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
+}
+
+/// A click inside the sidebar but BELOW the last thread moves focus only:
+/// no chat block owns that row, so the selection stays where it was.
+#[test]
+fn click_below_the_last_thread_only_moves_focus() {
+    let mut app = app_with_chats(2);
+    render_for_geometry(&mut app);
+
+    let geo = app
+        .sidebar_geometry
+        .clone()
+        .expect("render fed the sidebar geometry");
+    let below = geo.inner.y + geo.inner.height - 1;
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            10,
+            below,
+        ),
+        WHEEL_AREA,
+        &|_: &str| {},
+    );
+    assert_eq!(app.active, 0, "no chat block owns the empty tail row");
+    assert_eq!(app.focus, chibi_tui::app::Focus::Sidebar);
 }
 
 /// A press+release without drag is a plain click: the selection clears
@@ -323,7 +381,7 @@ fn plain_click_clears_and_copies_nothing() {
         &mut app,
         button(
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            27,
+            31,
             2,
         ),
         WHEEL_AREA,
@@ -333,7 +391,7 @@ fn plain_click_clears_and_copies_nothing() {
         &mut app,
         button(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            31,
+            35,
             2,
         ),
         WHEEL_AREA,
@@ -343,7 +401,7 @@ fn plain_click_clears_and_copies_nothing() {
         &mut app,
         button(
             MouseEventKind::Up(crossterm::event::MouseButton::Left),
-            31,
+            35,
             2,
         ),
         WHEEL_AREA,
@@ -404,7 +462,7 @@ fn y_copies_the_held_selection_and_keeps_it_active() {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                27,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -414,7 +472,7 @@ fn y_copies_the_held_selection_and_keeps_it_active() {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                32,
+                36,
                 2,
             ),
             WHEEL_AREA,
@@ -424,7 +482,7 @@ fn y_copies_the_held_selection_and_keeps_it_active() {
             &mut app,
             button(
                 MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                31,
+                35,
                 2,
             ),
             WHEEL_AREA,
@@ -507,7 +565,7 @@ fn esc_clears_the_mouse_selection() {
         &mut app,
         button(
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            27,
+            31,
             2,
         ),
         WHEEL_AREA,
@@ -517,7 +575,7 @@ fn esc_clears_the_mouse_selection() {
         &mut app,
         button(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            35,
+            39,
             2,
         ),
         WHEEL_AREA,
@@ -543,7 +601,7 @@ fn press_outside_the_chat_pane_clears_the_selection() {
         &mut app,
         button(
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            27,
+            31,
             2,
         ),
         WHEEL_AREA,
@@ -553,7 +611,7 @@ fn press_outside_the_chat_pane_clears_the_selection() {
         &mut app,
         button(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            31,
+            35,
             2,
         ),
         WHEEL_AREA,
@@ -592,7 +650,7 @@ fn wheel_during_a_drag_scrolls_without_moving_the_head() {
         &mut app,
         button(
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            27,
+            31,
             2,
         ),
         WHEEL_AREA,
@@ -602,7 +660,7 @@ fn wheel_during_a_drag_scrolls_without_moving_the_head() {
         &mut app,
         button(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            35,
+            39,
             2,
         ),
         WHEEL_AREA,
@@ -638,7 +696,7 @@ fn selection_presses_are_ignored_while_a_modal_is_open() {
         &mut app,
         button(
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            27,
+            31,
             2,
         ),
         WHEEL_AREA,
@@ -648,7 +706,7 @@ fn selection_presses_are_ignored_while_a_modal_is_open() {
         &mut app,
         button(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            31,
+            35,
             2,
         ),
         WHEEL_AREA,
@@ -699,7 +757,7 @@ fn selection_under_quit_confirm_is_swallowed() {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                27,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -709,7 +767,7 @@ fn selection_under_quit_confirm_is_swallowed() {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                31,
+                35,
                 2,
             ),
             WHEEL_AREA,
@@ -1417,7 +1475,7 @@ fn chat_pane_press_moves_focus_to_chat_and_selection_still_works() {
             &mut app,
             button(
                 MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                27,
+                31,
                 2,
             ),
             WHEEL_AREA,
@@ -1432,7 +1490,7 @@ fn chat_pane_press_moves_focus_to_chat_and_selection_still_works() {
             &mut app,
             button(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-                38,
+                42,
                 2,
             ),
             WHEEL_AREA,
@@ -1442,7 +1500,7 @@ fn chat_pane_press_moves_focus_to_chat_and_selection_still_works() {
             &mut app,
             button(
                 MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                40,
+                44,
                 2,
             ),
             WHEEL_AREA,
@@ -1555,5 +1613,276 @@ fn base_surface_clicks_are_swallowed_under_popups_and_non_normal_modes() {
     assert!(
         app.error_popup.is_some(),
         "the click must not dismiss the popup"
+    );
+}
+
+// ---- sidebar drag-resize ----------------------------------------------
+
+/// A press on EITHER divider column starts the sidebar drag with the grab
+/// offset relative to the boundary col, and it never moves focus nor
+/// clears a held selection (the old fallback routed these presses to the
+/// focus-chat/clear-selection arm).
+#[test]
+fn press_on_the_divider_columns_starts_a_sidebar_drag() {
+    let mut app = app_with_chats(1);
+    app.chats[0].messages.push(Message::assistant("text here"));
+    render_for_geometry(&mut app);
+    let noop = |_text: &str| {};
+
+    // Boundary col (chat pane's left border, col 30 @ width 30): offset 0.
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            30,
+            5,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert_eq!(app.sidebar_drag, Some(0), "boundary-col grab, zero offset");
+    assert_eq!(app.focus, Focus::Chat, "divider press never moves focus");
+
+    // Sidebar-side border col (29): offset -1, the width tracks 1:1.
+    app.sidebar_drag = None;
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            29,
+            5,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert_eq!(
+        app.sidebar_drag,
+        Some(-1),
+        "grab on the sidebar border col carries offset -1"
+    );
+    app.sidebar_drag = None;
+
+    // Precedence over the selection/focus fallback: a LIVE selection press
+    // followed by a divider press must keep the selection (the old else-arm
+    // cleared it: position_at on the border col is None → clear_selection).
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            31,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert!(app.selection.is_some(), "live selection held");
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            30,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert_eq!(app.sidebar_drag, Some(0), "drag started");
+    assert!(
+        app.selection.is_some(),
+        "divider press must NOT clear the held selection"
+    );
+}
+
+/// While the grab is held, Drag events re-size the sidebar live, clamped by
+/// the SAME helper the renderer applies, and skip the text-selection arm.
+#[test]
+fn drag_events_resize_the_sidebar_within_the_clamps() {
+    let mut app = app_with_chats(1);
+    app.chats[0].messages.push(Message::assistant("text here"));
+    render_for_geometry(&mut app);
+    let noop = |_text: &str| {};
+
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            30,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert!(app.selection.is_none(), "no text selection during a resize");
+
+    // Drag right: 1:1 width tracking.
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            45,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert_eq!(app.sidebar_width, 45);
+
+    // Drag far left: the 20-col floor.
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            5,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert_eq!(app.sidebar_width, 20, "width clamps at the floor");
+
+    // Drag past the half-frame cap (60 @120).
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            119,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    assert_eq!(app.sidebar_width, 60, "width clamps at the half-frame cap");
+
+    // No selection may have started underneath the resize drag.
+    assert!(app.selection.is_none(), "resize drag never selects text");
+}
+
+/// The release ends the drag and persists the final width through the
+/// injected seam (the production closure writes `ui.json`, best-effort).
+#[test]
+fn release_ends_the_drag_and_persists_the_width() {
+    let mut app = app_with_chats(1);
+    render_for_geometry(&mut app);
+    let noop = |_text: &str| {};
+
+    let saved = std::cell::RefCell::new(Vec::<u16>::new());
+    let persist = |width: u16| saved.borrow_mut().push(width);
+
+    handle_mouse_with_copy_and_persist(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            30,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+        &persist,
+    );
+    handle_mouse_with_copy_and_persist(
+        &mut app,
+        button(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            40,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+        &persist,
+    );
+    assert_eq!(app.sidebar_width, 40);
+    assert!(saved.borrow().is_empty(), "nothing persisted mid-drag");
+
+    handle_mouse_with_copy_and_persist(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            40,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+        &persist,
+    );
+    assert_eq!(app.sidebar_drag, None, "release ends the drag");
+    assert_eq!(
+        saved.borrow().as_slice(),
+        [40],
+        "the drag-end saved the final width exactly once"
+    );
+
+    // A stray second release with no active drag persists nothing.
+    handle_mouse_with_copy_and_persist(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            40,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+        &persist,
+    );
+    assert_eq!(saved.borrow().len(), 1, "no double save");
+}
+
+/// The width set by the drag flows straight into the NEXT render: the
+/// divider borders land on the new boundary columns and the editor wrap
+/// width follows the same runtime value.
+#[test]
+fn dragged_width_flows_into_the_rendered_geometry() {
+    let mut app = app_with_chats(1);
+    render_for_geometry(&mut app);
+    let noop = |_text: &str| {};
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            30,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            44,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+    handle_mouse_with_copy(
+        &mut app,
+        button(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            44,
+            2,
+        ),
+        WHEEL_AREA,
+        &noop,
+    );
+
+    let backend = ratatui::backend::TestBackend::new(WHEEL_AREA.width, WHEEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| chibi_tui::ui::draw(f, &mut app, &chibi_tui::theme::Theme::tokyo_night()))
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    for y in [1u16, 15] {
+        assert_eq!(
+            buf[(43, y)].symbol(),
+            "\u{2502}",
+            "sidebar right border @44"
+        );
+        assert_eq!(buf[(44, y)].symbol(), "\u{2502}", "chat left border @44");
+    }
+    // The editor wrap width tracked the same runtime width (single source
+    // of truth): input_text_width(120, 44) = 120-44-1-2 = 73.
+    assert_eq!(
+        chibi_tui::ui::input_text_width(WHEEL_AREA, app.sidebar_width),
+        73
     );
 }

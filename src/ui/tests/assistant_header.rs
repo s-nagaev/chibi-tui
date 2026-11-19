@@ -9,7 +9,7 @@ use super::support::*;
 #[test]
 fn assistant_header_without_metadata_is_plain() {
     let theme = Theme::tokyo_night();
-    let line = assistant_header_line(None, &theme);
+    let line = assistant_header_line(None, None, &theme);
     let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
     assert_eq!(text, "\u{25cf} Chibi", "fallback must stay plain: {text:?}");
     assert_eq!(line.spans.len(), 1);
@@ -20,7 +20,7 @@ fn assistant_header_without_metadata_is_plain() {
 #[test]
 fn assistant_header_renders_dim_parenthetical_model_label() {
     let theme = Theme::tokyo_night();
-    let line = assistant_header_line(Some("glm-5.2"), &theme);
+    let line = assistant_header_line(Some("glm-5.2"), None, &theme);
     let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
     assert_eq!(text, "\u{25cf} Chibi (glm-5.2)");
 
@@ -39,11 +39,54 @@ fn assistant_header_renders_dim_parenthetical_model_label() {
     );
 }
 
-/// Whitespace-only metadata must not render an empty "()" suffix.
+/// A stamped message renders a trailing DIM ` HH:MM` in local time after
+/// the author name (and after the model label, when present): the
+/// messenger convention. The instant is the row's own persisted stamp.
+#[test]
+fn assistant_header_renders_dim_timestamp_after_the_label() {
+    let theme = Theme::tokyo_night();
+    let line = assistant_header_line(Some("glm-5.2"), Some(1_700_000_000), &theme);
+    let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+    assert!(
+        text.starts_with("\u{25cf} Chibi (glm-5.2) "),
+        "the label comes first, then the clock: {text:?}"
+    );
+
+    // The clock is the LAST span, dim, shaped like a wall clock.
+    let clock = line.spans.last().expect("the timestamp span exists");
+    assert_eq!(clock.style.fg, Some(theme.dim), "timestamp is dim");
+    assert_eq!(
+        clock.content.len(),
+        7,
+        "'  HH:MM' is seven bytes: {clock:?}"
+    );
+    let hhmm: String = clock.content.chars().skip(2).collect();
+    assert!(
+        hhmm[..2].parse::<u32>().is_ok_and(|h| h < 24)
+            && &hhmm[2..3] == ":"
+            && hhmm[3..].parse::<u32>().is_ok_and(|m| m < 60),
+        "zero-padded local wall clock: {hhmm:?}"
+    );
+}
+
+/// A stamp-less row (pre-timestamp snapshot) renders NO clock: no
+/// placeholder, no invented time — the shared span helper stays `None`.
+#[test]
+fn timestamp_span_is_absent_without_a_stamp() {
+    let theme = Theme::tokyo_night();
+    assert_eq!(timestamp_span(None, &theme), None);
+    let span = timestamp_span(Some(1_700_000_000), &theme).expect("stamped");
+    assert_eq!(span.style.fg, Some(theme.dim), "the clock is dim");
+    assert!(
+        span.content.starts_with("  "),
+        "two-space separation from the author name: {span:?}"
+    );
+}
+
 #[test]
 fn assistant_header_ignores_blank_model_labels() {
     let theme = Theme::tokyo_night();
-    let line = assistant_header_line(Some("   "), &theme);
+    let line = assistant_header_line(Some("   "), None, &theme);
     let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
     assert_eq!(text, "\u{25cf} Chibi");
 }
@@ -58,9 +101,9 @@ fn assistant_header_ignores_blank_model_labels() {
 fn long_model_name_wrap_is_absorbed_by_row_math() {
     const FRAME_W: u16 = 60;
     const FRAME_H: u16 = 24;
-    // Chat pane inner width = frame - sidebar(26) - the pane's two
+    // Chat pane inner width = frame - DEFAULT_SIDEBAR_WIDTH - the pane's two
     // rounded border columns.
-    let pane_width = (FRAME_W - 26 - 2) as usize;
+    let pane_width = (FRAME_W - DEFAULT_SIDEBAR_WIDTH - 2) as usize;
 
     let model_name = "super-long-model-name-ultra-extended-edition-v42";
     let tail_word = "tail42";
@@ -87,7 +130,9 @@ fn long_model_name_wrap_is_absorbed_by_row_math() {
         ] {
             match msg.role {
                 Role::User => lines.push(Line::from(Span::styled("\u{25cf} You", Style::new()))),
-                Role::Assistant => lines.push(assistant_header_line(msg.model_label(), &theme)),
+                Role::Assistant => {
+                    lines.push(assistant_header_line(msg.model_label(), None, &theme))
+                }
             }
             lines.extend(markdown::render(&msg.markdown, &theme));
             lines.push(Line::from(""));
@@ -274,5 +319,73 @@ fn restored_rows_render_own_persisted_label_and_legacy_rows_stay_plain() {
     assert_eq!(
         labeled_headers, 1,
         "no backfill: only the row with its own label is labeled:\n{flat}"
+    );
+}
+
+// per-message creation stamp in the header -------------------------
+
+/// A stamped assistant header renders an extra dim span carrying the
+/// local `HH:MM`; an unstamped row renders exactly as before (no third
+/// span, no placeholder time).
+#[test]
+fn assistant_header_appends_a_dim_timestamp_span_only_when_stamped() {
+    let theme = Theme::tokyo_night();
+
+    let unstamped = assistant_header_line(None, None, &theme);
+    assert_eq!(
+        unstamped.spans.len(),
+        1,
+        "no stamp ⇒ no timestamp span: {unstamped:?}"
+    );
+
+    let clock = crate::localtime::fmt_hhmm(1_700_000_000);
+    let stamped = assistant_header_line(None, Some(1_700_000_000), &theme);
+    assert_eq!(
+        stamped.spans.len(),
+        2,
+        "a stamped row gains exactly one extra span: {stamped:?}"
+    );
+    let ts = &stamped.spans[1];
+    assert_eq!(ts.content, format!("  {clock}"), "renders the local HH:MM");
+    assert_eq!(ts.style.fg, Some(theme.dim), "the timestamp is dim");
+    assert!(
+        !ts.style.add_modifier.contains(Modifier::BOLD),
+        "the timestamp must not inherit the bold header"
+    );
+
+    // A labelled AND stamped header carries both suffixes, model label
+    // first, timestamp last.
+    let both = assistant_header_line(Some("glm-5.2"), Some(1_700_000_000), &theme);
+    assert_eq!(both.spans.len(), 3);
+    assert_eq!(both.spans[1].content, " (glm-5.2)");
+    assert_eq!(both.spans[2].content, format!("  {clock}"));
+}
+
+/// End-to-end: the user header (`● You`) renders the same dim `HH:MM`
+/// suffix for a stamped message and nothing extra for an unstamped one,
+/// so old chats (no `created_at` on disk) render unaffected.
+#[test]
+fn user_header_renders_timestamp_only_when_the_message_is_stamped() {
+    let mut app = App::new(vec![Chat::new("ts")]);
+    app.chats[0].messages.push(Message::user("no stamp"));
+    app.chats[0]
+        .messages
+        .push(Message::user("stamped").at(1_700_000_000));
+
+    let clock = crate::localtime::fmt_hhmm(1_700_000_000);
+    let flat = render_grid(&mut app).join("\n");
+    assert!(
+        flat.contains(&clock),
+        "the stamped user message renders its local time:\n{flat}"
+    );
+    let you_lines: Vec<&str> = flat
+        .lines()
+        .filter(|r| r.contains("\u{25cf} You"))
+        .collect();
+    assert_eq!(you_lines.len(), 2, "both user headers render: {flat}");
+    assert!(
+        !you_lines[0].contains(':'),
+        "the unstamped header carries no clock: {}",
+        you_lines[0]
     );
 }
